@@ -1,0 +1,60 @@
+[자동 예약 작업 — 2026-07-22 16:00 실행, claude -p 헤드리스 세션]
+
+배경(오늘 아침 사전점검, 08:20~08:49 세션에서 발견):
+- C:\stock_bot 은 자동매매 봇 프로젝트. 오늘 아침 사전점검 중 캡틴(MFLOW_CAPTAIN)이 7/21(화)에
+  선별판 신선도 문제(BOARD_STALE)로 신규매수 0건이었던 걸 발견 → 근본원인은 money_flow_board_v1.py의
+  _captain_map() 캡틴후보 계산창이 09:02~09:06 단 4분·재시도 없음이었음.
+- 08:41에 RUN\hidden\SAFEPLUS_MFLOW_BOARD.cmd 에 MF_CAP_END=0906→0920 을 추가해서 재시도 여유를
+  늘리는 수술을 이미 적용함(트레이딩 조건은 안 건드림). 이건 이미 끝난 일 — 다시 손댈 필요 없음.
+- 그 조사 중 별개로 발견한 구조적 약점: SAFEPLUS_DEEP_SIGNAL_REC 와 SAFEPLUS_MFLOW_CAPTAIN_LIVE
+  두 Windows 예약작업이 둘 다 "재시작 트리거 없는 단발 실행"(schtasks Repetition 없음) 구조라서,
+  장중에 그 프로세스가 죽으면 그날 복구가 안 됨. 반대로 SAFEPLUS_VALLEY_HUNTER_LIVE 와
+  SAFEPLUS_MFLOW_BOARD 는 MultipleInstances=IgnoreNew + 1분 반복 트리거가 있어서 죽어도 1분 안에
+  자동 재기동됨 — 이 비대칭이 구조적 약점으로 지목됨.
+- 장 시작 9분 전(08:41)이라 라이브 엔진 기동방식(스케줄러 트리거)을 바꾸는 위험한 수정은 그때
+  보류했고, 장 마감 후인 오늘 16:00에 안전하게 다시 다루기로 사용자와 합의함.
+- 상세 배경 메모리 파일(반드시 먼저 읽을 것):
+  C:\Users\UserK\.claude\projects\C--Users-UserK\memory\stockbot-20260722-premarket-captain-boardstale.md
+  같은 폴더의 MEMORY.md 도 참고(프로젝트 전반 맥락).
+
+오늘(16:00) 할 일 — 순서대로:
+
+1) 오늘 실제로 두 프로세스가 장중에 죽은 적이 있었는지 먼저 로그로 직접 확인(추론 금지, 직접 조회):
+   - C:\stock_bot\data\LOG\morning_captain_live.log (오늘자 최신 tail, 09:00~09:42 구간 활동 유무·에러·중간에 끊긴 흔적)
+   - C:\stock_bot\data\LOG\sched_MFLOW_BOARD.log, C:\stock_bot\data\shadow\captain_window_diag.csv
+     (08:41 수술이 실제로 효과가 있었는지도 같이 확인 — reason 컬럼에 뭐가 찍혔는지)
+   - PowerShell Get-ScheduledTaskInfo 로 SAFEPLUS_DEEP_SIGNAL_REC / SAFEPLUS_MFLOW_CAPTAIN_LIVE 의
+     LastRunTime/LastTaskResult 확인. LastTaskResult가 0이 아니면 비정상 종료 의심.
+   - Get-Process 로 지금(16:00) 시점에 관련 python 프로세스가 이미 종료돼 있는지도 참고
+     (정상이면 캡틴은 09:42, 골짜기류는 15:xx 경 이미 자연 종료돼 있을 것 — 그 자체는 문제 아님).
+
+2) 오늘 안 죽었다면(십중팔구 이럴 가능성 높음) — 급한 버그가 아니라 "구조적 위험"만 있는 상태이므로
+   서두르지 말고 신중하게 검토:
+   - morning_captain_live_v1.py 와 (DEEP_SIGNAL_REC가 실행하는 스크립트, 파일명 미확인이면
+     RUN\hidden\SAFEPLUS_DEEP_SIGNAL_REC.cmd 를 열어서 실제 실행 파일 확인) 의 RUN_SEC/종료 로직을
+     먼저 코드로 확인 — 이 두 프로세스가 "1분 간격 재시도 + IgnoreNew" 트리거를 얹었을 때, 자기
+     자신의 while 루프/종료 조건(END_HM 등)과 충돌 없이 동작하는지 반드시 코드로 검증한 뒤에만 적용.
+     (오늘 아침 valley_hunter_live_v1.py 사례처럼, 실제 종료는 코드 내부 wall-clock END_HM break가
+     담당하고 스케줄러 반복은 안전망 역할만 하는 패턴이 이 프로젝트의 검증된 방식임 — 그 패턴을
+     그대로 따라갈 것, 새 패턴 도입 금지.)
+   - 문제없다고 확인되면 PowerShell Set-ScheduledTask (또는 schtasks /change) 로 두 작업에
+     MultipleInstances=IgnoreNew + 1분 반복 트리거(Repetition Interval=PT1M, Duration은 각 엔진의
+     실제 운영시간에 맞춰) 추가.
+   - 지금은 장 마감 후라 라이브 리스크 없이 적용 가능 — 그래도 적용 전/후 스케줄러 설정을 텍스트로
+     남겨서 되돌릴 수 있게 할 것(예: C:\stock_bot\DOCS 밑에 적용 전 XML 백업 — 이 프로젝트의 기존
+     관례인 task_xml_backup_YYYYMMDD 폴더 패턴을 그대로 따를 것).
+   - 캡틴/골짜기 등 요청 안 된 다른 파일·로직은 건드리지 말 것(요청된 것만 수정 — surgical).
+
+3) 적용했다면(혹은 적용 안 하기로 판단했어도 그 판단 자체를) 반드시 메모리에 기록:
+   - C:\Users\UserK\.claude\projects\C--Users-UserK\memory\ 밑에 새 파일 또는 기존
+     stockbot-20260722-premarket-captain-boardstale.md 에 이어서 기록.
+   - MEMORY.md 인덱스에도 한 줄 추가.
+   - 적용했다면 "⚠️ 다음 거래일(내일) 개장 전에 반드시 재확인 필요" 라고 명시할 것 — 처음 라이브로
+     들어가는 변경이라 첫 실전 결과를 확인하기 전까진 미검증 상태로 간주해야 함.
+
+주의:
+- 이 세션은 --dangerously-skip-permissions/bypassPermissions 로 무인 실행됨 — 사람이 중간에 승인
+  못 하므로, 조금이라도 애매하거나 위험해 보이면(예: 코드 확인 결과 충돌 소지 발견) 적용을 보류하고
+  이유를 로그/메모리에 남기는 쪽을 택할 것. 무리하게 밀어붙이지 말 것.
+- 실행 결과 요약을 이 프롬프트를 실행한 세션의 표준출력(stdout)에 한국어로 간결하게 남길 것 —
+  결과 로그 파일: C:\stock_bot\DOCS\claude_task_20260722_1600_result.log 로 리다이렉트되어 저장됨.
