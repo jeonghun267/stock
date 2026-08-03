@@ -1,0 +1,41 @@
+# 파이썬 캐시
+__pycache__/
+*.pyc
+*.pyo
+
+# 런타임 데이터/로그/IPC (용량 크고 초 단위로 계속 바뀜 - 코드 아님)
+data/
+DATA/
+LOG/
+IPC/
+MONITOR/
+BACKTEST/
+COLLECT/
+
+# 정리 대상 창고/백업 폴더 (cleanup backlog)
+창고/
+백업/
+
+# 상태/로그/일시 파일
+*.csv
+*.log
+*.flag
+*.pid
+*.heartbeat
+*.lock
+*.tmp
+*.json
+
+# 기존 방식의 수동 백업 스냅샷 (git이 이제 이 역할을 대신함)
+*.bak_*
+*.bak
+
+# 민감정보 (2026-07-24 github 업로드 대비 분리 — 절대 추적 금지)
+config/secrets.ps1
+.env
+*.env
+
+# 잡파일
+nul
+105
+go

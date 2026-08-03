@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<title>8/1(토) 정리 — 6번 신설·2번 개편</title>
+<style>
+body{font-family:"Batang","바탕",serif;font-size:22px;line-height:2.2;
+     max-width:900px;margin:40px auto;padding:0 24px;background:#fdfcf8;color:#222}
+h1{font-size:30px;border-bottom:3px solid #8a6d3b;padding-bottom:12px}
+h2{font-size:25px;color:#8a6d3b;margin-top:48px}
+li{margin-bottom:14px}
+.box{background:#f4efe4;border:1px solid #d8c9a3;border-radius:10px;padding:18px 24px;margin:18px 0}
+.warn{color:#a33}
+code{font-size:19px;background:#eee;padding:2px 6px;border-radius:4px}
+</style></head><body>
+
+<h1>8월 1일(토) 정리 — 월요일 아침에 이 순서로 확인</h1>
+
+<h2>1. 6번 급락 저점추격 — 새로 만듦, 월요일 실전</h2>
+<div class="box">
+<p>대상: 바탕화면 고저폭 30 종목.</p>
+<p>사는 법: 시가 대비 <b>-8%</b> 급락 → 저점을 끝까지 추격(계단 리셋) →</p>
+<p>저점 +0.5% 회복 → <b>1분 관찰</b> → <b>속도 역전</b>(매도 우위 → 매수 우위) 확인 → 1주 매수.</p>
+<p>총알 2발. 2발째는 1발째 저점보다 <b>1% 더 깊은</b> 신저점 뒤에만.</p>
+<p>파는 법: 당일 +10% 오르면 매도. 못 가면 <b>다음날 아침 9시 1분~10분</b> 매도. 손절 없음.</p>
+<p>태스크 <code>STRATEGY06_LIVE</code> — 월~금 아침 8:55 자동 시작.</p>
+<p>끄는 법: <code>config\strategy_06_off.flag</code> 만들기.</p>
+</div>
+
+<h2>2. 2번 저점매수 — 사는 법을 6번과 똑같이 바꿈</h2>
+<div class="box">
+<p>발동: 장중 고점 대비 <b>-3%</b> (오늘 -2%에서 올림).</p>
+<p>그 다음은 6번과 동일: 저점 추격 → 1분 관찰 → 속도 역전 → 재무장 1% → 2발.</p>
+<p>6번에 없던 관문(호가 확인, 확정 대기)은 뺐음.</p>
+<p>매도·시간창(09:06~14:20)은 안 건드림.</p>
+<p>되돌리기: <code>setx S02_SIX_STYLE NO</code> 후 재기동.</p>
+</div>
+
+<h2>3. 종가매수 — 그대로 살아 있음</h2>
+<div class="box">
+<p>상한가 포함 전부 유지. (내가 잠깐 잘못 껐다가 복구했음)</p>
+<p>11시~14시반 저점매수(LOWBUY)는 7/31에 이미 은퇴 — 6번이 후계자.</p>
+</div>
+
+<h2>4. 오늘 기각·발견</h2>
+<div class="box">
+<p><span class="warn">기각:</span> 5번(베이스 돌파)을 고저폭30에 대입 — 전부 마이너스.</p>
+<p><span class="warn">기각:</span> "첫 눌림만 돈이 된다" — 고저폭30에서는 반대(시가 위 첫 눌림이 최악).</p>
+<p>발견: 진짜 바닥에서만 <b>속도 역전</b>이 나온다 (7/29 분당 재생 — 가짜 6개는 역전 없음).</p>
+<p><span class="warn">의심:</span> 공용코어에 -2% 손절이 박혀 있어 승인된 -3%를 가릴 가능성 — 월요일 로그로 확증.</p>
+</div>
+
+<h2>5. 장세별 우선권 — 확정 원칙 (8/1 친구님)</h2>
+<div class="box">
+<p><b>급상승하는 날</b> → <b>1번</b>이 우선권.</p>
+<p><b>보통 날·급하락 날</b> → <b>6번·3번</b>이 우선권.</p>
+<p><b>자동 배선 완료</b> — 매일 아침 8시 56분에 판정기가 돈다.</p>
+<p>판정: 고저폭30의 장전 예상 갭 중앙값이 <b>+3% 이상</b>이면 급상승일.</p>
+<p>(6개월 분포에서 상위 10% 경계. 7/31 폭등일은 +11.3%로 확실히 걸림)</p>
+<p>보통날엔 1번 매수를 깃발로 끈다. 수동 깃발은 절대 안 건드림.</p>
+<p class="warn">주의: 월요일이 보통날이면 1번은 원칙대로 쉰다.</p>
+<p>끄는 법: 태스크 REGIME_PRIORITY_JUDGE 끄고 off깃발 삭제.</p>
+</div>
+
+<h2>6. 월요일 아침 확인 목록</h2>
+<div class="box">
+<p>① 1·2·3번 개편 첫 실전 로그 (기존 9개 항목)</p>
+<p>② 6번 첫 실전 — 매수 몇 건, 관찰창이 뭘 거르고 통과시켰나</p>
+<p>③ 2번 신호 수 — 새 관문 때문에 급감할 수 있음</p>
+<p>④ 전략끼리 종목 겹침 정도</p>
+<p>⑤ 화요일 아침 9시 1분 — 6번 익일 매도 실제 동작</p>
+</div>
+
+<p style="color:#777;margin-top:40px">작성: 2026-08-01 저녁 · 상세 롤백 경로는 기억 파일에 보관</p>
+</body></html>
