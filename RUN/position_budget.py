@@ -96,6 +96,11 @@ def _z(c): return str(c).strip().zfill(6)
 def _open(rec, assume_live=False):
     """status OPEN(기본) + qty>0 + (live=True or assume_live)."""
     if not isinstance(rec, dict): return False
+    # ★[2026-07-30 친구님 "저점매수 10개는 여기 구애받지 말고"] 저점매수(route=LOWBUY·1주×10)는
+    #   전역 종목수/예산 계산에서 제외 — 안 빼면 저점매수 10개가 상한 10을 채워
+    #   15:18 종가매수·돈흐름 신규매수가 전멸한다. 저점매수 자체 한도는 진입기의
+    #   EOD_GAP_LOWBUY_BUDGET_KRW(200만)가 담당. 롤백: backup\position_budget_20260730_lowbuyfree.py
+    if str(rec.get("route", "")) == "LOWBUY": return False
     if rec.get("status", "OPEN") != "OPEN": return False
     if float(rec.get("qty", 0) or 0) <= 0: return False
     return True if assume_live else bool(rec.get("live", False))
@@ -132,6 +137,8 @@ def _scan():
     elif isinstance(d, dict):
         for code, rec in d.items():
             if isinstance(rec, dict) and float(rec.get("qty", 0) or 0) > 0:
+                if str(rec.get("route", "")) == "LOWBUY":   # ★저점매수 제외(위 _open 주석)
+                    continue
                 codes.add(_z(code))
     return codes, degraded
 
@@ -177,6 +184,8 @@ def total_open_krw():
     if isinstance(d, dict):
         for code, rec in d.items():
             if isinstance(rec, dict) and float(rec.get("qty", 0) or 0) > 0:
+                if str(rec.get("route", "")) == "LOWBUY":   # ★저점매수 제외(위 _open 주석)
+                    continue
                 _put(code, _rec_krw(rec))
     return sum(m.values())
 

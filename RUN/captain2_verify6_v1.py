@@ -173,7 +173,8 @@ def main():
 
     # ── 1. EARLY ──
     w("\n[1] EARLY 초입 레인")
-    early = [e for e in ev if e["event"] == "EARLY_ONSET"]
+    early_events = {"EARLY_DIRECT_ONSET", "EARLY_GAP_ONSET", "EARLY_DIP_RECLAIM"}
+    early = [e for e in ev if e["event"] in early_events]
     if early:
         for e in early:
             c = e["code"]; bs = sec_of(e["ts"]); bpx = float(e["price"] or 0)
@@ -184,7 +185,7 @@ def main():
               f"[{e['reason']}] MFE/MAE 30s {fm(m30)} 1분 {fm(m60)} 5분 {fm(m300)}")
         verdicts["EARLY"] = ("PASS", len(early), "발화 실측 — 상세 위")
     else:
-        verdicts["EARLY"] = ("미발생", 0, "09:00~09:10 발화 0건(조건 미충족 또는 후보 없음)")
+        verdicts["EARLY"] = ("미발생", 0, "09:00~09:19 발화 0건(조건 미충족 또는 후보 없음)")
         w("  발화 0건 — 미발생")
 
     # ── 2. VWAP 관문 ──

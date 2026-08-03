@@ -95,7 +95,7 @@ REAL_MICRO_ON        = os.environ.get("REAL_MICRO", "OFF").strip().upper() == "O
 MICRO_WATCH_FILE     = IPC_DIR / "micro_watch.json"             # 구독 대상 코드(소비자가 작성: {"codes":[...]})
 MICRO_SNAPSHOT_FILE  = IPC_DIR / "live_micro_snapshot.json"     # 종목별 최신 마이크로(broker가 1초마다 작성)
 MICRO_SCREEN         = "9300"                                    # 마이크로 전용 실시간 화면(타 화면 무간섭) — 분할 시작 화면번호
-MICRO_FIDS           = "10;13;15;228;121;125;27;28"             # 현재가;누적거래량;거래량;체결강도;매도총잔량;매수총잔량;최우선매도;최우선매수
+MICRO_FIDS           = "10;13;15;228;121;125;27;28;41;51;61;71"             # 현재가;누적거래량;거래량;체결강도;매도총잔량;매수총잔량;최우선매도;최우선매수
 # [OB-FIX 2026-07-13 친구님 "호가도 받게 해줘"] ★키움은 화면 1개당 실시간 100종목이 한계.
 #   CAP=120을 화면 9300 하나에 몰아넣어(SetRealReg) 넘치는 뒤쪽이 조용히 잘려나갔다.
 #   실측(장중 40초 관측): 정렬 앞100 호가생존 93/100 vs 뒤20 5/20.
@@ -106,6 +106,41 @@ MICRO_FIDS           = "10;13;15;228;121;125;27;28"             # 현재가;누�
 MICRO_CHUNK          = int(os.environ.get("MICRO_CHUNK", "90"))  # 화면당 실시간 등록 종목수(키움 한계 100 미만)
 MICRO_THROTTLE_MS    = 200                                       # 종목별 micro update 최소간격(CPU 보호)
 MICRO_FLUSH_MS       = 1000                                      # snapshot 파일 flush 주기
+# ★[2026-07-30 친구님 승인 "고저폭 보강 ② — 돈맥 앞 끼워넣기 하지 마·별개로·50개 해도 돼"]
+#   고저폭 TOP30 전용 실시간 구독 통로. 공용 200칸(_read_micro_watch 우선순위)은 한 글자도 안 바꾼다.
+#   문제: micro_watch_high_range.json 은 공용 PRIOR 에 없어 "남는 자리" 취급 → 7/30 실측 CAP 200 이
+#   돈맥에서 정확히 소진 = 고저폭 몫 0칸(그날 30/30 수신은 앞 목록과 겹친 우연).
+#   해결: 고저폭 파일만 읽는 전용 화면 1개를 따로 등록(상한 50 ≤ 키움 화면당 100 한계).
+#   수신 데이터는 기존 _micro_update → live_micro_snapshot.json 으로 자동 합류(콜백에 목록 필터 없음).
+#   끄기: setx HR_MICRO_CAP 0  ·  롤백: broker_gateway_v1.py.bak_20260730_hrlane 복원.
+HR_WATCH_FILE        = IPC_DIR / "micro_watch_high_range.json"   # 고저폭 TOP30(08:40 생성·HR30 감시가 재생성 보장)
+# ★[2026-07-30 밤·저점매수 매도기] 오버나이트 보유 목록(eod_gap_lowbuy_sell 이 발행)도 전용 통로에 합류.
+#   어제 급락주가 오늘 TOP30 에서 빠져도 매도기의 2초 시세를 보장한다(그 전엔 TR 30초 폴링).
+#   보유 종목이 최우선(매도 필수) — 상한 HR_MICRO_CAP 안에서 hold 먼저, TOP30 나중.
+HR_HOLD_FILE         = IPC_DIR / "micro_watch_eodgap_hold.json"
+HR_SCREEN            = "9250"                                    # 전용 화면(마이크로 9300대 분할과 분리·타 등록 무간섭)
+try:
+    HR_MICRO_CAP = max(0, int(os.environ.get("HR_MICRO_CAP", "50")))
+except (TypeError, ValueError):
+    HR_MICRO_CAP = 50
+
+# ★[2026-08-01 친구님 승인 "①② 둘 다 만들어줘"] 실시간 시세 지연 실측 ① — 키움서버→우리 PC 구간.
+#   발단: 매도 실측 25건에서 체결가가 신호가보다 평균 -0.136%(최악 -1.084%)인데 플러스도 10건
+#         섞여 있다 = 호가 스프레드만이 아니라 '시간이 흘렀다'는 뜻.
+#   재는 법: 실시간 체결 이벤트가 들고 온 '체결시각'과 우리가 그 콜백을 받은 로컬 시각의 차.
+#   ⚠️해상도 1초 — 키움 체결시간은 HHMMSS 라 밀리초가 없다. "1초 이상 밀리는가"만 판정 가능.
+#   ⚠️FID 20 과 908 중 어느 쪽이 값을 주는지 확실치 않아 둘 다 기록하고 실측으로 가린다.
+#     MICRO_FIDS(SetRealReg 등록 문자열)는 손대지 않았다 — 등록 목록을 바꾸면 기존 구독이
+#     흔들릴 수 있어서다. 등록 없이 읽히는지부터 이 계측으로 확인한다(빈 값이면 보고 후 재판단).
+#   기록만 한다 — 판정·주문·스냅샷 어디에도 안 쓴다. 전체 try 격리라 실패해도 영향 0.
+#   끄기: setx REAL_LAT_PROBE OFF (브로커 재시작 시 적용)
+LAT_PROBE_ON         = os.environ.get("REAL_LAT_PROBE", "ON").strip().upper() == "ON"
+LAT_PROBE_DIR        = BASE_DIR / "data" / "latency_probe"
+LAT_PROBE_PER_CODE_SEC = 10.0   # 종목별 최소 간격(같은 종목 도배 방지)
+LAT_PROBE_MAX_PER_SEC  = 5      # 전역 초당 상한(파일·CPU 부담 차단)
+LAT_PROBE_COLUMNS = [
+    "ts_local", "code", "fid20", "fid908", "cur", "lag20_sec", "lag908_sec",
+]
 
 for d in (
     DATA_DIR, IPC_REQ, IPC_RES,
@@ -157,6 +192,40 @@ def _emit_event(event_type, entity, entity_id="", payload=None, prev_state=None,
             _f.write("\n")
     except Exception:
         pass  # fail-safe
+
+
+# [SEC-ORDERCAP 2026-07-30] 게이트웨이 주문 상한.
+#   기존: order_type/hoga_gb/qty>0 만 보고 수량·금액 상한이 전무 →
+#         IPC 요청 파일을 쓸 수 있는 프로세스면 계좌 전액 규모 주문이 가능했다.
+#   ★qty×price 상한만으로는 못 막는다 — 실주문 183건 전부 hoga_gb=06(최유리)이라 price=0.
+#   ★매수(1)·매수정정(5)만 검사. 매도·취소는 통과 — 포지션 탈출을 절대 막지 않기 위해서.
+#   롤백: 이 블록과 _handle_sendorder_real_request 의 상한 검사 6줄 제거
+_ORDER_CAP_BUY_SIDES = (1, 5)
+
+
+def _order_cap_env(name, default):
+    """MICRO_CAP 과 같은 관례 — 숫자가 아니면 기본값으로 진행."""
+    try:
+        return int(str(os.environ.get(name, default)).strip())
+    except Exception:
+        logger.error("[SEC] %s 값이 숫자가 아님(%r) — 기본 %s 로 진행",
+                     name, os.environ.get(name), default)
+        return int(default)
+
+
+# [SEC-ACCTMASK 2026-07-30] 로그 계좌번호 마스킹.
+#   실주문 1건마다 account 평문이 broker_journal 에 남던 것을 가린다(7/30 보안점검 발견).
+#   형식은 기존 관례(eod_gap_live_executor_v1.py:238)와 동일: 0000000000 → 0000**
+def _mask_acct(a):
+    s = str(a or "")
+    return (s[:4] + "**") if len(s) >= 4 else "**"
+
+
+# [GHOST-WIN 2026-07-30] 유령 주문 창 그림자 스위치.
+#   클라 10초 포기 후 게이트웨이가 15초까지 실행하던 5초 창 문제 —
+#   오늘 밤은 YES(그림자·로그만). 7/31 age_sec 데이터 보고 setx BROKER_GHOST_SHADOW NO 로 실거부 전환.
+_GHOST_SHADOW = str(os.environ.get("BROKER_GHOST_SHADOW", "YES")).strip().upper() != "NO"
+
 
 _console = logging.StreamHandler(sys.stdout)
 _console.setFormatter(_fmt)
@@ -461,6 +530,10 @@ class BrokerGateway:
 
         self._heartbeat_timer = None
         self._poll_timer      = None
+        # QEventLoop.exec_() 중에도 Qt timer가 다시 발화한다. 이때 poll_requests가
+        # 재진입하면 뒤 TR이 self.tr_loop/output_fields를 덮어써 앞 TR 응답을
+        # 유실시킨다. 한 번의 IPC poll pass가 끝날 때까지 중첩 poll을 막는다.
+        self._poll_in_progress = False
         # [Z2 2026-05-14] state replay — SetRealReg 등록 상태 영속화
         # key = screen_no, value = {"code_list": "035720;...", "fid_list": "10;13;...", "real_type": "0", "ts": ...}
         self._realreg_state: dict = {}
@@ -832,6 +905,7 @@ class BrokerGateway:
     _micro_snapshot: dict = {}        # code -> {ts, che_str, ask_tot, bid_tot, imb, cur, cum_vol}
     # [OB-FIX 2026-07-13] set → list. 등록 순서(우선순위)가 화면 분할에 그대로 쓰이므로 순서를 잃으면 안 됨.
     _micro_watch_codes: list = []
+    _hr_watch_codes: list = []      # ★[2026-07-30] 고저폭 전용 통로 등록 상태
     _micro_screens: list = []         # 현재 실시간 등록에 쓰고 있는 화면번호(줄었을 때 해제용)
     _micro_last_upd: dict = {}        # code -> last update epoch ms (per-code throttle)
     _micro_verify_logged: int = 0
@@ -840,6 +914,12 @@ class BrokerGateway:
     #   매 체결 이벤트마다(스로틀 앞) 쌓고, 1초 flush 때 스냅샷에 병합한다. 읽기·누계뿐 — 주문 경로 무관.
     _micro_acc: dict = {}
     _micro_acc_verify_logged: int = 0
+    # ★[LAT-PROBE 2026-08-01] 지연 실측 ① 버퍼(1초 flush 때 배치 append — 콜백에서 직접 파일 안 씀)
+    _lat_rows: list = []
+    _lat_last_by_code: dict = {}      # code -> last probe epoch
+    _lat_sec_bucket: int = 0          # 현재 초(전역 상한 계산용)
+    _lat_sec_count: int = 0
+    _lat_empty_logged: int = 0        # FID 가 빈 값일 때 진단 로그(첫 5건만)
 
     def _read_micro_watch(self):
         # [REAL-MICRO 2026-06-24] 다중 소비자: micro_watch*.json (돌파/눌림/종가/스캐너) 전부 합집합 — 전략별 파일 충돌방지
@@ -848,7 +928,19 @@ class BrokerGateway:
         #   해결: 우선순위 확정 컷 — ①반전 바닥워치 ②전략 유니버스(매일 갱신 100) ③나머지(상승/돌파/종가/스캐너).
         #   strategy_watchlist.py가 "급락 바닥 시간에도 체결강도 계속 찍히게" 발행한 100을 캡이 도로 버리던 걸 살림.
         #   롤백(기존 무작위 컷) setx MICRO_CAP_PRIORITY NO.
-        CAP = 120
+        # ★[2026-07-29 친구님 승인 "미조치 3건도 고쳐"] 숫자가 아닌 값이 들어와도 죽지 않게.
+        #   종전엔 int() 가 ValueError 를 내고 _micro_tick 의 except 가 매초 삼켜서,
+        #   실시간 구독(SetRealReg)도 스냅샷 flush 도 영영 안 돌아 전 전략이 신선도 게이트에
+        #   걸려 하루 종일 매수 0건이 된다(로그엔 [MICRO] tick 오류만 반복). 기본 200 으로 폴백.
+        #   롤백: *.bak_20260729_microcap
+        try:
+            CAP = max(1, int(os.environ.get("MICRO_CAP", "200")))
+        except (TypeError, ValueError):
+            CAP = 200
+            if not getattr(self, "_micro_cap_warned", False):
+                self._micro_cap_warned = True
+                logger.error("[MICRO] MICRO_CAP 값이 숫자가 아님(%r) — 기본 200 으로 진행. 환경변수 확인 필요",
+                             os.environ.get("MICRO_CAP"))
         if os.environ.get("MICRO_CAP_PRIORITY", "YES").strip().upper() != "YES":
             codes = set()
             try:
@@ -863,9 +955,15 @@ class BrokerGateway:
                 pass
             return list(codes)[:CAP]
         # ── 우선순위 확정 컷 ──
-        def _codes_of(name):
+        def _codes_of(name, today_only=False):
             try:
                 d = json.loads((IPC_DIR / name).read_text(encoding="utf-8-sig"))
+                watch_date = str(
+                    d.get("for_date")
+                    or str(d.get("ts") or "")[:10].replace("-", ""))
+                if today_only and watch_date != datetime.now().strftime("%Y%m%d"):
+                    logger.warning("[MICRO] stale watch ignored: %s watch_date=%s", name, watch_date)
+                    return []
                 return [str(c).zfill(6) for c in (d.get("codes") or [])]
             except Exception:
                 return []
@@ -876,22 +974,78 @@ class BrokerGateway:
                     break
                 if c and len(c) == 6 and c not in seen:
                     seen.add(c); out.append(c)
-        # ★[7/12 친구님 "매도 폭탄이 서서히 줄다가 바닥"] ①돈맥 급락종목 최우선 — 실전 매수 엔진이 깊은바닥 하나뿐인데
+        # 골짜기·캡틴2 09:00 고정풀과 갭상승·장중급등 주입파일은 FID15를 놓치면
+        # 신호가 뜬 뒤에야 관측을 시작하므로 우선 등록한다. 오늘 파일만 사용한다.
+        # ★[7/12 친구님 "매도 폭탄이 서서히 줄다가 바닥"] 돈맥 급락종목도 우선 유지.
         #   정작 그 후보들의 호가잔량이 46~65% 결측이었다(reversal 파일은 7/11 엔진잠금으로 소멸·돈맥은 발행한 적 없음).
         #   micro_watch_moneyflow.json = money_flow_board_v1._publish_micro_watch (하락 -2%↓ 낙폭순 60개·30s 갱신)
-        PRIOR = ["micro_watch_moneyflow.json",      # ①돈맥 급락종목(실전 매수 후보) ★최우선
-                 "micro_watch_reversal.json",       # ②반전 바닥(현재 엔진 잠금 = 파일 없음·복구 대비 유지)
-                 "micro_watch_strategy.json"]       # ③전략 EOD100(바닥커버)
-        _add(_codes_of(PRIOR[0]))
-        _add(_codes_of(PRIOR[1]))
+        # ★[MICRO-PRIOR-FIX 2026-07-29 친구님 승인] S01·S02·S03 공용 감시를 1순위로.
+        #   문제: micro_watch_strategy_shared.json(138종목)은 S01·S02·S03 신호기가 전부 쓰는
+        #   공용 목록인데 PRIOR에 없어 "나머지(남는 자리)" 취급 → CAP 200이 앞에서 소진되어 0칸.
+        #   실시간 가격이 안 들어오니 매수단계 스냅샷 신선도(4초)를 영영 못 넘겨 주문시도 0이었다.
+        #   (7/28 실측: valley 60 + captain2 100 + premarket 62 = 222 → 이하 전부 0칸)
+        #   함께 제거: micro_watch_captain2.json — 캡틴2는 은퇴한 전략인데 100칸을 점유했다.
+        #   롤백: broker_gateway_v1.py.bak_20260729_microprior 복원.
+        PRIOR = ["micro_watch_strategy_shared.json",  # ①S01·S02·S03 공용 감시(138)
+                 "micro_watch_valley.json",         # ②골짜기 Gate1 100억 고정풀
+                 "micro_watch_premarket.json",      # ③장전 예상 갭상승
+                 "micro_watch_updown.json",         # ④장중 상승률 상위
+                 "micro_watch_movers.json",         # ⑤장중 거래대금 급증
+                 "micro_watch_strategy05.json",     # ⑥S05 장중 베이스 돌파 장전 활동주
+                 "micro_watch_moneyflow.json",      # ⑥돈맥 급락종목
+                 "micro_watch_reversal.json",       # ⑦반전 바닥
+                 "micro_watch_strategy.json"]       # ⑧전략 EOD100
+        for name in PRIOR[:6]:
+            _add(_codes_of(name, today_only=True))
+        for name in PRIOR[6:]:
+            _add(_codes_of(name))
         try:
-            for f in sorted(IPC_DIR.glob("micro_watch*.json")):            # ③나머지(남는 자리만)
+            for f in sorted(IPC_DIR.glob("micro_watch*.json")):            # 나머지(남는 자리만)
                 if f.name in PRIOR:
                     continue
                 _add(_codes_of(f.name))
         except Exception:
             pass
         return out      # [OB-FIX 2026-07-13] 우선순위 순서 그대로(돈맥 깊은바닥이 맨 앞) — 화면 분할이 이 순서를 씀
+
+    def _read_high_range_watch(self):
+        # ★[2026-07-30 친구님 승인 "고저폭 보강 ②"] 고저폭 전용 통로 판독 — 공용 _read_micro_watch 와
+        #   완전 분리. 오늘(for_date) 파일만 쓴다(낡은 목록에 화면을 내주지 않기). 상한 HR_MICRO_CAP.
+        if HR_MICRO_CAP <= 0:
+            return []
+        _today = datetime.now().strftime("%Y%m%d")
+        out, seen = [], set()
+        # ★[2026-07-30 밤] 1순위 = 저점매수 오버나이트 보유(매도기 발행·오늘 것만·fail-safe).
+        #   파일 없음/깨짐/낡음 = 그냥 건너뜀 — 기존 TOP30 동작 무영향.
+        try:
+            h = json.loads(HR_HOLD_FILE.read_text(encoding="utf-8-sig"))
+            if str(h.get("for_date") or "") == _today:
+                for c in (h.get("codes") or []):
+                    c = str(c).zfill(6)
+                    if len(c) == 6 and c not in seen:
+                        seen.add(c)
+                        out.append(c)
+                    if len(out) >= HR_MICRO_CAP:
+                        return out
+        except Exception:
+            pass
+        try:
+            d = json.loads(HR_WATCH_FILE.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return out
+        watch_date = str(
+            d.get("for_date")
+            or str(d.get("ts") or "")[:10].replace("-", ""))
+        if watch_date != _today:
+            return out
+        for c in (d.get("codes") or []):
+            c = str(c).zfill(6)
+            if len(c) == 6 and c not in seen:
+                seen.add(c)
+                out.append(c)
+            if len(out) >= HR_MICRO_CAP:
+                break
+        return out
 
     def _micro_register(self, codes):
         """[OB-FIX 2026-07-13] 화면당 MICRO_CHUNK(90)씩 분할 등록 — 키움 화면당 100종목 한계 회피.
@@ -993,10 +1147,33 @@ class BrokerGateway:
             if cur is not None: rec["cur"] = cur
             cv = _num(_g("13"))
             if cv is not None: rec["cum_vol"] = cv
+            # ★[OPEN-FID 2026-08-03 친구님 승인] 당일 시가(FID 16)를 스냅샷에 실는다.
+            #   왜: 시가는 deep_bottom_signal_recorder 가 "09:00 그 1분에 관측된 종목"만
+            #   붙잡아 왔다(hm=="0900"). 09:01 이후 구독에 들어온 종목은 하루 종일 시가가
+            #   없어 S03 후보의 37%(86종목)가 OPEN_PRICE_MISSING 으로 판정 불가였다.
+            #   시가는 정적 값이라 장중 어느 시점에 구독해도 정확한 값이 온다.
+            #   MICRO_FIDS 는 손대지 않았다 — 주식체결 실시간에 16이 원래 실려 오는지
+            #   먼저 확인한다(8/1 FID 20·908 계측과 같은 방식). 빈 값이면 등록 추가 재판단.
+            #   실패해도 무해: op 가 안 실리면 소비자는 종전과 똑같이 동작한다.
+            op = _num(_g("16"))
+            if op:  # 0/None 은 기록하지 않는다 — 거짓 시가가 판정을 오염시키면 안 된다
+                rec["op"] = op
+            # ★[LAT-PROBE 2026-08-01] 지연 실측 ① — 체결 이벤트에만. 기록 전용, 전체 try 격리.
+            if LAT_PROBE_ON:
+                try:
+                    self._lat_probe(code, _g, rec.get("cur"))
+                except Exception:
+                    pass
         if "호가" in rt:
             ask = _num(_g("121")); bid = _num(_g("125"))
+            best_ask = _num(_g("41")); best_bid = _num(_g("51"))
+            best_ask_qty = _num(_g("61")); best_bid_qty = _num(_g("71"))
             if ask is not None: rec["ask_tot"] = ask
             if bid is not None: rec["bid_tot"] = bid
+            if best_ask is not None: rec["best_ask_px"] = best_ask
+            if best_bid is not None: rec["best_bid_px"] = best_bid
+            if best_ask_qty is not None: rec["best_ask_qty"] = best_ask_qty
+            if best_bid_qty is not None: rec["best_bid_qty"] = best_bid_qty
             if rec.get("ask_tot") and rec.get("bid_tot"):
                 rec["imb"] = round(rec["bid_tot"] / rec["ask_tot"], 3) if rec["ask_tot"] > 0 else 0.0
                 # [OB-FIX 2026-07-13] 호가 전용 시각 — rec["ts"]는 체결에도 갱신돼서 호가가 죽어도 신선해 보인다.
@@ -1011,6 +1188,74 @@ class BrokerGateway:
                         code, rec.get("che_str"), rec.get("cur"), rec.get("ask_tot"),
                         rec.get("bid_tot"), rec.get("imb"))
             self._micro_verify_logged += 1
+
+    # ★[LAT-PROBE 2026-08-01 친구님 승인 "①② 둘 다 만들어줘"] 키움서버→우리 PC 지연 실측.
+    #   체결 이벤트가 들고 온 체결시각(HHMMSS) 과 콜백을 받은 로컬 시각의 차 = 우리가 보는 시세가
+    #   몇 초 늦은가. 해상도 1초라 "1초 이상 밀리는가"만 판정한다(밀리초는 키움이 안 준다).
+    #   FID 20 / 908 둘 다 적어서 어느 쪽이 값을 주는지 실측으로 가린다.
+    #   버퍼에만 담고 파일은 1초 flush 때 한 번에 쓴다 — 콜백에서 디스크를 만지지 않는다.
+    def _lat_probe(self, code, getter, cur):
+        now = datetime.now()
+        epoch = time.time()
+        # 전역 초당 상한 — 활발한 종목이 버퍼를 채우는 걸 막는다
+        bucket = int(epoch)
+        if bucket != self._lat_sec_bucket:
+            self._lat_sec_bucket = bucket
+            self._lat_sec_count = 0
+        if self._lat_sec_count >= LAT_PROBE_MAX_PER_SEC:
+            return
+        # 종목별 간격 — 같은 종목이 표본을 독점하지 않게
+        if epoch - self._lat_last_by_code.get(code, 0.0) < LAT_PROBE_PER_CODE_SEC:
+            return
+        self._lat_last_by_code[code] = epoch
+        self._lat_sec_count += 1
+
+        raw20 = str(getter("20") or "").strip()
+        raw908 = str(getter("908") or "").strip()
+
+        def _lag(raw):
+            """HHMMSS(또는 HHMMSSmmm) → 로컬 시각과의 차(초). 형식이 아니면 빈칸."""
+            digits = "".join(ch for ch in raw if ch.isdigit())
+            if len(digits) < 6:
+                return ""
+            try:
+                stamp = now.replace(
+                    hour=int(digits[0:2]), minute=int(digits[2:4]),
+                    second=int(digits[4:6]), microsecond=0)
+            except ValueError:
+                return ""
+            return round((now - stamp).total_seconds(), 3)
+
+        self._lat_rows.append({
+            "ts_local":   now.isoformat(timespec="milliseconds"),
+            "code":       code,
+            "fid20":      raw20,
+            "fid908":     raw908,
+            "cur":        cur if cur is not None else "",
+            "lag20_sec":  _lag(raw20),
+            "lag908_sec": _lag(raw908),
+        })
+        # 둘 다 빈 값이면 SetRealReg 등록 목록(MICRO_FIDS)에 없어서 안 오는 것 — 첫 5건만 알린다.
+        if not raw20 and not raw908 and self._lat_empty_logged < 5:
+            self._lat_empty_logged += 1
+            logger.info("[LAT-PROBE] %s 체결시각 FID 20·908 둘 다 빈 값 — 등록 없이는 안 오는 것으로 보임", code)
+
+    def _lat_flush(self):
+        """[LAT-PROBE 2026-08-01] 버퍼 → CSV append (1초 1회). 실패해도 시세 경로에 영향 0."""
+        if not self._lat_rows:
+            return
+        rows, self._lat_rows = self._lat_rows, []
+        try:
+            path = LAT_PROBE_DIR / f"real_latency_{datetime.now():%Y%m%d}.csv"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            new = not path.exists()
+            with path.open("a", encoding="utf-8-sig", newline="") as handle:
+                writer = _csv.DictWriter(handle, fieldnames=LAT_PROBE_COLUMNS)
+                if new:
+                    writer.writeheader()
+                writer.writerows(rows)
+        except Exception as e:
+            logger.error("[LAT-PROBE] 기록 실패(계측만 손실·시세 무영향): %s", e)
 
     def _micro_flush(self):
         if not self._micro_snapshot:
@@ -1039,7 +1284,28 @@ class BrokerGateway:
             if codes and codes != self._micro_watch_codes:
                 self._micro_register(codes)
                 self._micro_watch_codes = codes
+            # ★[2026-07-30 친구님 승인 "고저폭 보강 ②"] 고저폭 전용 통로 등록 — 공용 경로와 독립.
+            #   실패해도 공용 구독·flush 에 영향이 없게 자체 try 로 격리. optType "0" =
+            #   그 화면의 기존등록 교체(전용 화면이라 타 등록 무간섭). 목록이 바뀔 때만 재등록.
+            try:
+                hr_codes = self._read_high_range_watch()
+                if hr_codes and hr_codes != self._hr_watch_codes:
+                    ret = self.ocx.dynamicCall(
+                        "SetRealReg(QString, QString, QString, QString)",
+                        HR_SCREEN, ";".join(hr_codes), MICRO_FIDS, "0")
+                    self._hr_watch_codes = hr_codes
+                    logger.info("[HR-MICRO] 고저폭 전용 %d종목 등록 (screen=%s) ret=%s",
+                                len(hr_codes), HR_SCREEN, ret)
+            except Exception as e:
+                logger.error("[HR-MICRO] 등록 실패: %s", e)
             self._micro_flush()
+            # ★[LAT-PROBE 2026-08-01] 지연 계측 버퍼를 1초 1회 CSV 로 흘린다. 자체 try 격리 —
+            #   계측이 죽어도 위의 시세 flush 는 이미 끝난 뒤라 영향이 없다.
+            if LAT_PROBE_ON:
+                try:
+                    self._lat_flush()
+                except Exception:
+                    pass
         except Exception as e:
             logger.error("[MICRO] tick 오류: %s", e)
 
@@ -1384,7 +1650,7 @@ class BrokerGateway:
         if not account or not code or qty <= 0:
             logger_order_shadow.warning(
                 "invalid payload engine=%s account=%s code=%s qty=%d",
-                engine_name, account, code, qty,
+                engine_name, _mask_acct(account), code, qty,
             )
             self._write_response(
                 request_id, status="ERROR",
@@ -1753,6 +2019,10 @@ class BrokerGateway:
     # SendOrder 화이트리스트 — order_type 정수만 허용 (1=매수, 2=매도, 3=매수취소, 4=매도취소, 5=매수정정, 6=매도정정)
     SENDORDER_TYPE_WHITELIST = {1, 2, 3, 4, 5, 6}
 
+    # [SEC-ORDERCAP 2026-07-30] 일일 매수 건수 카운터 (브로커가 매일 재기동되므로 메모리로 충분)
+    _buy_count_date: str = ""
+    _buy_count: int = 0
+
     def _handle_sendorder_real_request(self, request_id, req):
         """[Z1 2026-05-14] 실 SendOrder 집행. idempotency 보장.
 
@@ -1829,11 +2099,111 @@ class BrokerGateway:
                 error=f"SENDORDER_REAL: hoga_gb '{hoga_gb}' 허용 외")
             return
 
+        # [GHOST-WIN 2026-07-30] 주문 유예 상한 — 클라 값이 더 커도 이 값으로 자른다.
+        #   상한 검사보다 앞: 낡아서 버릴 주문이 일일 매수 카운트를 소모하면 안 된다.
+        #   ts 없음/깨짐 = 나이 판정 불가 → 차단하지 않는다(fail-open·주문 경로 보수).
+        _eff_ttl = min(int(req.get("ttl_sec", 15)), _order_cap_env("BROKER_ORDER_MAX_TTL_SEC", 8))
+        try:
+            _req_age = (datetime.now() - datetime.fromisoformat(str(req.get("ts", "")))).total_seconds()
+        except Exception:
+            _req_age = -1.0
+        if _req_age > _eff_ttl:
+            if _GHOST_SHADOW:          # 그림자 모드 — 로그만 남기고 통과
+                logger.warning("[GHOST-SHADOW] 실거부였으면 차단됐을 주문 age=%.2fs > %ds code=%s",
+                               _req_age, _eff_ttl, code)
+            else:
+                logger.critical("[GHOST-BLOCK] 늦은 주문 거부 age=%.2fs > %ds code=%s",
+                                _req_age, _eff_ttl, code)
+                self._write_response(request_id, status="ERROR",
+                    error=f"ORDER_TTL: 접수 지연 {_req_age:.2f}s > {_eff_ttl}s")
+                return
+
+        # [SEC-ORDERCAP 2026-07-30] 주문 상한 — 매수 계열만 검사
+        if order_type in _ORDER_CAP_BUY_SIDES:
+            _max_qty   = _order_cap_env("BROKER_MAX_ORDER_QTY", 5)
+            _max_krw   = _order_cap_env("BROKER_MAX_ORDER_KRW", 1000000)
+            _max_daily = _order_cap_env("BROKER_MAX_DAILY_BUY", 100)
+            _today = datetime.now().strftime("%Y%m%d")
+            if self._buy_count_date != _today:
+                self._buy_count_date = _today
+                self._buy_count = 0
+
+            _deny = None
+            if _max_qty > 0 and qty > _max_qty:
+                _deny = f"수량 상한 초과 (qty={qty} > {_max_qty})"
+            elif _max_krw > 0 and price > 0 and qty * price > _max_krw:
+                _deny = f"금액 상한 초과 (qty*price={qty * price} > {_max_krw})"
+            elif _max_daily > 0 and self._buy_count >= _max_daily:
+                _deny = f"일일 매수 건수 상한 초과 ({self._buy_count} >= {_max_daily})"
+
+            # ★[2026-07-31 친구님 승인 #4] 시장가·최유리(price=0)는 위 금액 검사를
+            #   그냥 통과하던 구멍(조건이 price > 0). 저점매수·종가매수가 전부
+            #   price=0, hoga_gb=06 이라 금액 상한이 사실상 무력했다.
+            #   구독 중인 종목이면 _micro_snapshot 의 최근가(cur)로 추정 검사.
+            # ★[2026-08-01 친구님 승인 "구멍도 메꿔줘"] 미구독 종목 fail-open 봉합 —
+            #   ① 구독에 없으면 키움 마스터 전일가 × 1.3(상한가 여유)으로 보수 추정
+            #     (마스터는 로그인 때 메모리에 실리는 값 — 조회 지연·TR 소모 없음).
+            #   ② 그래도 가격을 못 구하면: 1주는 통과(금액이 저절로 유계),
+            #     2주 이상은 차단(fail-close). 현 체제는 전부 1주라 실전 무영향.
+            #   부작용 한도: 전일가 77만원 이상 종목의 1주 시장가는 ×1.3 추정이 100만
+            #   상한을 넘겨 거부될 수 있음(로그 CRITICAL로 보임) — 그때는 BROKER_MAX_ORDER_KRW 조정.
+            #   롤백: backup\broker_gateway_v1_20260801_capfix.py 복원.
+            if _deny is None and _max_krw > 0 and price == 0:
+                try:
+                    _est = abs(float((self._micro_snapshot.get(code) or {}).get("cur") or 0))
+                except Exception:
+                    _est = 0.0
+                if _est <= 0:
+                    try:
+                        _mlp = str(self.ocx.dynamicCall(
+                            "GetMasterLastPrice(QString)", code)).replace(",", "").strip()
+                        _est = abs(float(_mlp or 0)) * 1.3
+                    except Exception:
+                        _est = 0.0
+                if _est > 0 and qty * _est > _max_krw:
+                    _deny = (f"금액 상한 초과 (시장가 추정 qty*{_est:.0f}"
+                             f"={qty * _est:.0f} > {_max_krw})")
+                elif _est <= 0:
+                    if qty <= 1:
+                        logger.warning(
+                            "[SEC-ORDERCAP] 시장가 code=%s 추정가 없음 — 1주 주문이라 통과(금액 유계)",
+                            code)
+                    else:
+                        _deny = (f"시장가 추정가 없음 + 다수량 (qty={qty}) — "
+                                 f"금액 검사 불가로 차단")
+
+            if _deny:
+                logger.critical("[SEC-ORDERCAP] 매수 차단 — %s | code=%s key=%s",
+                                _deny, code, idempotency_key)
+                self._write_response(request_id, status="ERROR",
+                    error=f"ORDER_CAP: {_deny}")
+                return
+            self._buy_count += 1
+
         logger.info(
             "[SENDORDER-REAL] key=%s account=%s code=%s qty=%d price=%d type=%d hoga=%s rqname=%s",
-            idempotency_key, account, code, qty, price, order_type, hoga_gb, rqname,
-        )
+            idempotency_key, _mask_acct(account), code, qty, price, order_type, hoga_gb, rqname,
+        )                        # ↑ [SEC-ACCTMASK] 로그 인자만 마스킹 — SendOrder 에는 원본이 간다
 
+        # [ORDER-EVT 2026-07-30] 접수→실행 지연 기록. ②(유령 창) 판단의 유일한 근거.
+        #   기존 event_journal 엔 CHEJAN(체결)뿐이라 "언제 접수해서 언제 쐈는지"가 없었다.
+        #   클라가 넣어주는 req["ts"](broker_client.py:206)와 지금 시각의 차 = age_sec.
+        #   _emit_event 는 내부가 try/except:pass 인 fail-safe → 주문 경로 영향 0.
+        _age_sec = -1.0
+        try:
+            _age_sec = round(
+                (datetime.now() - datetime.fromisoformat(str(req.get("ts", "")))).total_seconds(), 3)
+        except Exception:
+            pass
+        _emit_event("ORDER_SUBMITTED", entity="order", entity_id=idempotency_key, payload={
+            "code": code, "qty": qty, "order_type": order_type, "hoga_gb": hoga_gb,
+            "rqname": rqname, "request_id": request_id,
+            "ts_client": str(req.get("ts", "")),
+            "age_sec": _age_sec,                                    # ★7/31 아침에 볼 숫자
+            "ttl_sec": int(req.get("ttl_sec", self.DEFAULT_TTL_SEC)),
+        })
+
+        _t0 = datetime.now()
         try:
             ret = self.ocx.dynamicCall(
                 "SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
@@ -1844,6 +2214,11 @@ class BrokerGateway:
             )
             ret_int = int(ret) if ret is not None else -1
             ok = (ret_int == 0)
+            # [ORDER-EVT 2026-07-30] 실행 결과 + SendOrder 자체 소요
+            _emit_event("ORDER_RESULT", entity="order", entity_id=idempotency_key, payload={
+                "code": code, "ret": ret_int, "ok": ok,
+                "send_ms": round((datetime.now() - _t0).total_seconds() * 1000, 1),
+            })
             response_dict = {
                 "status": "OK" if ok else "ERROR",
                 "data":   {"ret": ret_int, "code": code, "qty": qty, "order_type": order_type,
@@ -2302,9 +2677,32 @@ class BrokerGateway:
                 self.tr_pending_rqname.pop(rqname, None)
 
     # ───────────────────────────────────────────────────────────
+    # [SEC-PATHTRAV 2026-07-30] request_id 경로조작 차단
+    # ───────────────────────────────────────────────────────────
+    # 기존: 요청 JSON 의 request_id 를 무검증으로 f"{request_id}.json" 경로에 사용.
+    #       "..\..\config\x" 나 "C:/Windows/Temp/x" 로 IPC\responses 를 벗어나
+    #       관리자 권한 임의 .json 덮어쓰기가 가능했다(7/30 보안점검 발견).
+    # 정상 client 는 전부 str(uuid.uuid4()) → 영숫자+하이픈만 나온다(전수확인).
+    # 롤백: 이 메서드와 _write_response 첫 3줄 제거 (bak_20260730_night)
+    _RID_ALLOWED = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+
+    def _safe_request_id(self, raw):
+        """응답 파일명으로 안전한 request_id 만 통과. 아니면 None."""
+        rid = str(raw).strip()
+        if rid and len(rid) <= 80 and all(ch in self._RID_ALLOWED for ch in rid):
+            return rid
+        return None
+
+    # ───────────────────────────────────────────────────────────
     # IPC: Response 작성
     # ───────────────────────────────────────────────────────────
     def _write_response(self, request_id, status, data=None, error=None):
+        # [SEC-PATHTRAV 2026-07-30] 파일명이 IPC\responses 밖으로 못 나가게 한다
+        _safe = self._safe_request_id(request_id)
+        if _safe is None:
+            logger.warning("[SEC] request_id 형식 위반 — 응답 격리: %r", str(request_id)[:120])
+            _safe = "rejected_request_id"
+        request_id = _safe
         try:
             res = {
                 "request_id": request_id,
@@ -2328,6 +2726,9 @@ class BrokerGateway:
     # IPC polling
     # ───────────────────────────────────────────────────────────
     def poll_requests(self):
+        if self._poll_in_progress:
+            return
+        self._poll_in_progress = True
         try:
             files = sorted(IPC_REQ.glob("*.json"))
             if not files:
@@ -2364,6 +2765,8 @@ class BrokerGateway:
                 self.process_request(f)
         except Exception as e:
             logger.error("poll 오류: %s", e)
+        finally:
+            self._poll_in_progress = False
 
     # ───────────────────────────────────────────────────────────
     # Main run loop

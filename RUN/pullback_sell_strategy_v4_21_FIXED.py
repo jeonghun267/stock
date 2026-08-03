@@ -2117,7 +2117,7 @@ def _append_ev(pos: Position, order: SellDecision,
 #
 #  환경변수
 #    PAPER_TRADE=false    : 실거래 모드 활성화
-#    KIWOOM_ACCOUNT       : 계좌번호 (예: 1234567890)
+#    KIWOOM_ACCOUNT       : 계좌번호 (예: <REDACTED_ACCOUNT>)
 #    KIWOOM_SCREEN_SELL   : 매도 화면번호 (기본 "9001")
 #    KIWOOM_ORDER_TIMEOUT : 접수 확인 대기 초 (기본 5)
 #    KIWOOM_MAX_RETRY     : 주문 재시도 횟수 (기본 3)
@@ -3153,8 +3153,11 @@ def main() -> int:
             #   PB엔진이 건드리면 14:55 매수분을 15:00 tick이 C급 조기매도로 즉살하는 사고. 제외.
             _strat = str((_v or {}).get("strategy", "")).strip().upper()
             # [NEWPB-OWN-EXIT 2026-06-19] _newpb 포지션은 NEW_PB executor 전담(env ON시) — EOD_PICK과 동일 제외.
+            # ★[2026-07-30 친구님 "저점매수는 오늘 매도 안 된다·다음날 9시 이후만"] EOD_GAP(종가매수·
+            #   저점매수 오버나이트)도 EOD_PICK과 동일 제외 — 매도는 익일 09:01 SAFEPLUS_EOD_GAP_SELL 전담.
+            #   저점매수가 11:00~14:30 장중에 사기 시작하면서 이 엔진과 처음으로 공존하게 돼 명시.
             _is_newpb = bool((_v or {}).get("_newpb"))
-            if _q > 0 and _strat != "EOD_PICK" and not (_is_newpb and _NEWPB_OWN_EXIT):
+            if _q > 0 and _strat not in ("EOD_PICK", "EOD_GAP") and not (_is_newpb and _NEWPB_OWN_EXIT):
                 _held[str(_k).zfill(6)] = _q
         _before_n = len(row_map)
         row_map = {c: r for c, r in row_map.items() if c in _held}

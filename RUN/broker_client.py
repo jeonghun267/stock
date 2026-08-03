@@ -43,6 +43,12 @@ from typing import Optional, Dict, Any, List
 _DEFAULT_IPC_BASE = Path(r"C:\stock_bot\IPC")
 _DEFAULT_HB_STALE_SEC = 15.0
 
+# [GHOST-WIN 2026-07-30] 실주문 유예 여백(초).
+#   기존: request()가 ttl_sec = timeout+5 를 기본 부여 → 클라가 10초에 포기한 주문을
+#   게이트웨이가 15초까지 실행하는 5초 유령 창. 실주문만 timeout-2초로 조여 창을 없앤다.
+#   TR·BATCH_TR 은 종전대로(낡은 조회는 무해하지만 낡은 주문은 위험).
+_GHOST_MARGIN_SEC = 2
+
 
 # ─────────────────────────────────────────────────────────
 # [TR-CALLER 2026-07-11] 화면0001 호출자 특정 수술 — 모든 요청에 호출자 서명
@@ -523,10 +529,21 @@ class BrokerClient:
                     except Exception:
                         _kchg = None
                     # ★-3% 이하 = 매수 스탑(주문 거부). 매도는 이 블록(order_type==1=매수)에 안 걸림 = 항상 통과.
+                    # ★[2026-07-29 친구님 지시 "레짐스탑 전략별로 분리해"]
+                    #   레짐스탑 면제 목록(env REGIME_STOP_EXEMPT · 쉼표구분 rqname 접두어).
+                    #   근거(일봉 1년·상한가 종가매수 1,134건·익일 시가매도·비용 0.38% 차감):
+                    #     폭락일(시장 -3%↓) +6.262%·승률 73.1%(67건) — 전체 +5.976%보다 오히려 높다.
+                    #     기존 "폭락장 전멸" 판단은 표본 8건짜리였다. 상한가 경로엔 레짐스탑이 손해.
+                    #   ⚠️장중 전략(S01~S05)은 면제 대상이 아니다. 이 목록에 넣지 말 것.
+                    #   기본값 빈 문자열 = 종전 동작 그대로(전 전략 차단). 켤 때만 값을 넣는다.
+                    #   예: REGIME_STOP_EXEMPT=EODGAP_   ·  롤백: 환경변수 삭제 또는 빈값
+                    _exempt = tuple(p.strip().upper() for p in
+                                    _osr.environ.get("REGIME_STOP_EXEMPT", "").split(",") if p.strip())
                     if _kchg is not None and _stop < 0 and _kchg <= _stop:
-                        return {"status": "ERROR",
-                                "error": f"레짐스탑 — 코스닥 {_kchg:+.2f}% (문턱 {_stop:g}%·폭락일 매수중단)",
-                                "data": None}
+                        if not (_exempt and str(rqname or "").upper().startswith(_exempt)):
+                            return {"status": "ERROR",
+                                    "error": f"레짐스탑 — 코스닥 {_kchg:+.2f}% (문턱 {_stop:g}%·폭락일 매수중단)",
+                                    "data": None}
                     _bad = (_kchg is not None and _kchg <= _drop)                    # -2% 이하 = 절반
                     if not _bad and _osr.environ.get("US_DANGER_BLOCK", "YES").strip().upper() == "YES":
                         try:
@@ -548,7 +565,13 @@ class BrokerClient:
                 import os as _os3, json as _json3
                 # [2026-07-07 친구님] 돈흐름(rqname MFLOW…)은 큰손추종이라 저가주도 담게 별도 하한(MF_MIN_PRICE).
                 #   나머지 전 전략은 SAFEPLUS_MIN_PRICE(5만) 유지 — 7/4 결정 보존. MF_MIN_PRICE 미설정시 SAFEPLUS_MIN_PRICE로 폴백.
-                if str(rqname or "").upper().startswith("MFLOW"):
+                # ★[2026-07-30 친구님 "저점매수는 구애받지 말고 200만 한도 내 매수"] 저점매수(EODGAP_LOWBUY)는
+                #   가격하한 면제 — 유니버스(고저폭 TOP30)가 전일종가 1만원↑로 이미 걸러져 있는데
+                #   급락 당일가로 재검사하면 -13% 빠진 가장 깊은 후보(전략의 핵심)가 차단된다.
+                #   MFLOW 별도하한과 같은 기존 패턴. 롤백: backup\broker_client_20260730_lowbuyfree.py
+                if str(rqname or "").upper().startswith("EODGAP_LOWBUY"):
+                    _minp = 0.0
+                elif str(rqname or "").upper().startswith("MFLOW"):
                     _minp = float(_os3.environ.get("MF_MIN_PRICE") or _os3.environ.get("SAFEPLUS_MIN_PRICE", "1000"))
                 else:
                     _minp = float(_os3.environ.get("SAFEPLUS_MIN_PRICE", "1000"))
@@ -568,7 +591,9 @@ class BrokerClient:
                 #     (500억 완화 = 잡주 건당 -0.031% → +0.939%)이 무력화된 상태였다.
                 #   나머지 전 전략(종가매수 EODGAP 포함)은 SAFEPLUS_MIN_MARKETCAP(1,000억) 그대로.
                 #   롤백: setx MF_MIN_MARKETCAP 100000000000   (=1,000억 = 기존과 동일)
-                if str(rqname or "").upper().startswith("MFLOW"):
+                if str(rqname or "").upper().startswith("EODGAP_LOWBUY"):
+                    _minmc = 0.0   # ★저점매수 시총하한 면제(위 가격하한 주석과 같은 근거)
+                elif str(rqname or "").upper().startswith("MFLOW"):
                     _minmc = float(_os3.environ.get("MF_MIN_MARKETCAP")
                                    or _os3.environ.get("SAFEPLUS_MIN_MARKETCAP", "0"))
                 else:
@@ -608,6 +633,9 @@ class BrokerClient:
             "price":           int(price),
             "hoga_gb":         str(hoga_gb),
             "origin_order_no": str(origin_order_no),
+            # [GHOST-WIN 2026-07-30] 실주문만 유예를 줄인다 — request()의 setdefault(timeout+5)보다
+            #   이 명시값이 우선. 게이트웨이 쪽 상한(BROKER_ORDER_MAX_TTL_SEC=8)과 이중 방어.
+            "ttl_sec":         max(1, int(timeout_sec) - _GHOST_MARGIN_SEC),
         }
         return self.request(payload, timeout_sec=timeout_sec)
 

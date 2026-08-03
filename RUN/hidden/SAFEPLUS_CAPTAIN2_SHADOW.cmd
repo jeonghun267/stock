@@ -31,9 +31,49 @@ set CAPTAIN2_LIVE=YES
 if exist C:\stock_bot\config\captain2_off.flag set CAPTAIN2_LIVE=NO
 set CAPTAIN2_QTY_FIX=1
 set CAPTAIN2_MAX_POSITIONS=6
+REM Monday C2-01 one-share validation: one order attempt, all other live entry lanes isolated.
+set CAPTAIN2_C2_01_ON=1
+set CAPTAIN2_C2_01_MAX_ORDER_ATTEMPTS=1
+set CAPTAIN2_C2_01_SIGNAL_MAX_AGE_SEC=5
+set CAPTAIN2_EARLY_ON=0
+set CAPTAIN2_ENTRY_START=2400
+set CAPTAIN2_BASE_ON=0
+set CAPTAIN2_REACCEL_START=0930
+set CAPTAIN2_EARLY_END=0919
+REM EARLY uses the qualified pre-open watch plus live FID15 inflow speed.
+REM Three routes: direct, >=3pct gap, or below-open dip reclaim. No chase above open +3pct.
+set CAPTAIN2_EARLY_MAX_ABOVE_OPEN_PCT=3.0
+set CAPTAIN2_EARLY_GAP_MIN_PCT=3.0
+set CAPTAIN2_EARLY_DIP_NO_NEW_SEC=2
+set CAPTAIN2_EARLY_DECISION_HM=0920
+set CAPTAIN2_EARLY_FORCE_EXIT_HM=0930
+set CAPTAIN2_EARLY_TREND_MIN_BUY_RATIO=0.52
+set CAPTAIN2_EARLY_TREND_SPEED_FRAC=0.5
+REM Theme leader is a ranking bonus, never a hard exclusion.
+set CAPTAIN2_THEME_LEADER_BONUS_ON=1
+REM Completed 3m re-breakout + line hold + FID15 dominance + VWAP -> common 1-share order pool.
+set CAPTAIN2_REACCEL_LIVE_ON=0
+set CAPTAIN2_LOW_SEARCH_MAX=30
+set CAPTAIN2_BUY_MAX_SEC=30
 REM 0 = unlimited daily entries (rotation must not stop)
 set CAPTAIN2_MAX_ENTRIES=0
-set CAPTAIN2_TRAIL_STEPS=2:1.0,4:1.25,7:1.5
+REM Rotation capital: current holdings + pending buys <= 2,000,000 KRW; sold capital is reusable.
+set CAPTAIN2_MAX_ACTIVE_CAPITAL_KRW=2000000
+REM Test sample collection: do not stop new entries on daily/consecutive realized losses.
+set CAPTAIN2_MAX_DAILY_LOSS_KRW=0
+set CAPTAIN2_MAX_CONSECUTIVE_LOSSES=0
+REM RAID 3m MA rider: arm when MA5/MA10 meet upward and MA20 rises.
+REM General exits resume below MA20; hard stop and 15:10 exit always remain first.
+set CAPTAIN2_MA3_RIDER_ON=1
+set CAPTAIN2_MA3_CONVERGE_PCT=0.5
+REM PULL high-zone block: require >=2pct depth and buy only in lower/middle 60pct.
+set CAPTAIN2_PULL_MIN_DEPTH_PCT=2.0
+set CAPTAIN2_PULL_MAX_RECOVERY_PCT=60
+REM 2026-07-24 owner "fix the problems": widen trail bands toward measured normal
+REM   pullback depth (7/23 leader study: median 2.4pct / p90 6.5pct). Old first
+REM   band 1.0 sold HLB on a 1.4pct dip (kept rising after). Rollback: restore
+REM   previous line 2:1.0,4:1.25,7:1.5
+set CAPTAIN2_TRAIL_STEPS=2:1.5,4:2.0,7:2.5
 REM 2026-07-22 night sweep (6 variants, today's 1s replay, final code): dryup confirm
 REM   30s->60s = best balance. win 41% (best), cost-after -44.5%->-26.8%, dryup stays
 REM   primary exit (22/39), stops 3->5. frac 0.1 and OFF rejected (0.1: win 35%,

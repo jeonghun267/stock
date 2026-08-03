@@ -2686,7 +2686,36 @@ def main() -> None:
         # ══════════════════════════════════════════════════
         # ADD-CB: Circuit Breaker — QA FAIL 시 출력 파일 비생성
         # ══════════════════════════════════════════════════
-        if done_status == "FAIL":
+        # ★[SHRINK-GUARD 2026-07-24 친구님 "문제 수정"] 종목수 급감 시 덮어쓰기 거부.
+        #   7/23 밤 TR 대량 타임아웃 → 5시간 상한 PARTIAL(779종목)이 QA 100점으로 통과해
+        #   전체 파일(3,585종목)을 덮어쓴 사고 재발 방지 — PARTIAL이 CB를 우회하는 구멍 봉쇄.
+        #   기존 파일 대비 종목수 80% 미만이면 상태(OK/WARN/PARTIAL) 무관 출력 차단.
+        #   KOSDAQ_ONLY 모드는 의도적 축소라 가드 제외. 롤백 = 이 블록 삭제.
+        shrink_reason = ""
+        if not KOSDAQ_ONLY:
+            try:
+                if OUTPUT.exists():
+                    _prev_codes = int(pd.read_csv(OUTPUT, usecols=["code"], dtype={"code": str},
+                                                  encoding="utf-8-sig")["code"].nunique())
+                    _new_codes = int(clean["code"].nunique())
+                    if _prev_codes > 0 and _new_codes < 0.8 * _prev_codes:
+                        shrink_reason = f"SHRINK_GUARD: codes {_prev_codes}->{_new_codes} (<80%)"
+            except Exception as exc:
+                log.warning(f"[SHRINK-GUARD] 기존 파일 비교 실패(가드 스킵): {exc}")
+
+        if done_status == "PARTIAL":
+            partial_reason = "PARTIAL_GUARD: incomplete collection; previous EOD preserved"
+            log.error(
+                "[PARTIAL-GUARD] 수집 중단/타임아웃으로 일부 종목만 수집됨 — "
+                "eod_daily_bars.csv 출력 차단 (이전 정상 데이터 유지)"
+            )
+            _write_done_flag("PARTIAL", score, len(clean), clean["code"].nunique(),
+                             reason=partial_reason)
+        elif shrink_reason:
+            log.error(f"[SHRINK-GUARD] {shrink_reason} — 출력 차단 (이전 정상 데이터 유지)")
+            _write_done_flag("FAIL", score, len(clean), clean["code"].nunique(),
+                             reason=shrink_reason)
+        elif done_status == "FAIL":
             log.error(
                 f"[CIRCUIT BREAKER] QA={score:.1f} < 80 — "
                 f"eod_daily_bars.csv 출력 차단 (다운스트림 보호)"

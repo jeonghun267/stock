@@ -131,6 +131,30 @@ def _acct_pass(bc, acc, today):
                     net.pop(c, None)
     except Exception:
         pass
+    # ★[2026-07-27 친구님 승인 — 새전략 실전전환] 새전략 S01~S04(공통 회전엔진·최종청산 15:10)도
+    #   종일 보유 엔진 — 골짜기·캡틴2와 동일 원리로, 상태파일이 오늘 날짜이고 진행 중
+    #   phase(BUY_PENDING/HOLD/SELL_PENDING/RECOVERY_BLOCKED)인 종목은 이 패스에서 제외한다
+    #   (각 전략 엔진이 청산·주문복구 담당). 못 읽으면 기존대로 전부 청산(안전판 우선).
+    for _sname, _spath in (
+            ("S01", r"C:\stock_bot\data\strategy_01_rotation_state_v2.json"),
+            ("S02", r"C:\stock_bot\data\strategy_02_rotation_state_v1.json"),
+            ("S03", r"C:\stock_bot\data\strategy_03_rotation_state_v1.json"),
+            ("S04", r"C:\stock_bot\data\strategy_04_rotation_state_v1.json"),
+            ("S05", r"C:\stock_bot\data\strategy_05_rotation_state_v1.json")):
+        try:
+            ST = json.loads(Path(_spath).read_text(encoding="utf-8-sig"))
+            if str(ST.get("date")) != today:
+                continue
+            sheld = {str(c).zfill(6) for c, p in (ST.get("positions", {}) or {}).items()
+                     if isinstance(p, dict) and str(p.get("phase")) in
+                     ("BUY_PENDING", "HOLD", "SELL_PENDING", "RECOVERY_BLOCKED")}
+            sdrop = sorted(sheld & set(net))
+            if sdrop:
+                _log(f"  🧩새전략({_sname}) 관리중 제외: {sdrop} — 전략 엔진(최종청산 15:10)이 담당")
+                for c in sdrop:
+                    net.pop(c, None)
+        except Exception:
+            pass
     if not net:
         _log("  🧾계좌대조: 오늘 순잔량 남은 종목 없음 ✓")
         return

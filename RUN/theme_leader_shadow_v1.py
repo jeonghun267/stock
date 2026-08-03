@@ -30,6 +30,10 @@ STATE = Path(r"C:\stock_bot\data\shadow\theme_leader_state.json")
 LOG = Path(r"C:\stock_bot\data\LOG\theme_leader_shadow.log")
 HOT_CHG = float(os.environ.get("THLDR_HOT_CHG", "3.0"))
 MIN_MEM = int(os.environ.get("THLDR_MIN_MEM", "3"))
+# ★[2026-07-29 친구님 지시] 등락 1등이 이 %이상이면 대금 순위를 묻지 않고 [상한가대장] 발행.
+#   상한가는 매도잔량이 0이 되어 대금이 안 쌓이므로 기존 vrank<=2 조건으로는 영구 탈락한다.
+#   끄기: setx THLDR_LIMIT_UP_CHG 999
+LIMIT_UP_CHG = float(os.environ.get("THLDR_LIMIT_UP_CHG", "28.0"))
 HEADER = ["일자", "시각", "신호", "테마", "종목코드", "종목명", "진입가", "등락률", "대금억",
           "스냅샷멤버수", "수익30분", "수익1시간", "수익2시간", "최고1시간내", "수익종가"]
 
@@ -219,7 +223,16 @@ def record():
                 true_leaders.append({"code": t1_code, "name": t1["name"], "theme": th,
                                       "gap_pct": round(gap_pct, 1), "che": che_v, "members": len(grp)})
         vrank = next(i + 1 for i, (m, _g) in enumerate(by_val) if m == top_chg[0])
-        if vrank == 1:
+        # ★[2026-07-29 친구님 지시] 상한가 종목을 대장 후보에 넣는다.
+        #   상한가에 잠기면 매도잔량이 0이 되어 체결이 멈추고 거래대금이 더 안 쌓인다.
+        #   그래서 테마에서 가장 강한 종목인데도 대금 순위가 밀려 vrank>=3 으로 버려졌다.
+        #   7/29 실측: 엔젤로보틱스 로봇테마 등락 1등(+29.87%)인데 대금 540억으로 5등 밖
+        #   → continue 로 탈락. 코스모로보틱스(+4.50%·1432억)만 대장으로 잡혔다.
+        #   상한가일수록 확실하게 탈락하는 구조라 등락 1등이 상한가면 대금 순위를 묻지 않는다.
+        #   되돌리기: theme_leader_shadow_v1.py.bak_20260729_limitup 복원.
+        if top_chg[1]["chg"] >= LIMIT_UP_CHG:
+            sig = "상한가대장"
+        elif vrank == 1:
             sig = "쌍끌이"
         elif vrank == 2:
             sig = "대금2등"
