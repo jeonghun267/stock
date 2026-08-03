@@ -123,8 +123,17 @@ MA_CONFIRM    = int(os.environ.get("VLA_MA_CONFIRM", "2"))      # 경로② 돌�
 MG_CHASE_PCT  = float(os.environ.get("VLA_MG_CHASE_PCT", "1.5"))   # 이평선 대비 이 %(초과)면 추격 금지
 MG_WIN_SEC    = float(os.environ.get("VLA_MG_WIN_SEC", "60"))      # 돈유입 판정 창(초·전/후반 이등분 비교)
 GATE1_START   = os.environ.get("VLA_GATE1_START", "0900")
-GATE1_END     = os.environ.get("VLA_GATE1_END", "0930")
-GATE1_ARM_PCT = float(os.environ.get("VLA_GATE1_ARM_PCT", "-5"))
+GATE1_END     = os.environ.get("VLA_GATE1_END", "0920")
+GATE2_START   = os.environ.get("VLA_GATE2_START", "0930")
+GATE1_ARM_PCT = float(os.environ.get("VLA_GATE1_ARM_PCT", "-4"))
+GATE1_FAST_ON = os.environ.get("VLA_GATE1_FAST", "YES").strip().upper() == "YES"
+FAST_MIN_SEC = float(os.environ.get("VLA_FAST_MIN_SEC", "2"))
+FAST_MAX_SEC = float(os.environ.get("VLA_FAST_MAX_SEC", "6"))
+FAST_CONFIRM_SEC = float(os.environ.get("VLA_FAST_CONFIRM_SEC", "2"))
+FAST_REBOUND_LO = float(os.environ.get("VLA_FAST_REBOUND_LO", "0.6"))
+FAST_REBOUND_HI = float(os.environ.get("VLA_FAST_REBOUND_HI", "3.0"))
+FAST_MIN_MONEY = float(os.environ.get("VLA_FAST_MIN_MONEY", "10000000"))
+FAST_MIN_BUY_RATIO = float(os.environ.get("VLA_FAST_MIN_BUY_RATIO", "0.70"))
 
 
 def trend_pct_changes(trend_log):
@@ -254,6 +263,12 @@ class LowAnchor:
     last_cum_vol: Optional[float] = field(default=None, init=False)
     last_px: Optional[float] = field(default=None, init=False)
     last_dir: int = field(default=0, init=False)
+    last_buy_money: Optional[float] = field(default=None, init=False)
+    last_sell_money: Optional[float] = field(default=None, init=False)
+    side_exact: bool = field(default=False, init=False)
+    reset_che: float = field(default=0.0, init=False)
+    fast_ok_since: Optional[float] = field(default=None, init=False)
+    fast_arm_px: Optional[float] = field(default=None, init=False)
 
     trend_log: List[tuple] = field(default_factory=list, init=False)   # RESET 이후 (t,che,seg_buy,seg_sell,cum_vol) 스냅샷 — 전반/후반 추세비교용
 
@@ -269,11 +284,20 @@ class LowAnchor:
     gate1_armed_ts: Optional[float] = field(default=None, init=False)
     gate1_armed_px: Optional[float] = field(default=None, init=False)
 
-    def _reset_seg(self, cur, cum_vol, now_ts):
+    def _reset_seg(self, cur, cum_vol, now_ts, buy_money_cum=None, sell_money_cum=None,
+                   side_exact=False, che=0.0):
         self.seg_buy = self.seg_sell = 0.0
         self.last_cum_vol = cum_vol
         self.last_px = cur
         self.last_dir = 0
+        exact = bool(side_exact and buy_money_cum is not None and sell_money_cum is not None
+                     and buy_money_cum >= 0 and sell_money_cum >= 0)
+        self.last_buy_money = float(buy_money_cum) if exact else None
+        self.last_sell_money = float(sell_money_cum) if exact else None
+        self.side_exact = exact
+        self.reset_che = float(che or 0)
+        self.fast_ok_since = None
+        self.fast_arm_px = None
         self.decided = False
         self.reset_ts = now_ts
         self.trend_log = []
@@ -283,9 +307,40 @@ class LowAnchor:
         반환: {"che":1|0|-1, "buy":.., "sell":.., "vol":..} (1=확연히증가 -1=확연히감소 0=보합) 또는 None(표본부족)."""
         return judge_trend(self.trend_log, self.trend_margin_pct)
 
-    def _seg_update(self, cur, cum_vol):
-        """매 폴링마다 저점 구간 매수/매도 체결량(근사) 누적 — 이번 폴링 사이 늘어난 누적거래량을,
-           가격이 오르면 매수/내리면 매도로 분류한다."""
+    def _seg_update(self, cur, cum_vol, now_ts=None, buy_money_cum=None, sell_money_cum=None,
+                    require_exact=False, che=0.0):
+        """MORNING_CRASH는 FID15 실제 체결대금, 다른 게이트는 기존 틱룰 근사를 누적한다."""
+        if require_exact:
+            valid = (buy_money_cum is not None and sell_money_cum is not None
+                     and buy_money_cum >= 0 and sell_money_cum >= 0)
+            regressed = (valid and self.last_buy_money is not None and self.last_sell_money is not None
+                         and (buy_money_cum < self.last_buy_money
+                              or sell_money_cum < self.last_sell_money))
+            if not valid or not self.side_exact or self.last_buy_money is None \
+                    or self.last_sell_money is None or regressed:
+                self.seg_buy = self.seg_sell = 0.0
+                self.trend_log = []
+                self.last_buy_money = float(buy_money_cum) if valid else None
+                self.last_sell_money = float(sell_money_cum) if valid else None
+                self.side_exact = bool(valid)
+                self.reset_che = float(che or 0)
+                self.fast_ok_since = None
+                self.fast_arm_px = None
+                if now_ts is not None:
+                    self.reset_ts = now_ts
+                self.last_px = cur
+                if cum_vol is not None:
+                    self.last_cum_vol = cum_vol
+                return bool(valid)
+            self.seg_buy += max(0.0, float(buy_money_cum) - self.last_buy_money)
+            self.seg_sell += max(0.0, float(sell_money_cum) - self.last_sell_money)
+            self.last_buy_money = float(buy_money_cum)
+            self.last_sell_money = float(sell_money_cum)
+            self.last_px = cur
+            if cum_vol is not None:
+                self.last_cum_vol = cum_vol
+            return True
+
         if self.last_px is not None and cum_vol is not None and self.last_cum_vol is not None:
             dv = max(0.0, cum_vol - self.last_cum_vol)
             d = self.last_dir
@@ -301,6 +356,48 @@ class LowAnchor:
         self.last_px = cur
         if cum_vol is not None:
             self.last_cum_vol = cum_vol
+        return True
+
+    def _gate1_fast_signal(self, hm, cur, now_ts, che, observation_low, side_ok):
+        """완성봉을 기다리지 않는 Gate1 우회로. 최신 신저가 RESET 이후 실제 체결대금만 사용한다."""
+        elapsed = now_ts - (self.reset_ts if self.reset_ts is not None else now_ts)
+        rebound_pct = (cur / observation_low - 1) * 100.0 if observation_low else 0.0
+        if not (GATE1_FAST_ON and side_ok and FAST_MIN_SEC <= elapsed <= FAST_MAX_SEC):
+            self.fast_ok_since = None
+            self.fast_arm_px = None
+            return None
+        money_total = self.seg_buy + self.seg_sell
+        buy_ratio = self.seg_buy / money_total if money_total > 0 else 0.0
+        fast_ok = (
+            FAST_REBOUND_LO <= rebound_pct <= FAST_REBOUND_HI
+            and money_total >= FAST_MIN_MONEY
+            and buy_ratio >= FAST_MIN_BUY_RATIO
+            and self.seg_buy > self.seg_sell
+            and che > self.reset_che > 0
+        )
+        if fast_ok and self.fast_ok_since is None:
+            self.fast_ok_since = now_ts
+            self.fast_arm_px = cur
+        elif fast_ok and self.fast_arm_px is not None and cur < self.fast_arm_px:
+            self.fast_ok_since = None
+            self.fast_arm_px = None
+            fast_ok = False
+        elif not fast_ok:
+            self.fast_ok_since = None
+            self.fast_arm_px = None
+        held = now_ts - self.fast_ok_since if self.fast_ok_since is not None else 0.0
+        if not fast_ok or held < FAST_CONFIRM_SEC:
+            return None
+        self.done = True
+        return {"signal": "BUY", "observation_low": observation_low, "entry_px": cur,
+                "rebound_pct": round(rebound_pct, 2), "trend": self._trend_judge(),
+                "seg_buy": round(self.seg_buy), "seg_sell": round(self.seg_sell),
+                "entry_gate": "MORNING_CRASH", "side_exact": True, "fast_entry": True,
+                "ready_lo": FAST_REBOUND_LO, "ready_hi": FAST_REBOUND_HI,
+                "reason": (f"Gate1실시간저점FAST {elapsed:.1f}초·FID15매수비{buy_ratio:.0%}·"
+                           f"실체결{money_total / 1e8:.2f}억·체결강도"
+                           f"{self.reset_che:.0f}→{che:.0f}·가격상승{held:.1f}초지속"),
+                "hm": hm}
 
     def _capture_bar1m(self, hm, bar1m) -> bool:
         """이번 분(hm)이 직전 폴링과 다르면(분이 바뀌면) 방금 완성된 분(bar1m["prev"][-1]/["pv"][-1])을
@@ -332,7 +429,9 @@ class LowAnchor:
              daily_ma5: float, bar1m: Optional[Dict] = None,
              daily_ma10: Optional[float] = None, daily_ma20: Optional[float] = None,
              daily_ma60: Optional[float] = None, che: float = 0.0,
-             prev_close: Optional[float] = None, money_flow: bool = False) -> Optional[Dict]:
+             prev_close: Optional[float] = None, money_flow: bool = False,
+             buy_money_cum: Optional[float] = None, sell_money_cum: Optional[float] = None,
+             side_exact: bool = False) -> Optional[Dict]:
         """매 폴링(권장 2초)마다 호출.
         hm="HHMM", cur=현재가, cum_vol=누적거래량(방향분류용), now_ts=time.time(),
         daily_ma5=일봉 5일선, bar1m=이번 분 1분봉 전체 dict({o,h,l,c,prev,v,pv,...} — peak추적·저점확정용),
@@ -380,14 +479,41 @@ class LowAnchor:
         #    3연속음봉 조건 없이 이후 계속 최저가만 갱신한다. IDLE 상태에서만 추적(WATCHING_LOW 진입 후엔
         #    그쪽 저점 갱신 로직이 대신함). 사용자 지시(2026-07-20)로 Gate2의 3연속음봉 조건과 분리. ──
         if self.state == "IDLE" and GATE1_START <= hm < GATE1_END and prev_close and prev_close > 0:
+            gate1_low_reset = False
             if not self.gate1_armed:
                 if (cur / prev_close - 1) * 100 <= GATE1_ARM_PCT:
                     self.gate1_armed = True
                     self.gate1_cand_low = cur
                     self.gate1_armed_ts = now_ts    # ★[지시4] 무장 시각·가격 기록(반등해 -5% 위로 가도 유지=지시5)
                     self.gate1_armed_px = cur
+                    self._reset_seg(cur, cum_vol, now_ts, buy_money_cum, sell_money_cum,
+                                    side_exact, che)
+                    gate1_low_reset = True
             elif self.gate1_cand_low is None or cur < self.gate1_cand_low:
                 self.gate1_cand_low = cur
+                self._reset_seg(cur, cum_vol, now_ts, buy_money_cum, sell_money_cum,
+                                side_exact, che)
+                gate1_low_reset = True
+
+            # 캡틴 EARLY의 RESET 생략 원리를 급락주에 맞게 변환:
+            # 완성 양봉 전에라도 최신 실시간 신저가 이후 실제 매수대금과 가격 상승이 함께 지속되면 진입한다.
+            if self.gate1_armed and GATE1_FAST_ON and self.gate1_cand_low:
+                side_ok = self.side_exact
+                if not gate1_low_reset:
+                    side_ok = self._seg_update(
+                        cur, cum_vol, now_ts, buy_money_cum, sell_money_cum,
+                        require_exact=True, che=che)
+                fast_ev = self._gate1_fast_signal(
+                    hm, cur, now_ts, che, self.gate1_cand_low, side_ok)
+                if fast_ev:
+                    self.state = "WATCHING_LOW"
+                    self.entry_gate = "MORNING_CRASH"
+                    self.observation_low = self.gate1_cand_low
+                    self.gate1_armed = False
+                    self.gate1_cand_low = None
+                    self.gate1_armed_ts = None
+                    self.gate1_armed_px = None
+                    return fast_ev
 
         new_bar1 = self._capture_bar1m(hm, bar1m)
 
@@ -429,6 +555,9 @@ class LowAnchor:
                 self.gate1_cand_low = None
                 self.gate1_armed_ts = None
                 self.gate1_armed_px = None
+            elif hm < GATE2_START:
+                return None   # 09:20 Gate1 종료 후 09:30 Gate2 시작 전에는 신규 저점 사이클 금지
+
             else:
                 # ── Gate2(09:30~) — 기존 골짜기 사냥꾼 기준: 5일선위고점 대비 -5% + 3연속음봉후양봉전환 ──
                 if self.ma5_above_peak is None:
@@ -461,7 +590,9 @@ class LowAnchor:
             # ── 공통: 전 조건 충족 → 저점 관찰 시작 ──
             self.state = "WATCHING_LOW"
             self.entry_gate = entry_gate
-            self._reset_seg(cur, cum_vol, now_ts)
+            exact_gate1 = entry_gate == "MORNING_CRASH" and side_exact
+            self._reset_seg(cur, cum_vol, now_ts, buy_money_cum, sell_money_cum,
+                            exact_gate1, che)
             base_pct = -GATE1_ARM_PCT if entry_gate == "MORNING_CRASH" else -self.peak_drop_pct
             base_desc = "전일종가" if entry_gate == "MORNING_CRASH" else "5일선위고점"
             candle_desc = "양봉전환" if entry_gate == "MORNING_CRASH" \
@@ -480,7 +611,9 @@ class LowAnchor:
         # ── state == WATCHING_LOW ──
         if cur < self.observation_low:
             self.observation_low = cur
-            self._reset_seg(cur, cum_vol, now_ts)   # 신저가 — 대기시간 없이 즉시 저점 갱신·카운터·시계 리셋
+            exact_gate1 = self.entry_gate == "MORNING_CRASH" and side_exact
+            self._reset_seg(cur, cum_vol, now_ts, buy_money_cum, sell_money_cum,
+                            exact_gate1, che)
             return None
 
         # ── 경로② : 현재가가 20일선 위에 완전히 올라서 있을 때만("우상향 중"의 실질 기준),
@@ -536,27 +669,43 @@ class LowAnchor:
         #    시점 대비 "체결강도·매수체결량·매도체결량·거래량 변화량 추세"로 반등품질을 판정한다.
         #    절대 문턱(구 VLA_BUY_RATIO=105)은 안 씀. ★매 폴링(실시간)마다 트렌드 기록을 쌓는다
         #    (1분봉 게이트 밖 — 60초 관찰이 1분봉 스케일보다도 촘촘해야 의미가 있어서). ──
-        self._seg_update(cur, cum_vol)
-        if che and che > 0:
+        exact_required = self.entry_gate == "MORNING_CRASH"
+        side_ok = self._seg_update(cur, cum_vol, now_ts, buy_money_cum, sell_money_cum,
+                                   require_exact=exact_required, che=che)
+        if che and che > 0 and (not exact_required or side_ok):
             self.trend_log.append((now_ts, che, self.seg_buy, self.seg_sell,
                                     cum_vol if cum_vol is not None else 0.0))
-            if len(self.trend_log) > 900:   # 장마감까지 무제한 대기해도 메모리 안전(최근 표본만 유지)
+            if len(self.trend_log) > 900:
                 self.trend_log = self.trend_log[-900:]
 
         rebound_pct = (cur / self.observation_low - 1) * 100.0
         in_zone = self.obs_pct_lo <= rebound_pct <= self.obs_pct_hi
         elapsed = now_ts - (self.reset_ts if self.reset_ts is not None else now_ts)
 
+        # Gate1 FAST: 실시간 신저가 우회로와 완성 양봉 이후 경로가 같은 실제 체결대금 관문을 공유한다.
+        # 실패하면 아래 기존 60초 정밀 경로로 자동 폴백한다.
+        if exact_required:
+            fast_ev = self._gate1_fast_signal(
+                hm, cur, now_ts, che, self.observation_low, side_ok)
+            if fast_ev:
+                return fast_ev
+
         if in_zone and elapsed >= self.watch_min:
             tr = self._trend_judge()
             if tr is not None:
-                if tr["che"] > 0 and tr["buy"] > 0 and tr["vol"] > 0 and tr["sell"] < 0:
+                exact_buy_ok = (not exact_required
+                                or (side_ok and self.side_exact and self.seg_buy > self.seg_sell))
+                if exact_buy_ok and tr["che"] > 0 and tr["buy"] > 0 \
+                        and tr["vol"] > 0 and tr["sell"] < 0:
                     self.done = True
                     return {"signal": "BUY", "observation_low": self.observation_low, "entry_px": cur,
                             "rebound_pct": round(rebound_pct, 2), "trend": tr,
                             "seg_buy": round(self.seg_buy), "seg_sell": round(self.seg_sell),
-                            "entry_gate": self.entry_gate,
-                            "reason": "체결강도·매수체결량·거래량증가+매도체결량감소(반등품질확인)", "hm": hm}
+                            "entry_gate": self.entry_gate, "side_exact": bool(exact_required),
+                            "reason": ("FID15실제매수대금우위+60초반등품질확인"
+                                       if exact_required else
+                                       "체결강도·매수체결량·거래량증가+매도체결량감소(반등품질확인)"),
+                            "hm": hm}
                 if tr["che"] < 0 and tr["buy"] < 0 and tr["vol"] < 0 and tr["sell"] > 0:
                     # ── "2차 하락지점을 찾는다" — 이 저점은 포기하고 IDLE로 되돌아가 재탐색 ──
                     prev_low = self.observation_low
@@ -582,8 +731,12 @@ class LowAnchor:
             return {"signal": "WAIT", "observation_low": self.observation_low, "entry_px": cur,
                     "rebound_pct": round(rebound_pct, 2), "trend": self._trend_judge(), "entry_gate": self.entry_gate,
                     "seg_buy": round(self.seg_buy), "seg_sell": round(self.seg_sell),
-                    "reason": ("반등구간초과대기" if rebound_pct > self.obs_pct_hi
-                               else ("관찰기간워밍업" if elapsed < self.watch_min else "반등품질혼재")),
+                    "reason": ("FID15실체결대금없음·관찰재시작" if exact_required and not side_ok
+                               else ("매도대금우위·매수유예"
+                                     if exact_required and self.seg_sell >= self.seg_buy
+                                     else ("반등구간초과대기" if rebound_pct > self.obs_pct_hi
+                                           else ("관찰기간워밍업" if elapsed < self.watch_min
+                                                 else "반등품질혼재")))),
                     "hm": hm}
         return None   # 관찰 지속
 
@@ -648,7 +801,8 @@ def _csv_row(r):
 
 LEDGER_FIELDS = ["ma5_above_peak", "state", "observation_low", "bar1m_hist", "last_captured_1m_hm",
                   "reset_ts", "seg_buy", "seg_sell",
-                  "last_cum_vol", "last_px", "last_dir", "trend_log", "decided", "done", "entry_gate",
+                  "last_cum_vol", "last_px", "last_dir", "last_buy_money", "last_sell_money",
+                  "side_exact", "reset_che", "fast_ok_since", "fast_arm_px", "trend_log", "decided", "done", "entry_gate",
                   "gate1_armed", "gate1_cand_low", "gate1_armed_ts", "gate1_armed_px",
                   "ma_touch_confirmed_bars"]   # ★[7/19 구조 정상화 5] 재기동 시 확인봉 카운터 유지
 

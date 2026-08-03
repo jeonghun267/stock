@@ -79,7 +79,36 @@ Start-Process -WindowStyle Hidden -FilePath "powershell.exe" -ArgumentList "-NoP
 # S1 패치(24번째) 이후 collector opt10080/10059 routing은 broker 무시(direct OCX), broker 가동은
 # rt_sell/buy_sender 의 STATE 조회 + SHADOW order mirror 보존 목적.
 $broker = "$RUN\broker_gateway_v1.py"
-if (Test-Path $broker) {
+# [DUP-BOOT-FIX 2026-07-29 owner approved] Skip boot when the broker is already alive.
+#   7/28 08:40:02 this boot hit the singleton lock and self-terminated, but it froze the
+#   running broker (PID 12564) for 37s -> watchdog false DEAD -> lock wiped -> 2 brokers
+#   -> preflight BROKER_HOLDINGS 12s timeout -> S01/S03 entry window lost (2 days running).
+#   Watchdog (08:35) already boots the broker, so this block is redundant, not primary.
+#   Rollback: restore run_safeplus_pipeline_0900.ps1.bak_20260729_dupboot
+$brokerAlive = $false
+$brokerPid = 0
+try {
+    $brokerPid = [int](((Get-Content "C:\stock_bot\DATA\broker_gateway.lock" -ErrorAction Stop) -join '').Trim())
+    # [PID-REUSE-GUARD 2026-07-29 owner approved] Verify the PID really belongs to python.
+    #   The lock file survives taskkill/crash (atexit never runs), so a stale PID can be
+    #   reassigned to an unrelated process -> "broker alive" false positive -> boot skipped
+    #   -> market opens with no broker. Checking the process name closes that hole.
+    #   Failing this check falls through to the heartbeat test below, exactly as before.
+    #   Rollback: run_safeplus_pipeline_0900.ps1.bak_20260729_pidguard
+    if ($brokerPid -gt 0) {
+        $brokerProc = Get-Process -Id $brokerPid -ErrorAction SilentlyContinue
+        if ($brokerProc -and ($brokerProc.ProcessName -like 'python*')) { $brokerAlive = $true }
+    }
+} catch { }
+if (-not $brokerAlive) {
+    try {
+        $hbItem = Get-Item "C:\stock_bot\IPC\broker_heartbeat.json" -ErrorAction Stop
+        if (((Get-Date) - $hbItem.LastWriteTime).TotalSeconds -lt 60) { $brokerAlive = $true }
+    } catch { }
+}
+if ($brokerAlive) {
+    "[$(Get-Date -Format 'HH:mm:ss')] broker_gateway_v1 already alive (PID=$brokerPid) - boot skipped" | Add-Content $bootLog
+} elseif (Test-Path $broker) {
     $env:REAL_MICRO = "ON"   # [REAL-MICRO 2026-06-24] 실시간 체결강도(228)/호가(121·125) 구독 강제
     Start-Process -WindowStyle Normal -FilePath $PY -ArgumentList "-X","utf8",$broker
     "[$(Get-Date -Format 'HH:mm:ss')] broker_gateway_v1 started" | Add-Content $bootLog

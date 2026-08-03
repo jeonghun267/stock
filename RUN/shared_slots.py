@@ -8,11 +8,40 @@
 경쟁 조건: 두 프로세스가 밀리초 단위 동시 진입 확률은 낮고(각 2초 루프), os.replace 원자적 쓰기 + 총 예수금이 2차 방어.
 스위치: SHARED_MAX_SLOTS(기본 6) · SHARED_SLOTS_FILE
 """
-import json, os
+import json, os, time
+from contextlib import contextmanager
 from pathlib import Path
+import msvcrt
 
 FILE = Path(os.environ.get("SHARED_SLOTS_FILE") or r"C:\stock_bot\data\shared_slots.json")
 MAX  = int(os.environ.get("SHARED_MAX_SLOTS", "6"))
+LOCK_TIMEOUT_SEC = float(os.environ.get("SHARED_SLOTS_LOCK_TIMEOUT_SEC", "2"))
+
+
+@contextmanager
+def _exclusive_lock():
+    lock_path = FILE.with_suffix(FILE.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        deadline = time.monotonic() + LOCK_TIMEOUT_SEC
+        while True:
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("shared slot lock timeout")
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def _load(today):
@@ -44,23 +73,28 @@ def has(code, today):
 def acquire(code, strat, today):
     """슬롯 확보. 이미 내 종목이면 True(재매수). 풀 차면 False."""
     code = str(code).zfill(6)
-    d = _load(today)
-    s = d.setdefault("slots", {})
-    if code in s:
-        # ★[7/16 수술] 내 전략이 점유했을 때만 재매수 통과 — 타 전략 점유 종목은 False(같은 종목 30만+30만 이중진입 방지)
-        return s[code].get("strat") == strat
-    if len(s) >= MAX:
+    try:
+        with _exclusive_lock():
+            d = _load(today)
+            s = d.setdefault("slots", {})
+            if code in s:
+                # 다른 전략이 점유한 같은 종목은 중복진입 금지.
+                return s[code].get("strat") == strat
+            if len(s) >= MAX:
+                return False
+            s[code] = {"strat": strat}
+            d["date"] = today
+            _save(d)
+            return True
+    except TimeoutError:
         return False
-    s[code] = {"strat": strat}
-    d["date"] = today
-    _save(d)
-    return True
 
 
 def release(code, today):
     """슬롯 반환(완전 종료 시). 다른 종목/전략이 쓸 수 있게."""
     code = str(code).zfill(6)
-    d = _load(today)
-    if code in d.get("slots", {}):
-        del d["slots"][code]
-        _save(d)
+    with _exclusive_lock():
+        d = _load(today)
+        if code in d.get("slots", {}):
+            del d["slots"][code]
+            _save(d)

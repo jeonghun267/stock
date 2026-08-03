@@ -54,6 +54,16 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 #   캡틴1·골짜기가 이미 쓰는 바로 그 파일(data\shared_slots.json)을 그대로 공유한다.
 sys.path.insert(0, r"C:\stock_bot\RUN")
 import shared_slots as shared      # noqa: E402
+from captain2_common_hold_sell_v1 import (  # noqa: E402
+    HoldSellState,
+    StrategyId,
+    UnifiedHoldSellEngine,
+)
+from captain2_strategy_01_live_bridge_v1 import (  # noqa: E402
+    STRATEGY_NAME as C2_01_STRATEGY_NAME,
+    select_fresh_signals,
+)
+from valley_common_exit_shadow_v1 import SideWindows, build_observation  # noqa: E402
 
 
 # =============================================================================
@@ -66,6 +76,13 @@ class Config:
         "CAPTAIN2_SNAPSHOT", r"C:\stock_bot\IPC\live_micro_snapshot.json"))
     micro_board_path: Path = Path(os.environ.get(
         "CAPTAIN2_MICRO_BOARD", r"C:\stock_bot\data\micro_rank_board.json"))
+    selector_board_path: Path = Path(os.environ.get(
+        "CAPTAIN2_SELECTOR_BOARD", r"C:\stock_bot\data\돈흐름_선별판.json"))
+    selector_gate_on: bool = os.environ.get(
+        "CAPTAIN2_SELECTOR_GATE_ON", "1").strip() == "1"
+    selector_refresh_sec: float = float(os.environ.get("CAPTAIN2_SELECTOR_REFRESH_SEC", "5"))
+    early_watch_path: Path = Path(os.environ.get(
+        "CAPTAIN2_EARLY_WATCH", r"C:\stock_bot\IPC\micro_watch_captain2.json"))
     name_cache_path: Path = Path(os.environ.get(
         "CAPTAIN2_NAME_CACHE", r"C:\stock_bot\data\_code_name_cache.json"))
     state_path: Path = Path(os.environ.get(
@@ -76,11 +93,13 @@ class Config:
         "CAPTAIN2_LOG", r"C:\stock_bot\LOG\captain2_moneyflow.log"))
     manual_block_path: Path = Path(os.environ.get(
         "CAPTAIN2_MANUAL_BLOCK", r"C:\stock_bot\config\manual_buy_block.flag"))
+    off_flag_path: Path = Path(os.environ.get(
+        "CAPTAIN2_OFF_FLAG", r"C:\stock_bot\config\captain2_off.flag"))
 
     live: bool = os.environ.get("CAPTAIN2_LIVE", "NO").strip().upper() == "YES"
     qty_fixed: int = int(os.environ.get("CAPTAIN2_QTY_FIX", "1"))
     loop_sec: float = float(os.environ.get("CAPTAIN2_LOOP_SEC", "1.0"))
-    entry_start: str = os.environ.get("CAPTAIN2_ENTRY_START", "0900")
+    entry_start: str = os.environ.get("CAPTAIN2_ENTRY_START", "0930")
     entry_end: str = os.environ.get("CAPTAIN2_ENTRY_END", "1520")
     force_exit: str = os.environ.get("CAPTAIN2_FORCE_EXIT", "1525")
     program_end: str = os.environ.get("CAPTAIN2_END", "1530")
@@ -104,7 +123,10 @@ class Config:
     min_price_ticks: int = int(os.environ.get("CAPTAIN2_MIN_PRICE_TICKS", "1"))
 
     # 보유/경계/청산
-    hard_stop_pct: float = float(os.environ.get("CAPTAIN2_STOP_PCT", "-3.0"))
+
+    hard_stop_bottom_pct: float = float(os.environ.get("CAPTAIN2_STOP_BOTTOM_PCT", "-2.0"))
+    hard_stop_pull_pct: float = float(os.environ.get("CAPTAIN2_STOP_PULL_PCT", "-3.0"))
+    hard_stop_pull_buy_pct: float = float(os.environ.get("CAPTAIN2_STOP_PULL_BUY_PCT", "-4.0"))
     watch_buy_ratio: float = float(os.environ.get("CAPTAIN2_WATCH_BUY_RATIO", "0.52"))
     sell_buy_ratio: float = float(os.environ.get("CAPTAIN2_SELL_BUY_RATIO", "0.48"))
     watch_confirm_sec: float = float(os.environ.get("CAPTAIN2_WATCH_CONFIRM_SEC", "2.0"))
@@ -130,8 +152,20 @@ class Config:
     #   새 TR 0. 267MB라 백그라운드 스레드 로드(이평은 보조라 수십 초 늦게 켜져도 무해).
     eod_bars_path: Path = Path(os.environ.get(
         "CAPTAIN2_EOD_BARS", r"C:\stock_bot\data\eod_daily_bars.csv"))
+    # ★[수익성 진단 2026-07-24] 일봉 5·20선이 모두 60선 아래인 역배열은 신규매수 금지.
+    #   돈흐름 공용 캐시를 재사용해 새 TR·대용량 CSV 재로딩 없이 세 진입 레인에 동일 적용한다.
+    reverse_ma_gate_on: bool = os.environ.get(
+        "CAPTAIN2_REVERSE_MA_GATE_ON", "1").strip() == "1"
+    ma60_cache_path: Path = Path(os.environ.get(
+        "CAPTAIN2_MA60_CACHE", r"C:\stock_bot\data\돈흐름_ma60.json"))
     #   허가증 효과 = "조금 더 끌고 간다" — 흐름매도 지속확인 시간 배수(돈이 살아있을 때만 발동).
     ma_permit_confirm_mult: float = float(os.environ.get("CAPTAIN2_MA_PERMIT_CONFIRM_MULT", "2.0"))
+    # ★[3분봉 상승보유 2026-07-24] RAID 보유 중 5·10선이 상향으로 만나고 20선이
+    #   우상향하면 20선 이탈 전까지 일반 전략매도를 유예한다. 하드컷·강제청산은 항상 우선한다.
+    ma3_rider_on: bool = os.environ.get("CAPTAIN2_MA3_RIDER_ON", "1").strip() == "1"
+    ma3_converge_pct: float = float(os.environ.get("CAPTAIN2_MA3_CONVERGE_PCT", "0.5"))
+    ma3_bars_path: Path = Path(os.environ.get(
+        "CAPTAIN2_MA3_BARS", r"C:\stock_bot\data\prices_3m.csv"))
     # ㉯돈 마름(속도 소멸) 매도 — "돈이 빠질 때까지 보유"의 대우: 유입속도가 보유 중 피크의
     #   20% 아래로 30초 지속 붕괴하면 돈이 빠진 것. 보유 60초·피크 0.01억/초 미만이면 판정 안 함.
     dryup_frac: float = float(os.environ.get("CAPTAIN2_DRYUP_FRAC", "0.2"))
@@ -148,6 +182,13 @@ class Config:
     max_positions: int = int(os.environ.get("CAPTAIN2_MAX_POSITIONS", "6"))
     # ★[2026-07-22] 0 = 하루 진입 횟수 무제한(로테이션이 하루 3회에서 끊기던 제한 해제)
     max_entries_day: int = int(os.environ.get("CAPTAIN2_MAX_ENTRIES", "0"))
+    # 하루 누적 매수액이 아니라 현재 보유+매수대기 원금만 제한한다. 매도 체결 뒤 즉시 재사용.
+    max_active_capital_krw: float = float(os.environ.get(
+        "CAPTAIN2_MAX_ACTIVE_CAPITAL_KRW",
+        os.environ.get("CAPTAIN2_MAX_DAILY_BUY_KRW", "2000000")))
+    # 표본 확보용: 0이면 일손실/연속손실에 따른 신규진입 중단을 사용하지 않는다.
+    max_daily_loss_krw: float = float(os.environ.get("CAPTAIN2_MAX_DAILY_LOSS_KRW", "0"))
+    max_consecutive_losses: int = int(os.environ.get("CAPTAIN2_MAX_CONSECUTIVE_LOSSES", "0"))
     # ★[2026-07-22] 전역 쿨다운 → '종목별' 쿨다운으로 의미 변경. 같은 루프에서 서로 다른 종목이
     #   빈 슬롯만큼 동시에 진입할 수 있어야 하므로, 이 값은 동일 종목 재진입만 막는 데 쓴다.
     #   (동일 종목 재진입은 CLOSED/FAILED 재무장 로직에서도 같은 값으로 한 번 더 걸린다)
@@ -165,23 +206,71 @@ class Config:
     pull_buy_max_sec: float = float(os.environ.get("CAPTAIN2_PULL_BUY_MAX_SEC", "60"))
     pull_buy_confirm_sec: float = float(os.environ.get("CAPTAIN2_PULL_BUY_CONFIRM_SEC", "5"))
     pull_split_drop_pct: float = float(os.environ.get("CAPTAIN2_PULL_SPLIT_DROP_PCT", "0.8"))
+    # ★[PULL 고점차단 2026-07-24] 0.8%는 관찰 시작 기준일 뿐 매수 허용 깊이가 아니다.
+    #   실제 매수는 고점→L2 저점 깊이 2% 이상이며, 저점에서 고점으로 60% 넘게 회복하기 전만 허용한다.
+    pull_min_depth_pct: float = float(os.environ.get("CAPTAIN2_PULL_MIN_DEPTH_PCT", "2.0"))
+    pull_max_recovery_pct: float = float(os.environ.get("CAPTAIN2_PULL_MAX_RECOVERY_PCT", "60"))
     pull_prev_max_age_sec: float = float(os.environ.get("CAPTAIN2_PULL_PREV_MAX_AGE_SEC", "1800"))
+
+    # ★[BASE 횡보돌파 2026-07-24 친구님 승인] 응집폭발의 검증된 완성 1분봉 조건을
+    #   캡틴2 독립 레인으로 이식한다. 5배 그림자는 비용 전 본전이었고, 실전값 6배는
+    #   7건 중 5승(+3.64%p, 비용 전)이어서 6배만 사용한다. 돌파 추격은 금지하고
+    #   10분 안 돌파선 리테스트 뒤 기존 실제 저점·매수우위 관문으로 진입한다.
+    base_on: bool = os.environ.get("CAPTAIN2_BASE_ON", "1").strip() == "1"
+    base_bars_path: Path = Path(os.environ.get(
+        "CAPTAIN2_BASE_BARS", r"C:\stock_bot\data\돈맥_1분봉.json"))
+    base_seed_ledger_path: Path = Path(os.environ.get(
+        "CAPTAIN2_BASE_SEED_LEDGER", r"C:\stock_bot\data\base_breakout_shadow_ledger.json"))
+    base_n: int = int(os.environ.get("CAPTAIN2_BASE_N", "30"))
+    base_tight_pct: float = float(os.environ.get("CAPTAIN2_BASE_TIGHT_PCT", "3.0"))
+    base_volx: float = float(os.environ.get("CAPTAIN2_BASE_VOLX", "6.0"))
+    base_wait_bars: int = int(os.environ.get("CAPTAIN2_BASE_WAIT_BARS", "10"))
+    # 7/23 6배 이상 리테스트 4건 실측: 실제 저점 0.1~66.9초, 저점 뒤 매수관문 최대 57초.
+    # BASE만 90/60초로 분리한다. RAID 5/6초·PULL 180/60초는 그대로다.
+    base_low_search_max_sec: float = float(os.environ.get("CAPTAIN2_BASE_LOW_SEARCH_MAX", "90"))
+    base_buy_max_sec: float = float(os.environ.get("CAPTAIN2_BASE_BUY_MAX_SEC", "60"))
+    base_entry_start: str = os.environ.get("CAPTAIN2_BASE_ENTRY_START", "0930")
+    base_entry_end: str = os.environ.get("CAPTAIN2_BASE_ENTRY_END", "1430")
+
+    # ★[재가속 재돌파 2026-07-24] 완성 3분봉 재돌파 뒤 돌파선 유지·추격상한·
+    #   VWAP·정확 FID15 매수우위를 모두 통과하면 기존 후보 풀로 보내 1주 주문체계를 재사용한다.
+    reaccel_shadow_on: bool = os.environ.get(
+        "CAPTAIN2_REACCEL_SHADOW_ON", "1").strip() == "1"
+    reaccel_live_on: bool = os.environ.get(
+        "CAPTAIN2_REACCEL_LIVE_ON", "0").strip() == "1"
+    reaccel_start: str = os.environ.get("CAPTAIN2_REACCEL_START", "0930")
+    reaccel_end: str = os.environ.get("CAPTAIN2_REACCEL_END", "1420")
+    reaccel_min_day_gain_pct: float = float(os.environ.get(
+        "CAPTAIN2_REACCEL_MIN_DAY_GAIN_PCT", "3.0"))
+    reaccel_min_age_bars: int = int(os.environ.get("CAPTAIN2_REACCEL_MIN_AGE_BARS", "5"))
+    reaccel_max_ext_pct: float = float(os.environ.get("CAPTAIN2_REACCEL_MAX_EXT_PCT", "1.5"))
+    reaccel_min_volx: float = float(os.environ.get("CAPTAIN2_REACCEL_MIN_VOLX", "1.2"))
+    reaccel_max_surge5_pct: float = float(os.environ.get(
+        "CAPTAIN2_REACCEL_MAX_SURGE5_PCT", "5.0"))
+    reaccel_gate_max_sec: float = float(os.environ.get(
+        "CAPTAIN2_REACCEL_GATE_MAX_SEC", "60"))
 
     # ★[EARLY 초입레인 2026-07-23 친구님 확정] "돈이 처음 몰리는 초입"을 RESET 저점확정 없이 잡는
     #   별도 레인. 수치 전부 7/23 1초캡처 실측(발화81·성공50·승률62%·비용후 +0.24%)에서 도출 — 추측 0.
-    #   근본배경: 100억 누적대금 관문이 초입엔 원리적으로 안 열려(주성 09:01:52에야 돌파=이미 +3.94%)
-    #   현행 RAID가 꼭지를 샀다. EARLY는 그 관문을 '돈의 속도'로 대체한다(min_price 1만원 관문은 유지).
+    #   EARLY는 장전 전일대금 상위 감시풀과 현재 유입속도로 초입을 잡는다.
+    #   일반·재가속 레인은 당일 누적대금 100억원 공통관문을 그대로 유지한다.
     #   증가배율은 개장 첫 30초 면제(30초창 미형성 — 실측 규칙에 포함), 매수대금비율은 첫 10초
     #   개장누적 폴백(10초 전 데이터 부재 — 실측과 동일). FID15 4필드 없으면 발화 안 함(fail-closed).
     early_on: bool = os.environ.get("CAPTAIN2_EARLY_ON", "1").strip() == "1"
     early_start: str = os.environ.get("CAPTAIN2_EARLY_START", "0900")
-    early_end: str = os.environ.get("CAPTAIN2_EARLY_END", "0910")
+    early_end: str = os.environ.get("CAPTAIN2_EARLY_END", "0919")
     early_min_speed: float = float(os.environ.get("CAPTAIN2_EARLY_MIN_SPEED", "1666667"))
     early_min_burst: float = float(os.environ.get("CAPTAIN2_EARLY_MIN_BURST", "3.0"))
     early_burst_waive_sec: float = float(os.environ.get("CAPTAIN2_EARLY_BURST_WAIVE_SEC", "30"))
     early_min_buy_ratio: float = float(os.environ.get("CAPTAIN2_EARLY_MIN_BUY_RATIO", "0.70"))
     early_persist_sec: int = int(os.environ.get("CAPTAIN2_EARLY_PERSIST_SEC", "3"))
-    early_max_above_open_pct: float = float(os.environ.get("CAPTAIN2_EARLY_MAX_ABOVE_OPEN_PCT", "2.0"))
+    early_max_above_open_pct: float = float(os.environ.get("CAPTAIN2_EARLY_MAX_ABOVE_OPEN_PCT", "3.0"))
+    early_gap_min_pct: float = float(os.environ.get("CAPTAIN2_EARLY_GAP_MIN_PCT", "3.0"))
+    early_dip_no_new_sec: float = float(os.environ.get("CAPTAIN2_EARLY_DIP_NO_NEW_SEC", "2"))
+    early_decision_hm: str = os.environ.get("CAPTAIN2_EARLY_DECISION_HM", "0920")
+    early_force_exit_hm: str = os.environ.get("CAPTAIN2_EARLY_FORCE_EXIT_HM", "0930")
+    early_trend_min_buy_ratio: float = float(os.environ.get("CAPTAIN2_EARLY_TREND_MIN_BUY_RATIO", "0.52"))
+    early_trend_speed_frac: float = float(os.environ.get("CAPTAIN2_EARLY_TREND_SPEED_FRAC", "0.5"))
     # 시가 폴백(엔진이 09:01 이후 재시작한 경우): 돈맥_1분봉.json의 op(당일 시가). 없으면 그 종목 EARLY 금지.
     early_m1_path: Path = Path(os.environ.get("CAPTAIN2_EARLY_M1", r"C:\stock_bot\data\돈맥_1분봉.json"))
 
@@ -190,6 +279,15 @@ class Config:
     #   지엔씨는 5/10일선·VWAP 위 + 직전10초 매수비 97% 폭주 중 트레일 조기매도(반납 2.21%p+재매수 왕복).
     #   원칙: VWAP '하나만'으로 매매하지 않는다 — 진입은 기존 조건에 관문 추가, 매도는 3중 동시확인.
     #   VWAP 무효(FID15 부재·누적량 리셋 글리치=현재가의 0.5~2배 밖) 시 관문 통과(fail-open — 전면중단 방지).
+    # C2-01 장초반 급상승 초입. 주문0 감시기가 확정한 신선한 신호만 기존 주문 경로에 전달한다.
+    c2_01_on: bool = os.environ.get("CAPTAIN2_C2_01_ON", "0").strip() == "1"
+    c2_01_signal_path: Path = Path(os.environ.get(
+        "CAPTAIN2_C2_01_SIGNAL", r"C:\stock_bot\data\captain2_c2_01_shadow.json"))
+    c2_01_signal_max_age_sec: float = float(os.environ.get(
+        "CAPTAIN2_C2_01_SIGNAL_MAX_AGE_SEC", "5"))
+    c2_01_max_order_attempts: int = int(os.environ.get(
+        "CAPTAIN2_C2_01_MAX_ORDER_ATTEMPTS", "1"))
+
     vwap_gate_on: bool = os.environ.get("CAPTAIN2_VWAP_GATE_ON", "1").strip() == "1"
     #   보유 중 VWAP 이탈 = 즉시매도 아님 → 조기경보. 경보 중 '매도대금 우위(기존 48% 임계 재사용)
     #   + 돈 속도 약화(기존 persist_min_frac 0.5 재사용) + 가속 아님'이 함께 확인될 때만 매도.
@@ -211,7 +309,10 @@ class Config:
     score_sell_ready: float = float(os.environ.get("CAPTAIN2_SCORE_SELL_READY", "75"))
     score_warning: float = float(os.environ.get("CAPTAIN2_SCORE_WARNING", "50"))
     score_watch: float = float(os.environ.get("CAPTAIN2_SCORE_WATCH", "25"))
-    score_hold_max_sec: float = float(os.environ.get("CAPTAIN2_SCORE_HOLD_MAX_SEC", "10"))
+
+    score_dry_confirm_sec: float = float(os.environ.get("CAPTAIN2_SCORE_DRY_CONFIRM_SEC", "5"))
+    score_min_hold_sec: float = float(os.environ.get("CAPTAIN2_SCORE_MIN_HOLD_SEC", "30"))
+    score_bottom_min_hold_sec: float = float(os.environ.get("CAPTAIN2_SCORE_BOTTOM_MIN_HOLD_SEC", "60"))
     score_peak_min_mps: float = float(os.environ.get("CAPTAIN2_SCORE_PEAK_MIN_MPS", "1000000"))
 
     # ★[재진입 가드 2026-07-23 친구님 확정 — 진입검증 2단계] 같은 종목 재진입은 '직전 회차보다
@@ -221,6 +322,9 @@ class Config:
     #   모두 직전 진입 이상이어야 재진입(매수비는 오차단 위험 때문에 제외 — _reentry_ok 참조).
     #   (유입대금 '하한 상향'은 구간별 비용후 전부 마이너스로 데이터 근거 없어 미적용)
     reentry_guard_on: bool = os.environ.get("CAPTAIN2_REENTRY_GUARD_ON", "1").strip() == "1"
+    max_entries_per_code: int = int(os.environ.get("CAPTAIN2_MAX_ENTRIES_PER_CODE", "2"))
+    reentry_strength_mult: float = float(os.environ.get("CAPTAIN2_REENTRY_STRENGTH_MULT", "1.3"))
+    reentry_buy_ratio_add: float = float(os.environ.get("CAPTAIN2_REENTRY_BUY_RATIO_ADD", "0.05"))
 
     # ★[VI 거부 대응 2026-07-23 친구님 확정] VI 거부→해제 확인→1~2초 대기→동일수량 재주문→최대 3회
     #   (max_sell_retry=3 재사용)→실패 시 로그 후 종료. 7/23 지엔씨 실측: VI 단일가 2분간 최유리
@@ -232,6 +336,7 @@ class Config:
 
     stale_snapshot_sec: float = float(os.environ.get("CAPTAIN2_STALE_SNAPSHOT_SEC", "3"))
     stale_board_sec: float = float(os.environ.get("CAPTAIN2_STALE_BOARD_SEC", "5"))
+    stale_recovery_sec: float = float(os.environ.get("CAPTAIN2_STALE_RECOVERY_SEC", "5"))
 
     # ★[구조판정 SHADOW 2026-07-24 친구님 승인] 계층 B(장중 대장주 구조판정)를 '그림자'로 병렬 기록.
     #   검증(1분봉 30일·대장244): 구조 3/3(종가<VWAP & 직전5완성분봉 저점이탈 & 최근60초 순매도)이
@@ -244,6 +349,8 @@ class Config:
     #   같은 우위 버킷 안에서 우선. 관문 아님 — 매수 차단 0·순서만 변경. 백테(12일·691신호):
     #   매집 그룹 전 축 우위·D-2 외인 비용후 +0.18% vs 비매집 -0.93%. EARLY 정렬은 확정 스펙이라 무적용.
     supply_boost_on: bool = os.environ.get("CAPTAIN2_SUPPLY_BOOST_ON", "1").strip() == "1"
+    theme_leader_bonus_on: bool = os.environ.get("CAPTAIN2_THEME_LEADER_BONUS_ON", "1").strip() == "1"
+    theme_leader_max_age_min: float = float(os.environ.get("CAPTAIN2_THEME_LEADER_MAX_AGE_MIN", "30"))
 
     # ★[2026-07-22] 시장 필터 — 잡주 제거. 기존 RESET/매수우위/WATCH/SELL 임계값과 무관한 별도 관문.
     #   현재가 1만원 미만 또는 당일 거래대금 100억원 미만이면 LOW_SEARCH/RESET/BUY_READY/BUY 전부 금지.
@@ -310,6 +417,8 @@ class MarketPoint:
     money_speed_30s: float = 0.0
     money_start: bool = False
     money_start_raw: bool = False
+    theme_leader: bool = False
+    theme_signal: str = ""
     # ★[2026-07-22] 당일 거래대금(원). 실측 결과 입력 JSON 두 개 어디에도 '누적' 당일거래대금 필드가
     #   없다(board의 money_* 는 전부 5s~180s 롤링 윈도우, snapshot은 cur/cum_vol/che_str/호가뿐).
     #   → 새 TR 없이 현재 데이터만으로 만드는 근사값: 현재가 × 당일누적거래량.
@@ -346,12 +455,62 @@ class EarlyState:
     발화는 종목당 하루 1회(fired). hist는 최근 20초의 (초epoch, FID15매수누계, 매도누계, 가격)."""
     bm0: float = -1.0                  # 개장 후 첫 관측 FID15 누계(첫 10초 비율 폴백 기준선)
     sm0: float = -1.0
+    bm0_ts: float = 0.0
     hist: deque = field(default_factory=lambda: deque(maxlen=20))
     streak: int = 0                    # 조건 연속 초(무장가 이상 유지 = 지속)
     last_sec: float = 0.0
     arm_px: float = 0.0                # 무장가 — 이 아래로 밀리면 지속 끊김
+    high_px: float = 0.0               # 시가 +3% 선을 먼저 넘긴 추격 이력 차단
+    below_open_seen: bool = False
+    dip_low: float = 0.0
+    dip_low_ts: float = 0.0
+    dip_low_speed: float = 0.0
+    streak_kind: str = ""
+    entry_kind: str = ""
     fired: bool = False
-    sort_key: Tuple[float, float, float] = (0.0, 0.0, 0.0)   # (매수비, 속도, 배율) 정렬용
+    sort_key: Tuple[float, float, float, float, float] = (0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+@dataclass
+class BasePatternState:
+    """완성 1분봉 응집돌파 추적. 매수판정은 FlowState(BASE)가 담당한다."""
+    hist: deque = field(default_factory=lambda: deque(maxlen=45))
+    cap_hm: str = ""
+    armed: bool = False
+    breakout_hm: str = ""
+    limit: float = 0.0
+    wait_left: int = 0
+    range_pct: float = 0.0
+    volx: float = 0.0
+    breakout_close: float = 0.0
+    retest_started: bool = False
+
+
+@dataclass
+class ReaccelShadowState:
+    """완성 3분봉 재돌파와 이후 60초 관문을 추적하는 주문0 전용 상태."""
+    bars: deque = field(default_factory=lambda: deque(maxlen=130))
+    bucket: int = -1
+    bar_hm: str = ""
+    bar_open: float = 0.0
+    bar_high: float = 0.0
+    bar_low: float = 0.0
+    bar_close: float = 0.0
+    bar_start_cum: float = 0.0
+    bar_last_cum: float = 0.0
+    status: str = "IDLE"
+    arm_ts: Optional[datetime] = None
+    signal_price: float = 0.0
+    line: float = 0.0
+    age: int = 0
+    ext_pct: float = 0.0
+    volx: float = 0.0
+    surge5_pct: float = 0.0
+    base_buy_cum: float = 0.0
+    base_sell_cum: float = 0.0
+    base_buy_money: float = 0.0
+    base_sell_money: float = 0.0
+    dominance_since: Optional[datetime] = None
 
 
 @dataclass
@@ -418,9 +577,18 @@ class FlowState:
     # ★[설계8단계 2026-07-22] ③가속(매수대금 속도 10>30>60초 서열) ⑤이평 허가증 ①평상시 배율
     money_accel: bool = False
     ma_permit: bool = False
+    # ★[3분봉 상승보유] 일봉 허가증과 분리. RAID에서만 일반 전략매도를 잠근다.
+    ma3_rider_permit: bool = False
+    ma3_ma5: float = 0.0
+    ma3_ma10: float = 0.0
+    ma3_ma20: float = 0.0
+    ma3_hold_logged: bool = False
+    morning_hold_logged: bool = False
     money_mult_dayavg: float = 0.0
     # ★[눌림레인 2026-07-22] 레인(RAID=급습/PULL=눌림 반등) + 직전 에피소드 고점(레인 판정용)
     lane: str = "RAID"
+    # C2-01만 사용하는 공통 상승보유·매도 엔진 상태. 재시작 뒤에도 같은 판단 순서를 잇는다.
+    common_exit_state: Dict[str, Any] = field(default_factory=dict)
     prev_episode_high: float = 0.0
     prev_episode_end_ts: Optional[datetime] = None
     # ★[눌림레인 점검1 수정] 이번 에피소드에서 관측한 최고가 — 감지 시점부터 추적.
@@ -431,6 +599,11 @@ class FlowState:
     # ★[PULL 5조건 2026-07-22 친구님] Higher Low용 — PULL 저점탐색의 1차 확정 저점(L1).
     #   0이면 아직 1차 저점 전. 2차 저점(L2)이 L1보다 높게 확정될 때만 RESET(앵커=L2).
     pull_l1_price: float = 0.0
+    # ★[PULL 실제 재눌림 2026-07-24] L1 뒤 반등 고점에서 최소 1틱 다시 내려온 뒤에만
+    #   L2 후보 탐색을 시작한다. 단순 상승·횡보를 가짜 L2로 확정하지 않기 위한 상태다.
+    pull_rebound_high: float = 0.0
+    pull_repull_seen: bool = False
+    pull_reference_high: float = 0.0       # PULL 위치 판정용 실제 직전/현재 에피소드 고점
     buy_ratio: float = 0.5
     buy_sell_ratio: float = 1.0
     price_response_pct: float = 0.0
@@ -463,6 +636,7 @@ class FlowState:
     sell_requested_ts: Optional[datetime] = None
     buy_requested_qty: int = 0
     sell_requested_qty: int = 0
+    buy_reserved_krw: float = 0.0
     buy_filled_qty: int = 0
     sell_filled_qty: int = 0
     buy_avg_fill_price: float = 0.0
@@ -494,6 +668,7 @@ class FlowState:
     obs_delta_cum_vol: float = 0.0
     obs_prev_structure_low: float = 0.0
     obs_structure_broken: bool = False
+    obs_buy_signal_reason: str = ""
 
     # ★[구조판정 SHADOW 2026-07-24] 직전 완성 1분봉 저가 누적(로그전용·판정 미사용).
     sh_entry_ref: Optional[datetime] = None      # 이 추적이 시작된 진입 시각(진입 바뀌면 초기화)
@@ -733,6 +908,150 @@ class TickSideAggregator:
                          "exact": bool(float(snap.get("exact") or 0.0))}
 
 
+class ThreeMinuteMARider:
+    """실시간 가격으로 3분봉 5·10·20선을 이어 붙이는 RAID 보유 허가증.
+
+    전일 시드는 intraday_ma의 검증된 CSV 로더만 재사용한다. bars3()/broker fallback은
+    호출하지 않으므로 보유 중 추가 TR은 0이다. 상향 만남에서 무장한 뒤에는 5·10선이
+    벌어져도 상승을 계속 타며, 20선 이탈 또는 완성봉 20선 비상승에서 해제한다.
+    """
+
+    KEEP_COMPLETED = 20
+
+    def __init__(self, cfg: Config, logger: logging.Logger) -> None:
+        self.enabled = cfg.ma3_rider_on
+        self.converge_pct = max(0.0, cfg.ma3_converge_pct)
+        self.bars_path = cfg.ma3_bars_path
+        self.log = logger
+        self._seed: Dict[str, List[float]] = {}
+        self._today: Dict[str, deque] = {}
+        self._bucket: Dict[str, int] = {}
+        self._current_close: Dict[str, float] = {}
+        self._active: set = set()
+        self._last: Dict[str, Tuple[float, float, float]] = {}
+        self._loaded = False
+
+    @staticmethod
+    def _metrics(series: List[float]) -> Optional[Tuple[float, float, float, bool, bool]]:
+        if len(series) < 21:
+            return None
+        m5 = sum(series[-5:]) / 5.0
+        m10 = sum(series[-10:]) / 10.0
+        m20 = sum(series[-20:]) / 20.0
+        prev = series[:-1]
+        p5 = sum(prev[-5:]) / 5.0
+        p10 = sum(prev[-10:]) / 10.0
+        p20 = sum(prev[-20:]) / 20.0
+        return m5, m10, m20, p5 <= p10 and m5 >= m10, m20 > p20
+
+    def load_seed(self) -> None:
+        if not self.enabled:
+            self._loaded = True
+            self.log.info("3분봉 상승보유 OFF")
+            return
+        try:
+            # 검증된 전일 풀데이·신선도 필터만 사용. bars3/브로커 함수는 호출하지 않는다.
+            os.environ.setdefault("PRIOR_3M_CSV", str(self.bars_path))
+            from intraday_ma import _prior_map
+            raw = _prior_map()
+            seed: Dict[str, List[float]] = {}
+            for code, values in raw.items():
+                closes = []
+                for value in values[-self.KEEP_COMPLETED:]:
+                    try:
+                        price = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if price > 0:
+                        closes.append(price)
+                if len(closes) >= self.KEEP_COMPLETED:
+                    seed[str(code).zfill(6)] = closes
+            self._seed = seed
+            self._loaded = True
+            self.log.info("3분봉 상승보유 전일시드 완료 %d종목 (추가 TR 0)", len(seed))
+        except Exception:
+            self._loaded = True
+            self.log.exception("3분봉 상승보유 시드 실패 — 허가증 미발동(fail-closed)")
+
+    def _series(self, code: str, current: Optional[float] = None) -> List[float]:
+        out = list(self._seed.get(code) or [])
+        out.extend(self._today.get(code) or [])
+        if current is not None and current > 0:
+            out.append(current)
+        return out[-21:]
+
+    def update(self, points: Iterable[MarketPoint]) -> None:
+        if not self.enabled:
+            return
+        for point in points:
+            code = point.code
+            price = float(point.price)
+            bucket = int(point.ts.timestamp() // 180)
+            previous_bucket = self._bucket.get(code)
+            new_bar = previous_bucket is not None and bucket != previous_bucket
+            if previous_bucket is None:
+                self._bucket[code] = bucket
+            elif new_bar:
+                previous_close = self._current_close.get(code, 0.0)
+                # 중단 뒤 여러 봉을 건너뛴 경우 마지막 관측가를 가짜 종가로 채우지 않는다.
+                if bucket - previous_bucket == 1 and previous_close > 0:
+                    bars = self._today.setdefault(code, deque(maxlen=self.KEEP_COMPLETED))
+                    bars.append(previous_close)
+                self._bucket[code] = bucket
+            self._current_close[code] = price
+            if not self._loaded:
+                continue
+
+            forming = self._metrics(self._series(code, price))
+            if forming is None:
+                self._last.pop(code, None)
+                self._active.discard(code)
+                continue
+            m5, m10, m20, cross_up, rising20 = forming
+            self._last[code] = (m5, m10, m20)
+
+            if code in self._active and new_bar:
+                completed = self._metrics(self._series(code))
+                if completed is not None and not completed[4]:
+                    self._active.discard(code)
+            if code in self._active and price < m20:
+                self._active.discard(code)
+
+            gap_pct = abs(m5 / m10 - 1.0) * 100.0 if m10 > 0 else 999.0
+            meet_up = m5 >= m10 and (cross_up or gap_pct <= self.converge_pct)
+            if code not in self._active and meet_up and rising20 and price >= m20:
+                self._active.add(code)
+
+    def status(self, code: str) -> Tuple[bool, float, float, float]:
+        code = str(code).zfill(6)
+        m5, m10, m20 = self._last.get(code, (0.0, 0.0, 0.0))
+        return self.enabled and code in self._active, m5, m10, m20
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "today": {code: list(values) for code, values in self._today.items()},
+            "bucket": self._bucket,
+            "current_close": self._current_close,
+            "active": sorted(self._active),
+        }
+
+    def restore(self, payload: Mapping[str, Any]) -> None:
+        if not self.enabled or str(payload.get("date") or "") != datetime.now().strftime("%Y-%m-%d"):
+            return
+        try:
+            self._today = {
+                str(code).zfill(6): deque((float(x) for x in values), maxlen=self.KEEP_COMPLETED)
+                for code, values in (payload.get("today") or {}).items()
+            }
+            self._bucket = {str(code).zfill(6): int(value)
+                            for code, value in (payload.get("bucket") or {}).items()}
+            self._current_close = {str(code).zfill(6): float(value)
+                                   for code, value in (payload.get("current_close") or {}).items()}
+            self._active = {str(code).zfill(6) for code in (payload.get("active") or [])}
+        except Exception:
+            self.log.exception("3분봉 상승보유 상태 복원 실패 — 새 관측부터 재구성")
+
 # =============================================================================
 # ★[2026-07-22] 체결 확인 — 캡틴1(morning_captain_live_v1.py)의 주문번호 기반 구조 이식.
 #   원본: _fills_onos(297행) / _ono_discover(335행) / _known_onos(352행).
@@ -859,23 +1178,37 @@ class DataFeed:
         except Exception:
             return {}
 
-    def read_points(self) -> Dict[str, MarketPoint]:
+    def read_points(self, allow_stale_board: bool = False) -> Dict[str, MarketPoint]:
         snap = stable_json_read(self.cfg.snapshot_path)
         board = stable_json_read(self.cfg.micro_board_path)
         now = datetime.now()
 
         board_ts = parse_ts(board.get("ts"), now)
-        if abs((now - board_ts).total_seconds()) > self.cfg.stale_board_sec:
+        board_stale = abs((now - board_ts).total_seconds()) > self.cfg.stale_board_sec
+        if board_stale and not allow_stale_board:
             raise RuntimeError(f"micro board stale: {(now - board_ts).total_seconds():.1f}s")
 
-        board_items = {
+        board_items = {} if board_stale else {
             str(x.get("code") or "").zfill(6): x
             for x in (board.get("all_items") or [])
             if x.get("code")
         }
+        theme_leaders = {}
+        if self.cfg.theme_leader_bonus_on:
+            try:
+                import theme_leader as theme_leader_feed
+                theme_leaders = theme_leader_feed.get_leaders(
+                    max_age_min=self.cfg.theme_leader_max_age_min)
+            except Exception:
+                theme_leaders = {}
         points: Dict[str, MarketPoint] = {}
         for raw_code, item in (snap.get("codes") or {}).items():
             code = str(raw_code).zfill(6)
+            # ★[2026-07-24 특수코드 차단 친구님 "문제 수정"] 6자리 숫자 정규코드만 취급.
+            #   0156T0류(신주인수권 계열 의심) 특수코드를 이름도 못 푼 채 매수한 사고
+            #   (7/24 2왕복 -3.04%·-1.08%) 재발 방지 — 감지 단계부터 원천 차단.
+            if len(code) != 6 or not code.isdigit():
+                continue
             price = safe_float(item.get("cur"))
             cum_vol = safe_float(item.get("cum_vol"))
             che_str = safe_float(item.get("che_str"))
@@ -885,6 +1218,7 @@ class DataFeed:
             if abs((now - ts).total_seconds()) > self.cfg.stale_snapshot_sec:
                 continue
             b = board_items.get(code, {})
+            theme_info = theme_leaders.get(code) or {}
             points[code] = MarketPoint(
                 ts=ts,
                 code=code,
@@ -900,6 +1234,8 @@ class DataFeed:
                 money_speed_30s=safe_float(b.get("money_speed_30s")),
                 money_start=bool(b.get("money_start")),
                 money_start_raw=bool(b.get("money_start_raw")),
+                theme_leader=bool(theme_info),
+                theme_signal=str(theme_info.get("signal") or ""),
                 # ★[2026-07-22] 당일 거래대금 근사(EST_PRICE_X_CUMVOL) — 입력에 누적 거래대금 필드 없음
                 today_value_krw=price * cum_vol,
                 # ★[REAL-SIDE 2026-07-22] 브로커 부호체결 누계 4필드 — 없으면 -1.0(틱룰 폴백 신호)
@@ -921,6 +1257,7 @@ class ExecutionAdapter:
         self.log = logger
         self.client = None
         self.account = ""
+        self.last_error_detail = ""
 
     def connect(self) -> bool:
         if not self.cfg.live:
@@ -951,6 +1288,11 @@ class ExecutionAdapter:
             return False
 
     def buy(self, code: str, qty: int) -> str:
+        self.last_error_detail = ""
+        if self.cfg.live and self.cfg.off_flag_path.exists():
+            self.last_error_detail = "captain2_off.flag"
+            self.log.warning("BUY 킬스위치 차단: %s", code)
+            return "BLOCKED"
         if self.cfg.live and self.cfg.manual_block_path.exists():
             self.log.warning("BUY 차단 플래그: %s", code)
             return "BLOCKED"
@@ -969,12 +1311,20 @@ class ExecutionAdapter:
                 rqname=f"CAPTAIN2_BUY_{code}",
                 screen_no="9750",
             )
-            return str((result or {}).get("status") or "NONE").upper()
-        except Exception:
+            status = str((result or {}).get("status") or "NONE").upper()
+            self.last_error_detail = str(
+                (result or {}).get("message") or (result or {}).get("error") or "")
+            if status not in ("OK", "TIMEOUT"):
+                self.log.warning("BUY 주문 거부 %s status=%s detail=%s",
+                                 code, status, self.last_error_detail or "-")
+            return status
+        except Exception as exc:
+            self.last_error_detail = f"{type(exc).__name__}: {exc}"
             self.log.exception("BUY 주문 실패 %s", code)
             return "ERROR"
 
     def sell(self, code: str, qty: int) -> str:
+        self.last_error_detail = ""
         if not self.cfg.live:
             self.log.info("[SHADOW] SELL %s x%d", code, qty)
             return "SHADOW"
@@ -990,8 +1340,15 @@ class ExecutionAdapter:
                 rqname=f"CAPTAIN2_SELL_{code}",
                 screen_no="9750",
             )
-            return str((result or {}).get("status") or "NONE").upper()
-        except Exception:
+            status = str((result or {}).get("status") or "NONE").upper()
+            self.last_error_detail = str(
+                (result or {}).get("message") or (result or {}).get("error") or "")
+            if status not in ("OK", "TIMEOUT"):
+                self.log.warning("SELL 주문 거부 %s status=%s detail=%s",
+                                 code, status, self.last_error_detail or "-")
+            return status
+        except Exception as exc:
+            self.last_error_detail = f"{type(exc).__name__}: {exc}"
             self.log.exception("SELL 주문 실패 %s", code)
             return "ERROR"
 
@@ -1078,6 +1435,14 @@ class Captain2Engine:
         "net_krw_60s", "cond_netsell", "score_count",
         "shadow_state", "live_action", "live_reason", "data_quality",
     ]
+    REACCEL_SHADOW_COLUMNS = [
+        "ts", "code", "name", "event", "price", "signal_price", "line",
+        "elapsed_sec", "day_gain_pct", "age_bars", "ext_pct", "volx",
+        "surge5_pct", "buy_exec_vol", "sell_exec_vol", "buy_ratio",
+        "buy_sell_ratio", "buy_exec_money", "sell_exec_money",
+        "money_total_krw", "persist_ok", "dominance_sec", "side_exact",
+        "reason",
+    ]
 
     def __init__(self, cfg: Config, feed: DataFeed, execution: ExecutionAdapter, logger: logging.Logger):
         self.cfg = cfg
@@ -1088,11 +1453,19 @@ class Captain2Engine:
         # ★[2026-07-22 실체결 수술] 실체결 누계 — 모든 판정의 유일한 매수/매도 체결량 원천
         #   (브로커 부호체결 4필드가 오면 정확모드, 없으면 틱룰 폴백)
         self.agg = TickSideAggregator(logger)
+        self.ma3_rider = ThreeMinuteMARider(cfg, logger)
         self.entries_today = 0
         self.last_entry_time = 0.0
         self.last_entry_by_code: Dict[str, float] = {}   # ★[2026-07-22] 종목별 마지막 진입시각(종목 쿨다운용)
         # ★[재진입 가드 2026-07-23] 종목별 직전 진입 신호강도 (유입대금, 유입속도, 매수비). 재시작 시 초기화(=당일).
         self.last_entry_signal: Dict[str, Tuple[float, float, float]] = {}
+        self.entry_count_by_code: Dict[str, int] = {}
+        self.daily_buy_krw = 0.0
+        self.daily_realized_pnl_krw = 0.0
+        self.consecutive_losses = 0
+        self.kill_switch_latched = False
+        self.feed_stale_latched = False
+        self.feed_fresh_since = 0.0
         self.recovery_blocked = False                    # ★[2026-07-22] 복구 실패 시 LIVE 신규매수 금지
         self._replay_buf: List[Dict[str, Any]] = []      # ★[2026-07-22] 재생로그 버퍼(배치 flush)
         self._replay_last_flush = time.time()
@@ -1108,14 +1481,47 @@ class Captain2Engine:
         self._ma10: Dict[str, float] = {}
         self._ma10_prev: Dict[str, float] = {}
         self._ma_loaded = False
+        self._reverse_ma_codes: set = set()
+        self._selector_codes: set = set()
+        self._selector_date = ""
+        self._selector_ready = False
+        self._selector_last_try = 0.0
+        self._selector_last_warning = ""
+        self._reverse_ma_date = ""
+        self._reverse_ma_last_try = 0.0
+        self._reverse_ma_last_warning = ""
         # ★[EARLY 초입레인 2026-07-23] 종목별 초입 추적 + 당일 시가(09:00 이후 첫 관측가) 캐시
         self.early: Dict[str, EarlyState] = {}
         self.day_open: Dict[str, float] = {}
         self._m1_open: Optional[Dict[str, float]] = None   # 재시작 폴백(돈맥_1분봉 op) — lazy 1회 로드
+        self._early_watch_meta: Dict[str, Dict[str, float]] = {}
+        self._early_watch_date = ""
+        self._early_watch_ready = False
+        self._early_watch_last_try = 0.0
+        self._early_watch_last_warning = ""
+        # C2-01은 감시 신호 1개를 기존 1주 주문 인프라에 전달하고 공통 매도 엔진을 사용한다.
+        self.c2_01_consumed_signals: set[str] = set()
+        self.c2_01_order_attempts = 0
+        self._c2_01_common_engine = UnifiedHoldSellEngine()
+        self._c2_01_common_windows = SideWindows()
+        self._c2_01_bars: Dict[str, Any] = {}
+        self._c2_01_bars_mtime_ns = -1
+        self._c2_01_exit_error = ""
+        # ★[BASE 횡보돌파] 1분봉 추적은 매수 상태와 분리. 재시작 시 기존 그림자 장부의
+        #   완성봉 이력만 시드로 읽고 이후 돈맥_1분봉.json을 직접 이어 붙인다(TR0).
+        self.base: Dict[str, BasePatternState] = {}
+        self._base_last_hm = ""
+        self._base_last_error = ""
+        self._base_seed_from_shadow_ledger()
+        # ★[재가속 SHADOW] BASE/RAID 상태와 완전히 분리된 주문0 관찰기.
+        self.reaccel_shadow: Dict[str, ReaccelShadowState] = {}
+        self.reaccel_shadow_path = (
+            cfg.event_dir / f"captain2_reaccel_shadow_{datetime.now():%Y%m%d}.csv")
         # ★[수급 가점 2026-07-23] D-2 본선·D-1 차선 매집 배지 — 0.2MB 파일이라 동기 로드(부팅 무지연)
         self._supply_badge_d1: set = set()                 # 차선(로더가 채움·실패 시 빈 집합)
         self._supply_badge: set = self._load_supply_badges()
         threading.Thread(target=self._load_daily_ma, daemon=True).start()
+        threading.Thread(target=self.ma3_rider.load_seed, daemon=True).start()
 
     def _load_supply_badges(self) -> set:
         """★[수급 가점 2026-07-23 친구님 승인] D-2(2거래일 전) 기관 또는 외인 순매수(+) 종목 집합.
@@ -1474,6 +1880,7 @@ class Captain2Engine:
 
     def _release_slot(self, code: str, state: FlowState, why: str) -> None:
         """공용 슬롯 반환 — 실제로 예약했던 경우에만(그림자는 애초에 예약 안 함)."""
+        state.buy_reserved_krw = 0.0
         if not state.buy_slot_reserved:
             return
         try:
@@ -1483,6 +1890,109 @@ class Captain2Engine:
         state.buy_slot_reserved = False
         self.log.info("SLOT_RELEASE %s (%s)", code, why)
 
+    def _refresh_selector_codes(self) -> None:
+        """돈맥 코스닥 선별기 정원(univ_codes)과 아침대장(captain)을 신규진입 허용목록으로 갱신."""
+        if not self.cfg.selector_gate_on:
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._selector_date and self._selector_date != today:
+            self._selector_codes.clear()
+            self._selector_ready = False
+            self._selector_date = ""
+        now_mono = time.monotonic()
+        if now_mono - self._selector_last_try < self.cfg.selector_refresh_sec:
+            return
+        self._selector_last_try = now_mono
+        try:
+            data = stable_json_read(self.cfg.selector_board_path)
+            board_date = str(data.get("ts") or "")[:10]
+            if board_date != today:
+                raise ValueError(f"STALE_{board_date or 'EMPTY'}")
+            codes = {
+                str(code).strip().zfill(6)
+                for code in (data.get("univ_codes") or [])
+                if str(code).strip()
+            }
+            captain = data.get("captain") or {}
+            if isinstance(captain, dict):
+                codes.update(str(code).strip().zfill(6) for code in captain if str(code).strip())
+            elif isinstance(captain, list):
+                codes.update(
+                    str(row.get("code") or "").strip().zfill(6)
+                    for row in captain
+                    if isinstance(row, dict) and str(row.get("code") or "").strip()
+                )
+            if not codes:
+                raise ValueError("EMPTY_SELECTOR")
+            first_ready = not self._selector_ready
+            self._selector_codes = codes
+            self._selector_date = board_date
+            self._selector_ready = True
+            self._selector_last_warning = ""
+            if first_ready:
+                self.log.info("코스닥 선별기 진입관문 로드: %s %d종목", board_date, len(codes))
+        except Exception as exc:
+            warning = f"{type(exc).__name__}:{exc}"
+            if warning != self._selector_last_warning:
+                self.log.warning("코스닥 선별기 진입관문 대기 — 신규매수 차단: %s", exc)
+                self._selector_last_warning = warning
+
+    def _refresh_early_watch(self) -> None:
+        """오늘 장전 압축목록만 EARLY 진입에 사용한다. 누락·구버전·날짜 불일치는 차단."""
+        today = datetime.now().strftime("%Y%m%d")
+        if self._early_watch_date and self._early_watch_date != today:
+            self._early_watch_meta.clear()
+            self._early_watch_ready = False
+            self._early_watch_date = ""
+        now_mono = time.monotonic()
+        if now_mono - self._early_watch_last_try < self.cfg.selector_refresh_sec:
+            return
+        self._early_watch_last_try = now_mono
+        try:
+            data = stable_json_read(self.cfg.early_watch_path)
+            watch_date = str(data.get("for_date") or "")
+            if watch_date != today:
+                raise ValueError(f"STALE_{watch_date or 'EMPTY'}")
+            qualified = {
+                str(code).strip().zfill(6)
+                for code in (data.get("qualified_codes") or [])
+                if str(code).strip()
+            }
+            raw_meta = data.get("meta") or {}
+            meta: Dict[str, Dict[str, float]] = {}
+            for code in qualified:
+                row = raw_meta.get(code) or raw_meta.get(str(code).lstrip("0")) or {}
+                prev_close = safe_float(row.get("prev_close")) if isinstance(row, dict) else 0.0
+                if prev_close > 0:
+                    meta[code] = {
+                        "prev_close": prev_close,
+                        "ret_5d_pct": safe_float(row.get("ret_5d_pct")),
+                        "high_close_pct": safe_float(row.get("high_close_pct")),
+                        "value_ratio_20d": safe_float(row.get("value_ratio_20d")),
+                    }
+            if not meta:
+                raise ValueError("EMPTY_QUALIFIED")
+            first_ready = not self._early_watch_ready
+            self._early_watch_meta = meta
+            self._early_watch_date = watch_date
+            self._early_watch_ready = True
+            self._early_watch_last_warning = ""
+            if first_ready:
+                self.log.info("EARLY 장전 압축목록 로드: %s %d종목", watch_date, len(meta))
+        except Exception as exc:
+            self._early_watch_meta.clear()
+            self._early_watch_ready = False
+            warning = f"{type(exc).__name__}:{exc}"
+            if warning != self._early_watch_last_warning:
+                self.log.warning("EARLY 장전 압축목록 대기 — 초입매수 차단: %s", exc)
+                self._early_watch_last_warning = warning
+
+    def _early_prev_close(self, code: str) -> float:
+        self._refresh_early_watch()
+        if not self._early_watch_ready:
+            return 0.0
+        return safe_float((self._early_watch_meta.get(str(code).zfill(6)) or {}).get("prev_close"))
+
     def _market_filter(self, p: MarketPoint) -> Tuple[bool, str]:
         """★[2026-07-22] 잡주 제거 관문 — 신규 진입 경로에만 적용(HOLD·WATCH 매도추적에는 미적용)."""
         if p.price < self.cfg.min_price:
@@ -1490,6 +2000,514 @@ class Captain2Engine:
         if p.today_value_krw < self.cfg.min_today_value_krw:
             return False, f"TODAY_VALUE_LT_{self.cfg.min_today_value_krw:.0f}"
         return True, "OK"
+
+    def _refresh_reverse_ma(self) -> None:
+        """당일 돈흐름 MA 캐시의 역배열 목록을 짧게 재시도해 로드한다."""
+        if not self.cfg.reverse_ma_gate_on:
+            return
+        today = datetime.now().strftime("%Y%m%d")
+        if self._reverse_ma_date == today:
+            return
+        now_mono = time.monotonic()
+        if now_mono - self._reverse_ma_last_try < 10.0:
+            return
+        self._reverse_ma_last_try = now_mono
+        try:
+            data = stable_json_read(self.cfg.ma60_cache_path)
+            data_date = str(data.get("date") or "")
+            if data_date != today:
+                warning = f"STALE_{data_date or 'EMPTY'}"
+                if warning != self._reverse_ma_last_warning:
+                    self.log.warning("역배열 캐시 당일 자료 대기: %s", warning)
+                    self._reverse_ma_last_warning = warning
+                return
+            reval = data.get("reval") or {}
+            self._reverse_ma_codes = {
+                str(code).zfill(6) for code, blocked in reval.items() if blocked
+            }
+            self._reverse_ma_date = data_date
+            self._reverse_ma_last_warning = ""
+            self.log.info("역배열 진입차단 로드: %s %d종목",
+                          data_date, len(self._reverse_ma_codes))
+        except Exception as exc:
+            warning = f"{type(exc).__name__}:{exc}"
+            if warning != self._reverse_ma_last_warning:
+                self.log.warning("역배열 캐시 로드 실패 — 기존 관문만 적용: %s", exc)
+                self._reverse_ma_last_warning = warning
+
+    def _entry_filter(self, p: MarketPoint, require_today_value: bool = True) -> Tuple[bool, str]:
+        """세 진입 레인 공통 관문: 가격·거래대금·역배열."""
+        if require_today_value:
+            ok, why = self._market_filter(p)
+        else:
+            ok, why = (p.price >= self.cfg.min_price,
+                       "OK" if p.price >= self.cfg.min_price else f"PRICE_LT_{self.cfg.min_price:.0f}")
+        if not ok:
+            return False, why
+        if self.cfg.selector_gate_on:
+            self._refresh_selector_codes()
+            if not self._selector_ready:
+                return False, "KOSDAQ_SELECTOR_NOT_READY"
+            if str(p.code).strip().zfill(6) not in self._selector_codes:
+                return False, "NOT_IN_KOSDAQ_SELECTOR"
+        if self.cfg.reverse_ma_gate_on:
+            self._refresh_reverse_ma()
+            if str(p.code).zfill(6) in self._reverse_ma_codes:
+                return False, "REVERSE_MA_5_20_LT_60"
+        return True, "OK"
+
+    @staticmethod
+    def _base_detect(hist: Iterable, base_n: int, tight_pct: float,
+                     min_volx: float) -> Optional[Tuple[float, float, float]]:
+        """완성 1분봉만 사용: 직전 N봉 응집 → 마지막 양봉 상단돌파·거래량 폭발."""
+        rows = list(hist)
+        if len(rows) < base_n + 1:
+            return None
+        base = rows[-(base_n + 1):-1]
+        _hm, op, _hi, _lo, close, vol = rows[-1]
+        base_hi = max(float(b[2]) for b in base)
+        base_lo = min(float(b[3]) for b in base)
+        if base_lo <= 0:
+            return None
+        range_pct = (base_hi / base_lo - 1.0) * 100.0
+        avg_vol = sum(float(b[5]) for b in base) / len(base)
+        if (range_pct > tight_pct or avg_vol <= 0 or close <= op
+                or close <= base_hi or vol < avg_vol * min_volx):
+            return None
+        return base_hi, range_pct, vol / avg_vol
+
+    def _base_seed_from_shadow_ledger(self) -> None:
+        """재시작 때 09:00 이후 모은 완성봉을 잃지 않도록 기존 주문0 장부만 시드로 재사용."""
+        if not self.cfg.base_on:
+            return
+        try:
+            data = stable_json_read(self.cfg.base_seed_ledger_path)
+            if str(data.get("date") or "") != datetime.now().strftime("%Y%m%d"):
+                return
+            for raw_code, saved in (data.get("codes") or {}).items():
+                code = str(raw_code).zfill(6)
+                st = BasePatternState()
+                for row in (saved.get("hist") or [])[-45:]:
+                    if isinstance(row, list) and len(row) >= 6:
+                        st.hist.append(tuple(row[:6]))
+                st.cap_hm = str(saved.get("cap_hm") or "")
+                # WAIT만 승계한다. POS는 이미 과거 리테스트에서 체결된 신호라 재시작 추격 금지.
+                if (str(saved.get("state") or "") == "WAIT"
+                        and float(saved.get("bo_vx") or 0) >= self.cfg.base_volx):
+                    st.armed = True
+                    st.breakout_hm = str(saved.get("bo_hm") or "")
+                    st.limit = float(saved.get("limit") or 0)
+                    st.wait_left = max(0, int(saved.get("wait_left") or 0))
+                    st.range_pct = float(saved.get("bo_rng") or 0)
+                    st.volx = float(saved.get("bo_vx") or 0)
+                self.base[code] = st
+            if self.base:
+                self.log.info("BASE 1분봉 재시작 시드 %d종목(주문0 장부·TR0)", len(self.base))
+        except Exception as exc:
+            self.log.warning("BASE 시드 없음 — 현재 기동 후 완성봉부터 수집: %s", exc)
+
+    def _start_base_retest(self, p: MarketPoint, pattern: BasePatternState) -> None:
+        """돌파선 리테스트에서 즉시 매수하지 않고 실제 저점 탐색을 시작한다."""
+        old = self.states.get(p.code)
+        if old and old.phase in (
+                Phase.HOLD, Phase.WATCH, Phase.RECOVERY_HOLD,
+                Phase.BUY_PENDING, Phase.SELL_PENDING):
+            return
+        ok, _why = self._entry_filter(p)
+        if not ok:
+            return
+        buy_cum, sell_cum = self.agg.cum_now(p.code)
+        buy_money, sell_money = self.agg.money_now(p.code)
+        state = FlowState(code=p.code, name=self.feed.names.get(p.code, p.code))
+        state.lane = "BASE"
+        state.phase = Phase.LOW_SEARCH
+        state.flow_detect_ts = p.ts
+        state.candidate_low = CandidateLow(
+            ts=p.ts, price=p.price, cum_vol=p.cum_vol, che_str=p.che_str,
+            ask_tot=p.ask_tot, bid_tot=p.bid_tot, imb=p.imb,
+            buy_cum=buy_cum, sell_cum=sell_cum,
+            buy_money=buy_money, sell_money=sell_money)
+        state.last_low_update_ts = p.ts
+        state.last_update_ts = p.ts
+        state.episode_high = max(pattern.breakout_close, p.price)
+        self.states[p.code] = state
+        pattern.armed = False
+        pattern.retest_started = True
+        replaced = f" · 기존 {old.lane}/{old.phase.value} 대체" if old else ""
+        self._event(
+            p, state, "BASE_RETEST",
+            f"돌파선 {pattern.limit:.0f} 리테스트·즉시매수 금지 → 실제저점/매수우위 대기 "
+            f"(응집 {pattern.range_pct:.2f}%·거래량 {pattern.volx:.1f}배){replaced}")
+
+    def _base_step(self, points: Mapping[str, MarketPoint]) -> None:
+        """완성 1분봉으로 BASE를 무장하고, 실시간 리테스트에서 BASE 저점탐색을 연다."""
+        if not self.cfg.base_on or not points:
+            return
+        hm = datetime.now().strftime("%H%M")
+        if hm != self._base_last_hm:
+            try:
+                bars = stable_json_read(self.cfg.base_bars_path)
+                if str(bars.get("hm") or "") != hm:
+                    raise ValueError(f"STALE_HM_{bars.get('hm')}")
+                minute_map = bars.get("m") or {}
+                for code in points:
+                    item = minute_map.get(code) or {}
+                    prev = item.get("prev") or []
+                    pv = item.get("pv") or []
+                    st = self.base.setdefault(code, BasePatternState())
+                    if st.cap_hm == hm or not prev or not pv:
+                        continue
+                    vals = [float(x) for x in prev[-1][:4]]
+                    minute = int(hm[:2]) * 60 + int(hm[2:]) - 1
+                    bar_hm = f"{minute // 60:02d}{minute % 60:02d}"
+                    if not st.hist or str(st.hist[-1][0]) != bar_hm:
+                        st.hist.append((bar_hm, vals[0], vals[1], vals[2],
+                                        vals[3], float(pv[-1])))
+                        if st.armed:
+                            st.wait_left -= 1
+                            if st.wait_left <= 0:
+                                self.log.info("[BASE EXPIRE] %s(%s) 돌파선 %.0f 리테스트 미도달",
+                                              self.feed.names.get(code, code), code, st.limit)
+                                st.armed = False
+                        elif self.cfg.base_entry_start <= hm <= self.cfg.base_entry_end:
+                            det = self._base_detect(
+                                st.hist, self.cfg.base_n,
+                                self.cfg.base_tight_pct, self.cfg.base_volx)
+                            if det:
+                                line, range_pct, volx = det
+                                st.armed = True
+                                st.retest_started = False
+                                st.breakout_hm = hm
+                                st.limit = line
+                                st.wait_left = self.cfg.base_wait_bars
+                                st.range_pct = range_pct
+                                st.volx = volx
+                                st.breakout_close = vals[3]
+                                self.log.info(
+                                    "[BASE ARMED] %s(%s) 선=%.0f 응집=%.2f%% 거래량=%.1f배 "
+                                    "→ %d분 리테스트 대기",
+                                    self.feed.names.get(code, code), code, line,
+                                    range_pct, volx, self.cfg.base_wait_bars)
+                    st.cap_hm = hm
+                self._base_last_hm = hm
+                self._base_last_error = ""
+            except Exception as exc:
+                msg = f"{type(exc).__name__}:{exc}"
+                if msg != self._base_last_error:
+                    self.log.warning("BASE 1분봉 대기 — 판정 보류: %s", msg)
+                    self._base_last_error = msg
+
+        # 돌파선 이하는 관찰 시작일 뿐 매수가 아니다. 기존 저점·실체결 관문이 뒤에서 확정한다.
+        for code, st in list(self.base.items()):
+            if not st.armed or st.retest_started or st.wait_left <= 0:
+                continue
+            p = points.get(code)
+            if p is not None and st.limit > 0 and p.price <= st.limit:
+                self._start_base_retest(p, st)
+
+
+    @staticmethod
+    def _reaccel_detect(
+            bars: Iterable, day_open: float, min_day_gain_pct: float,
+            min_age_bars: int, max_ext_pct: float, min_volx: float,
+            max_surge5_pct: float) -> Optional[Dict[str, float]]:
+        """과거 신고가재돌파 조건을 완성 3분봉으로 재현한다(진행봉 추정·주문 없음)."""
+        rows = list(bars)
+        if day_open <= 0 or len(rows) < min_age_bars + 2:
+            return None
+        current = rows[-1]
+        _hm, op, _hi, _lo, close, volume = current
+        if close < day_open * (1.0 + min_day_gain_pct / 100.0) or close <= op:
+            return None
+        prior = rows[:-1]
+        prior_high = max(float(bar[2]) for bar in prior)
+        hi_idx = max(i for i, bar in enumerate(prior)
+                     if float(bar[2]) >= prior_high)
+        age = (len(rows) - 1) - hi_idx
+        if age < min_age_bars or close <= prior_high:
+            return None
+        ext_pct = (close / prior_high - 1.0) * 100.0
+        if ext_pct > max_ext_pct:
+            return None
+        surge5_pct = 0.0
+        if len(rows) >= 6 and float(rows[-6][4]) > 0:
+            surge5_pct = (close / float(rows[-6][4]) - 1.0) * 100.0
+            if max_surge5_pct > 0 and surge5_pct > max_surge5_pct:
+                return None
+        window = rows[-(min_age_bars + 1):-1]
+        avg_volume = (sum(float(bar[5]) for bar in window) / len(window)
+                      if window else 0.0)
+        volx = volume / avg_volume if avg_volume > 0 else 0.0
+        if min_volx > 0 and (avg_volume <= 0 or volx < min_volx):
+            return None
+        return {
+            "line": prior_high,
+            "age": float(age),
+            "ext_pct": ext_pct,
+            "volx": volx,
+            "surge5_pct": surge5_pct,
+            "signal_price": float(close),
+        }
+
+    def _reaccel_shadow_log(
+            self, p: MarketPoint, state: ReaccelShadowState, event: str,
+            day_open: float, buy_vol: float = 0.0, sell_vol: float = 0.0,
+            buy_money: float = 0.0, sell_money: float = 0.0,
+            persist_ok: bool = False, reason: str = "") -> None:
+        """재가속 관찰 CSV만 기록한다. 주문·FlowState·공용 슬롯에는 접근하지 않는다."""
+        try:
+            total_vol = buy_vol + sell_vol
+            buy_ratio = buy_vol / total_vol if total_vol > 0 else 0.5
+            buy_sell_ratio = buy_vol / max(sell_vol, 1e-9) if total_vol > 0 else 1.0
+            elapsed = ((p.ts - state.arm_ts).total_seconds()
+                       if state.arm_ts is not None else 0.0)
+            dominance_sec = ((p.ts - state.dominance_since).total_seconds()
+                             if state.dominance_since is not None else 0.0)
+            row = {
+                "ts": p.ts.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                "code": p.code,
+                "name": self.feed.names.get(p.code, p.code),
+                "event": event,
+                "price": p.price,
+                "signal_price": state.signal_price,
+                "line": state.line,
+                "elapsed_sec": round(elapsed, 3),
+                "day_gain_pct": round(
+                    (state.signal_price / day_open - 1.0) * 100.0, 3)
+                if day_open > 0 else "",
+                "age_bars": state.age,
+                "ext_pct": round(state.ext_pct, 3),
+                "volx": round(state.volx, 3),
+                "surge5_pct": round(state.surge5_pct, 3),
+                "buy_exec_vol": round(buy_vol, 3),
+                "sell_exec_vol": round(sell_vol, 3),
+                "buy_ratio": round(buy_ratio, 4),
+                "buy_sell_ratio": round(buy_sell_ratio, 4),
+                "buy_exec_money": round(buy_money),
+                "sell_exec_money": round(sell_money),
+                "money_total_krw": round(buy_money + sell_money),
+                "persist_ok": 1 if persist_ok else 0,
+                "dominance_sec": round(dominance_sec, 3),
+                "side_exact": 1 if self.agg.is_exact(p.code) else 0,
+                "reason": reason,
+            }
+            self.reaccel_shadow_path.parent.mkdir(parents=True, exist_ok=True)
+            new = not self.reaccel_shadow_path.exists()
+            with self.reaccel_shadow_path.open(
+                    "a", encoding="utf-8-sig", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=self.REACCEL_SHADOW_COLUMNS)
+                if new:
+                    writer.writeheader()
+                writer.writerow(row)
+        except Exception:
+            self.log.exception("재가속 SHADOW 기록 실패 %s", p.code)
+
+    def _reaccel_shadow_gate(
+            self, p: MarketPoint, state: ReaccelShadowState,
+            day_open: float, allow_live: bool = False
+            ) -> Optional[Tuple[MarketPoint, FlowState, str]]:
+        if state.status != "WATCH" or state.arm_ts is None:
+            return None
+        elapsed = (p.ts - state.arm_ts).total_seconds()
+        buy_now, sell_now = self.agg.cum_now(p.code)
+        buy_money_now, sell_money_now = self.agg.money_now(p.code)
+        buy_vol = max(0.0, buy_now - state.base_buy_cum)
+        sell_vol = max(0.0, sell_now - state.base_sell_cum)
+        buy_money = max(0.0, buy_money_now - state.base_buy_money)
+        sell_money = max(0.0, sell_money_now - state.base_sell_money)
+        if p.price < state.line:
+            self._reaccel_shadow_log(
+                p, state, "FAILED_LINE", day_open, buy_vol, sell_vol,
+                buy_money, sell_money, reason="돌파선 이탈")
+            state.status = "DONE"
+            return None
+        if p.price > state.line * (1.0 + self.cfg.reaccel_max_ext_pct / 100.0):
+            self._reaccel_shadow_log(
+                p, state, "FAILED_CHASE", day_open, buy_vol, sell_vol,
+                buy_money, sell_money, reason="돌파선 대비 추격상한 초과")
+            state.status = "DONE"
+            return None
+        if elapsed > self.cfg.reaccel_gate_max_sec:
+            self._reaccel_shadow_log(
+                p, state, "EXPIRED", day_open, buy_vol, sell_vol,
+                buy_money, sell_money, reason="60초 관문 미완성")
+            state.status = "DONE"
+            return None
+        total_vol = buy_vol + sell_vol
+        buy_ratio = buy_vol / total_vol if total_vol > 0 else 0.5
+        buy_sell_ratio = buy_vol / max(sell_vol, 1e-9) if total_vol > 0 else 1.0
+        r10 = self.agg.roll(p.code, 10.0, p.ts.timestamp())
+        r30 = self.agg.roll(p.code, 30.0, p.ts.timestamp())
+        speed10 = ((max(0.0, r10[2]) + max(0.0, r10[3])) / r10[4]
+                   if r10 is not None and r10[4] > 0 else 0.0)
+        speed30 = ((max(0.0, r30[2]) + max(0.0, r30[3])) / r30[4]
+                   if r30 is not None and r30[4] > 0 else 0.0)
+        persist_ok = not (
+            speed30 > 0 and speed10 < self.cfg.persist_min_frac * speed30)
+        dominance_ok = (
+            self.agg.is_exact(p.code)
+            and buy_money + sell_money >= self.cfg.min_entry_money_krw
+            and total_vol >= self.cfg.min_reset_exec_volume
+            and buy_ratio >= self.cfg.min_buy_ratio
+            and buy_sell_ratio >= self.cfg.min_buy_sell_ratio
+            and persist_ok
+        )
+        if dominance_ok:
+            if state.dominance_since is None:
+                state.dominance_since = p.ts
+        else:
+            state.dominance_since = None
+        dominance_sec = ((p.ts - state.dominance_since).total_seconds()
+                         if state.dominance_since is not None else 0.0)
+        if dominance_ok and dominance_sec >= self.cfg.buy_confirm_sec:
+            self._reaccel_shadow_log(
+                p, state, "READY_SHADOW", day_open, buy_vol, sell_vol,
+                buy_money, sell_money, persist_ok,
+                "돌파선 유지·실체결 매수우위 2초")
+            candidate = None
+            if self.cfg.reaccel_live_on and allow_live:
+                candidate = self._reaccel_live_candidate(
+                    p, state, day_open, buy_vol, sell_vol,
+                    buy_money, sell_money, persist_ok)
+            state.status = "DONE"
+            return candidate
+        return None
+
+    def _reaccel_live_candidate(
+            self, p: MarketPoint, state: ReaccelShadowState, day_open: float,
+            buy_vol: float, sell_vol: float, buy_money: float,
+            sell_money: float, persist_ok: bool
+            ) -> Optional[Tuple[MarketPoint, FlowState, str]]:
+        """재가속 READY를 공통 후보 풀로 보내 테마대장 가점·슬롯·주문 관문을 재사용한다."""
+        entry_ok, entry_reason = self._entry_filter(p)
+        vw = self._vwap_of(p) if self.cfg.vwap_gate_on else 0.0
+        if not entry_ok or (vw > 0 and p.price <= vw):
+            reason = entry_reason if not entry_ok else f"VWAP_GATE {p.price:.0f}<=VWAP{vw:.0f}"
+            self._reaccel_shadow_log(
+                p, state, "LIVE_BLOCKED", day_open, buy_vol, sell_vol,
+                buy_money, sell_money, persist_ok, reason)
+            return None
+        previous = self.states.get(p.code)
+        if previous is not None and previous.phase not in (
+                Phase.IDLE, Phase.FAILED, Phase.CLOSED):
+            self._reaccel_shadow_log(
+                p, state, "LIVE_BLOCKED", day_open, buy_vol, sell_vol,
+                buy_money, sell_money, persist_ok,
+                f"기존상태 {previous.phase.value}")
+            return None
+
+        elapsed = max((p.ts - state.arm_ts).total_seconds(), 1.0)
+        total_vol = buy_vol + sell_vol
+        total_money = buy_money + sell_money
+        flow = FlowState(code=p.code, name=self.feed.names.get(p.code, p.code))
+        flow.lane = "REACCEL"
+        flow.phase = Phase.BUY_READY
+        flow.reset_id = uuid.uuid4().hex[:12]
+        flow.reset_ts = state.arm_ts
+        flow.reset_price = state.line
+        flow.reset_buy_cum = state.base_buy_cum
+        flow.reset_sell_cum = state.base_sell_cum
+        flow.reset_buy_money = state.base_buy_money
+        flow.reset_sell_money = state.base_sell_money
+        flow.reset_cum_vol = max(0.0, p.cum_vol - total_vol)
+        flow.reset_che_str = p.che_str
+        flow.reset_ask_tot = p.ask_tot
+        flow.reset_bid_tot = p.bid_tot
+        flow.reset_imb = p.imb
+        flow.reset_high = max(state.signal_price, p.price)
+        flow.reset_low = state.line
+        flow.structure_low = state.line
+        flow.buy_exec_vol = buy_vol
+        flow.sell_exec_vol = sell_vol
+        flow.buy_exec_money = buy_money
+        flow.sell_exec_money = sell_money
+        flow.buy_ratio = buy_vol / total_vol if total_vol > 0 else 0.5
+        flow.buy_sell_ratio = buy_vol / max(sell_vol, 1e-9) if total_vol > 0 else 1.0
+        flow.buy_money_ratio = buy_money / total_money if total_money > 0 else 0.5
+        flow.side_exact = self.agg.is_exact(p.code)
+        flow.price_response_pct = (
+            (p.price / state.line - 1.0) * 100.0 if state.line > 0 else 0.0)
+        flow.reset_delta_volume = total_vol
+        flow.reset_money_add_krw = total_money
+        flow.reset_money_per_sec_krw = total_money / elapsed
+        flow.money_size_grade = self._money_size_grade(total_money)
+        self.states[p.code] = flow
+        reason = (
+            f"REACCEL line={state.line:.0f} ext={state.ext_pct:.2f}% "
+            f"volx={state.volx:.2f} buy={flow.buy_ratio:.1%} "
+            f"money={total_money / 1e8:.2f}억 theme={p.theme_signal or '-'}")
+        self._event(p, flow, "REACCEL_READY", reason)
+        return p, flow, reason
+
+    def _reaccel_shadow_step(
+            self, points: Mapping[str, MarketPoint],
+            allow_live: bool = False) -> list:
+        """실시간 3분봉 재돌파를 관찰하고 LIVE READY는 공통 후보 풀로 반환한다."""
+        if not (self.cfg.reaccel_shadow_on or self.cfg.reaccel_live_on):
+            return []
+        candidates = []
+        for p in points.values():
+            if p.ts.strftime("%H%M") < "0900":
+                continue
+            state = self.reaccel_shadow.setdefault(p.code, ReaccelShadowState())
+            day_open = self._day_open_of(p)
+            bucket = int(p.ts.timestamp() // 180)
+            if state.bucket < 0:
+                state.bucket = bucket
+                state.bar_hm = p.ts.strftime("%H%M")
+                state.bar_open = state.bar_high = state.bar_low = state.bar_close = p.price
+                state.bar_start_cum = state.bar_last_cum = p.cum_vol
+            elif bucket == state.bucket:
+                state.bar_high = max(state.bar_high, p.price)
+                state.bar_low = min(state.bar_low, p.price)
+                state.bar_close = p.price
+                state.bar_last_cum = p.cum_vol
+            else:
+                consecutive_bucket = bucket - state.bucket == 1
+                new_bar_start_cum = state.bar_last_cum if consecutive_bucket else p.cum_vol
+                if consecutive_bucket and state.bar_open > 0:
+                    volume = max(0.0, state.bar_last_cum - state.bar_start_cum)
+                    state.bars.append((
+                        state.bar_hm, state.bar_open, state.bar_high,
+                        state.bar_low, state.bar_close, volume))
+                    signal_hm = state.bar_hm
+                    if (state.status != "WATCH"
+                            and self.cfg.reaccel_start <= signal_hm <= self.cfg.reaccel_end):
+                        hit = self._reaccel_detect(
+                            state.bars, day_open,
+                            self.cfg.reaccel_min_day_gain_pct,
+                            self.cfg.reaccel_min_age_bars,
+                            self.cfg.reaccel_max_ext_pct,
+                            self.cfg.reaccel_min_volx,
+                            self.cfg.reaccel_max_surge5_pct)
+                        if hit is not None:
+                            entry_ok, _entry_reason = self._entry_filter(p)
+                            if entry_ok:
+                                state.status = "WATCH"
+                                state.arm_ts = p.ts
+                                state.signal_price = hit["signal_price"]
+                                state.line = hit["line"]
+                                state.age = int(hit["age"])
+                                state.ext_pct = hit["ext_pct"]
+                                state.volx = hit["volx"]
+                                state.surge5_pct = hit["surge5_pct"]
+                                state.base_buy_cum, state.base_sell_cum = (
+                                    self.agg.cum_now(p.code))
+                                state.base_buy_money, state.base_sell_money = (
+                                    self.agg.money_now(p.code))
+                                state.dominance_since = None
+                                self._reaccel_shadow_log(
+                                    p, state, "ARMED", day_open,
+                                    reason="완성3분봉 재돌파·60초 실체결 관문 시작")
+                state.bucket = bucket
+                state.bar_hm = p.ts.strftime("%H%M")
+                state.bar_open = state.bar_high = state.bar_low = state.bar_close = p.price
+                state.bar_start_cum = new_bar_start_cum
+                state.bar_last_cum = p.cum_vol
+            candidate = self._reaccel_shadow_gate(p, state, day_open, allow_live)
+            if candidate is not None:
+                candidates.append(candidate)
+        return candidates
 
     @staticmethod
     def _money_size_grade(money_krw: float) -> str:
@@ -1522,17 +2540,39 @@ class Captain2Engine:
         if state.lane == "PULL":
             return (self.cfg.pull_low_search_max_sec, self.cfg.pull_low_no_new_sec,
                     self.cfg.pull_buy_max_sec, self.cfg.pull_buy_confirm_sec)
+        if state.lane == "BASE":
+            return (self.cfg.base_low_search_max_sec, self.cfg.low_no_new_sec,
+                    self.cfg.base_buy_max_sec, self.cfg.buy_confirm_sec)
         return (self.cfg.low_search_max_sec, self.cfg.low_no_new_sec,
                 self.cfg.buy_max_elapsed_sec, self.cfg.buy_confirm_sec)
+
+    def _pull_zone_ok(self, p: MarketPoint, state: FlowState) -> Tuple[bool, str]:
+        """PULL 매수 위치: 의미 있는 눌림이며 저점→고점 회복 구간의 중·하단인지 확인."""
+        high = state.pull_reference_high
+        low = state.reset_price
+        if high <= low or low <= 0:
+            return False, "PULL 위치기준 없음"
+        depth_pct = (1.0 - low / high) * 100.0
+        recovery_pct = (p.price - low) / (high - low) * 100.0
+        if depth_pct < self.cfg.pull_min_depth_pct:
+            return False, (f"PULL 고점구간 차단: 눌림깊이 {depth_pct:.2f}%"
+                           f"<{self.cfg.pull_min_depth_pct:.2f}%")
+        if recovery_pct > self.cfg.pull_max_recovery_pct:
+            return False, (f"PULL 고점추격 차단: 저점→고점 회복위치 {recovery_pct:.1f}%"
+                           f">{self.cfg.pull_max_recovery_pct:.1f}%")
+        return True, (f"PULL 중·저점구간: 깊이 {depth_pct:.2f}%·"
+                      f"회복위치 {recovery_pct:.1f}%")
 
     def _start_low_search(self, p: MarketPoint, state: FlowState) -> None:
         # ★[눌림레인 2026-07-22] 직전 에피소드 고점 대비 -0.8% 이상 아래에서 시작하는 새 탐색 =
         #   눌림 반등 국면 → PULL 레인(느린 창). 그 외 = RAID(급습·현행 창 그대로).
         state.lane = "RAID"
+        state.pull_reference_high = 0.0
         if (state.prev_episode_high > 0 and state.prev_episode_end_ts is not None
                 and (p.ts - state.prev_episode_end_ts).total_seconds() <= self.cfg.pull_prev_max_age_sec
                 and p.price <= state.prev_episode_high * (1 - self.cfg.pull_split_drop_pct / 100)):
             state.lane = "PULL"
+            state.pull_reference_high = state.prev_episode_high
         buy_cum, sell_cum = self.agg.cum_now(p.code)      # ★실체결 누계(역산 아님)
         buy_money, sell_money = self.agg.money_now(p.code)
         low = CandidateLow(
@@ -1553,6 +2593,23 @@ class Captain2Engine:
         assert state.candidate_low is not None
         if p.price > state.episode_high:      # ★[눌림레인 점검1] 매수 전 구간에서도 고점 추적
             state.episode_high = p.price
+            if state.lane == "PULL":
+                state.pull_reference_high = max(state.pull_reference_high, state.episode_high)
+        # ★[수익성 진단 2026-07-24] 같은 급등 에피소드 안의 '상승 후 눌림'도 PULL로 전환.
+        #   종전에는 이전 에피소드가 끝난 뒤 새 급증이 와야만 PULL이 되어 실제 PULL 체결이 0건이었다.
+        split = self.cfg.pull_split_drop_pct / 100.0
+        rose_enough = state.episode_high >= state.candidate_low.price * (1 + split)
+        pulled_back = p.price <= state.episode_high * (1 - split)
+        if state.lane == "RAID" and rose_enough and pulled_back:
+            state.lane = "PULL"
+            state.pull_l1_price = 0.0
+            state.pull_rebound_high = 0.0
+            state.pull_repull_seen = False
+            state.pull_reference_high = state.episode_high
+            self._event(
+                p, state, "PULL_LANE_SWITCH",
+                f"에피소드고점 {state.episode_high:.0f} 대비 "
+                f"{(p.price / state.episode_high - 1) * 100:.2f}% 눌림")
         # ★[2026-07-22 보강] 탐색시간 상한을 신저점 갱신 경로에서도 검사한다.
         #   원본은 이 검사가 '신저점이 아닐 때'(아래 else 경로)에만 있어서, 계속 신저점을 만들며
         #   떨어지는 종목은 매 루프 early return 되어 low_search_max_sec에 영원히 도달하지 못하고
@@ -1565,6 +2622,28 @@ class Captain2Engine:
             state.rearm_ready = False
             self._event(p, state, "LOW_SEARCH_FAILED",
                         f"저점 상승전환 미확인(탐색시간 초과·{state.lane})")
+            return
+        # ★[PULL 실제 재눌림] L1 확인 뒤에는 반등 고점을 먼저 추적하고, 그 고점에서 최소
+        #   1틱 다시 내려와야 L2 후보를 연다. 종전에는 L1 확인 시 현재가를 후보로 넣어
+        #   재눌림 없이 15초 상승·횡보만 해도 L2로 오인할 수 있었다.
+        if (state.lane == "PULL" and state.pull_l1_price > 0
+                and not state.pull_repull_seen):
+            state.pull_rebound_high = max(state.pull_rebound_high, p.price)
+            repull_tick = krx_tick_size(state.pull_rebound_high)
+            if p.price <= state.pull_rebound_high - repull_tick:
+                buy_cum, sell_cum = self.agg.cum_now(p.code)
+                buy_money, sell_money = self.agg.money_now(p.code)
+                state.candidate_low = CandidateLow(
+                    ts=p.ts, price=p.price, cum_vol=p.cum_vol, che_str=p.che_str,
+                    ask_tot=p.ask_tot, bid_tot=p.bid_tot, imb=p.imb,
+                    buy_cum=buy_cum, sell_cum=sell_cum,
+                    buy_money=buy_money, sell_money=sell_money,
+                )
+                state.last_low_update_ts = p.ts
+                state.pull_repull_seen = True
+                self._event(
+                    p, state, "PULL_REPULL_ARMED",
+                    f"반등고점 {state.pull_rebound_high:.0f}에서 1틱 재하락 — L2 탐색 시작")
             return
         if p.price < state.candidate_low.price:
             buy_cum, sell_cum = self.agg.cum_now(p.code)  # ★실체결 누계(역산 아님)
@@ -1594,6 +2673,8 @@ class Captain2Engine:
                     tag = ("1차 저점" if state.pull_l1_price <= 0
                            else f"Higher Low 실패(L2 {state.candidate_low.price:.0f}≤L1 {state.pull_l1_price:.0f}) — 새 L1로")
                     state.pull_l1_price = state.candidate_low.price
+                    state.pull_rebound_high = p.price
+                    state.pull_repull_seen = False
                     buy_cum, sell_cum = self.agg.cum_now(p.code)
                     buy_money, sell_money = self.agg.money_now(p.code)
                     state.candidate_low = CandidateLow(
@@ -1748,6 +2829,11 @@ class Captain2Engine:
             return False, "최소 관찰시간 미달"
         if elapsed > buy_max:
             return False, f"진입 확인창 초과({state.lane})"
+        if state.lane == "PULL":
+            zone_ok, zone_reason = self._pull_zone_ok(p, state)
+            if not zone_ok:
+                state.dominance_since = None
+                return False, zone_reason
         # ★[PULL 5조건] 재가속 조기반환 제거 — PULL 조건은 아래 통합 타이머에서 한 번에 판정
         #   (조기반환 방식은 재가속이 끊겨도 지속 타이머가 리셋되지 않던 결함이 있었음)
         # ★[ROLL-LIVE 2026-07-22] 진입 신뢰도 — RESET 이후 '실제' 유입대금 하한(먼지 진입 차단).
@@ -1799,7 +2885,7 @@ class Captain2Engine:
                 duration = 0.0
             if cond and price_ok and duration >= buy_confirm:
                 return True, (f"PULL 5조건 {duration:.1f}초 연속(우위 {state.buy_ratio:.0%}·"
-                              f"매도감속·매수증가·재가속·HL유지)")
+                              f"매도감속·매수증가·재가속·HL유지·{zone_reason})")
             fails = []
             if not dominance_ok:
                 fails.append("매수우위")
@@ -1825,7 +2911,20 @@ class Captain2Engine:
                           f"{duration:.1f}초·{state.lane}")
         return False, "매수우위 또는 가격반응 미확인"
 
+    def _capital_in_use_krw(self) -> float:
+        """현재 보유·매도대기·매수대기 원금. 누적 회전액은 포함하지 않는다."""
+        total = 0.0
+        held = (Phase.HOLD, Phase.WATCH, Phase.RECOVERY_HOLD, Phase.SELL_PENDING)
+        for state in self.states.values():
+            if state.phase == Phase.BUY_PENDING:
+                total += max(0.0, state.buy_reserved_krw)
+            elif state.phase in held:
+                total += max(0.0, state.entry_price) * max(0, int(state.qty or 0))
+        return total
+
     def _can_open(self, code: str = "") -> Tuple[bool, str]:
+        if self.cfg.live and self.cfg.off_flag_path.exists():
+            return False, "CAPTAIN2_OFF_FLAG"
         if self.cfg.live and self.cfg.manual_block_path.exists():
             return False, "manual_buy_block"
         if self.cfg.live and self.recovery_blocked:
@@ -1842,9 +2941,20 @@ class Captain2Engine:
             dup = self._duplicate_reason(code)
             if dup:
                 return False, dup
+            if (self.cfg.max_entries_per_code > 0
+                    and self.entry_count_by_code.get(code, 0) >= self.cfg.max_entries_per_code):
+                return False, f"종목 최대 {self.cfg.max_entries_per_code}회 진입"
         # ★[2026-07-22] 0 = 무제한(로테이션 무중단). >0일 때만 하루 진입 횟수를 제한한다.
         if self.cfg.max_entries_day > 0 and self.entries_today >= self.cfg.max_entries_day:
             return False, "일 최대 진입수"
+        if (self.cfg.max_active_capital_krw > 0
+                and self._capital_in_use_krw() >= self.cfg.max_active_capital_krw):
+            return False, "회전원금 한도"
+        if self.cfg.max_daily_loss_krw > 0 and self.daily_realized_pnl_krw <= -self.cfg.max_daily_loss_krw:
+            return False, "일 손실 한도"
+        if (self.cfg.max_consecutive_losses > 0
+                and self.consecutive_losses >= self.cfg.max_consecutive_losses):
+            return False, "연속 손절 한도"
         # ★[2026-07-22] 전역 쿨다운 폐지 → 종목별 쿨다운. 전역이면 한 종목을 사는 순간 같은 루프의
         #   다른 후보가 전부 막혀 빈 슬롯을 못 채웠다. 서로 다른 종목은 즉시 진입 가능해야 하고,
         #   동일 종목 재진입만 이 쿨다운으로 막는다.
@@ -1869,7 +2979,11 @@ class Captain2Engine:
         state.score_state = "NORMAL"
         state.buy_filled_qty = int(qty)
         state.buy_avg_fill_price = avg_price
+        state.buy_reserved_krw = 0.0
+        state.morning_hold_logged = False
         self.entries_today += 1
+        self.entry_count_by_code[p.code] = self.entry_count_by_code.get(p.code, 0) + 1
+        self.daily_buy_krw += avg_price * int(qty)
         self.last_entry_time = time.time()
         self.last_entry_by_code[p.code] = time.time()   # ★종목별 쿨다운 기준
         # ★[재진입 가드 2026-07-23] 이 진입의 신호강도 기록 — 다음 재진입은 이보다 강해야 허용.
@@ -1904,19 +3018,41 @@ class Captain2Engine:
         prev = self.last_entry_signal.get(p.code)
         if not prev:
             return True, ""
-        pm, ps = prev[0], prev[1]
+        pm, ps, pr = prev
         cm, cs = state.reset_money_add_krw, state.reset_money_per_sec_krw
-        if cm >= pm and cs >= ps:
+        need_m = pm * self.cfg.reentry_strength_mult
+        need_s = ps * self.cfg.reentry_strength_mult
+        need_r = min(1.0, pr + self.cfg.reentry_buy_ratio_add)
+        if cm >= need_m and cs >= need_s and state.buy_ratio >= need_r:
             return True, ""
         weak = []
-        if cm < pm: weak.append(f"유입 {cm / 1e8:.1f}<{pm / 1e8:.1f}억")
-        if cs < ps: weak.append(f"속도 {cs / 1e8:.2f}<{ps / 1e8:.2f}")
+        if cm < need_m: weak.append(f"유입 {cm / 1e8:.1f}<{need_m / 1e8:.1f}억")
+        if cs < need_s: weak.append(f"속도 {cs / 1e8:.2f}<{need_s / 1e8:.2f}")
+        if state.buy_ratio < need_r: weak.append(f"매수비 {state.buy_ratio:.1%}<{need_r:.1%}")
         return False, "REENTRY_WEAK " + ",".join(weak)
 
     def _open(self, p: MarketPoint, state: FlowState, reason: str) -> None:
         """★[2026-07-22 체결층 이식] 주문 접수 ≠ 체결.
         SHADOW : 기존대로 가상 체결(이벤트명 SHADOW_FILL) — 공용 슬롯은 건드리지 않는다.
         LIVE   : 공용 슬롯 예약 → 1주 주문 → BUY_PENDING. HOLD 전환은 체결확인 후에만."""
+        if state.lane in ("EARLY", "C2_01_OPEN_SURGE"):
+            no_execution_data = (
+                (p.buy_vol_cum <= 0 and p.sell_vol_cum <= 0)
+                or (p.buy_money_cum <= 0 and p.sell_money_cum <= 0)
+            )
+        else:
+            no_execution_data = (
+                (state.buy_exec_vol <= 0 and state.sell_exec_vol <= 0)
+                or (state.buy_exec_money <= 0 and state.sell_exec_money <= 0)
+            )
+        if no_execution_data:
+            self._event(p, state, "BUY_BLOCKED", "NO_EXECUTION_DATA_0_0")
+            return
+        projected_buy = self._capital_in_use_krw() + p.price * self.cfg.qty_fixed
+        if (self.cfg.max_active_capital_krw > 0
+                and projected_buy > self.cfg.max_active_capital_krw):
+            self._event(p, state, "BUY_BLOCKED", "회전원금 한도 초과")
+            return
         ok, why = self._can_open(p.code)
         if not ok:
             self._event(p, state, "BUY_BLOCKED", why)
@@ -1930,7 +3066,10 @@ class Captain2Engine:
         if not self.cfg.live:
             status = self.execution.buy(p.code, self.cfg.qty_fixed)
             if status != "SHADOW":
-                self._event(p, state, "BUY_ERROR", status)
+                detail = self.execution.last_error_detail or "-"
+                self._event(p, state, "BUY_ERROR", f"{status}: {detail}")
+                self.log.warning("BUY_ERROR %s(%s) status=%s detail=%s",
+                state.name, p.code, status, detail)
                 return
             self._confirm_entry(p, state, self.cfg.qty_fixed, p.price, reason, shadow=True)
             return
@@ -1942,6 +3081,7 @@ class Captain2Engine:
             self._event(p, state, "BUY_BLOCKED", "SHARED_SLOT_OR_DUPLICATE")
             return
         state.buy_slot_reserved = True
+        state.buy_reserved_krw = p.price * self.cfg.qty_fixed
         # ② 발주 직전 주문번호 스냅샷(이 시점 이후 새로 생기는 번호가 내 주문)
         state.buy_known_onos = self._known_onos(p.code, "매수")
         state.buy_since_hms = datetime.now().strftime("%H:%M:%S")
@@ -1969,7 +3109,10 @@ class Captain2Engine:
         self._release_slot(p.code, state, f"BUY_{status}")
         state.buy_requested_qty = 0
         state.buy_sent_epoch = 0.0
-        self._event(p, state, "BUY_ERROR", status)
+        detail = self.execution.last_error_detail or "-"
+        self._event(p, state, "BUY_ERROR", f"{status}: {detail}")
+        self.log.warning("BUY_ERROR %s(%s) status=%s detail=%s",
+                         state.name, p.code, status, detail)
 
     # ── ★[2026-07-22] 매수 체결확인 1스텝 (캡틴1 _pend_buy_step 556행 이식) ──
     def _buy_pending_step(self, p: MarketPoint, state: FlowState) -> None:
@@ -2046,8 +3189,151 @@ class Captain2Engine:
                 state.rearm_ready = False
                 self._event(p, state, "BUY_ONO_UNRESOLVED", "주문번호 미확정 — 체결0 판정")
 
+    def _c2_01_signal_step(self, points: Mapping[str, MarketPoint]) -> None:
+        """Consume at most one fresh C2-01 signal and pass it to the existing order path."""
+        if self.c2_01_order_attempts >= max(0, self.cfg.c2_01_max_order_attempts):
+            return
+        try:
+            payload = stable_json_read(self.cfg.c2_01_signal_path)
+        except Exception:
+            return
+        rows = select_fresh_signals(
+            payload,
+            now=datetime.now(),
+            max_age_sec=self.cfg.c2_01_signal_max_age_sec,
+            consumed=self.c2_01_consumed_signals,
+        )
+        for row in rows:
+            code = str(row["code"])
+            point = points.get(code)
+            if point is None:
+                continue
+            current = self.states.get(code)
+            if current and current.phase in (
+                    Phase.HOLD, Phase.WATCH, Phase.RECOVERY_HOLD,
+                    Phase.BUY_PENDING, Phase.SELL_PENDING):
+                self.c2_01_consumed_signals.add(str(row["signal_id"]))
+                continue
+
+            state = FlowState(code=code, name=self.feed.names.get(code, code))
+            state.phase = Phase.BUY_READY
+            state.lane = "C2_01_OPEN_SURGE"
+            state.reset_id = f"C2_01_{uuid.uuid4().hex[:8]}"
+            state.reset_ts = point.ts
+            state.reset_price = point.price
+            state.reset_buy_cum = max(0.0, point.buy_vol_cum)
+            state.reset_sell_cum = max(0.0, point.sell_vol_cum)
+            state.reset_buy_money = max(0.0, point.buy_money_cum)
+            state.reset_sell_money = max(0.0, point.sell_money_cum)
+            state.reset_cum_vol = max(0.0, point.cum_vol)
+            state.reset_high = point.price
+            state.reset_low = point.price
+            state.structure_low = point.price
+            state.buy_ratio = safe_float(row.get("buy_ratio"), 0.5)
+            state.buy_money_ratio = state.buy_ratio
+            state.reset_money_per_sec_krw = safe_float(row.get("money_speed_5s"))
+            state.reset_money_add_krw = state.reset_money_per_sec_krw * 5.0
+            state.money_size_grade = "C2_01"
+            state.side_exact = True
+            state.obs_buy_signal_reason = str(row.get("reason") or "")
+            self.states[code] = state
+            self.c2_01_consumed_signals.add(str(row["signal_id"]))
+            self.c2_01_order_attempts += 1
+            order_reason = (
+                f"{C2_01_STRATEGY_NAME} | {row.get('reason') or 'BUY_READY'} "
+                f"| signal={row['signal_id']}"
+            )
+            self._event(point, state, "C2_01_SIGNAL", order_reason)
+            self._open(point, state, order_reason)
+            if state.phase not in (Phase.HOLD, Phase.BUY_PENDING):
+                state.phase = Phase.FAILED
+                state.terminal_ts = point.ts
+                state.rearm_ready = False
+                self._event(point, state, "C2_01_ATTEMPT_CLOSED", "하루 1회 주문시도 종료")
+            return
+
+    def _c2_01_bars_payload(self) -> Dict[str, Any]:
+        try:
+            mtime_ns = self.cfg.base_bars_path.stat().st_mtime_ns
+            if mtime_ns != self._c2_01_bars_mtime_ns:
+                self._c2_01_bars = stable_json_read(self.cfg.base_bars_path)
+                self._c2_01_bars_mtime_ns = mtime_ns
+        except Exception:
+            pass
+        return self._c2_01_bars
+
+    def _c2_01_common_exit(
+            self, p: MarketPoint, state: FlowState) -> Tuple[Optional[str], str]:
+        """Evaluate the prebuilt common hold/sell engine without changing its rules."""
+        try:
+            point_row = {
+                "ts": p.ts.isoformat(timespec="seconds"),
+                "cur": p.price,
+                "buy_vol_cum": p.buy_vol_cum,
+                "sell_vol_cum": p.sell_vol_cum,
+                "buy_money_cum": p.buy_money_cum,
+                "sell_money_cum": p.sell_money_cum,
+            }
+            board_row = {
+                "money_speed_5s": p.money_speed_5s,
+                "money_speed_10s": p.money_speed_10s,
+                "money_speed_30s": p.money_speed_30s,
+            }
+            observation, quality = build_observation(
+                p.code,
+                point_row,
+                board_row,
+                self._c2_01_bars_payload(),
+                self._c2_01_common_windows,
+            )
+            entry_at = state.entry_ts or p.ts
+            if entry_at.tzinfo is None:
+                entry_at = entry_at.replace(tzinfo=observation.observed_at.tzinfo)
+            else:
+                entry_at = entry_at.astimezone(observation.observed_at.tzinfo)
+            if state.common_exit_state:
+                common_state = HoldSellState.from_dict(state.common_exit_state)
+            else:
+                common_state = HoldSellState(
+                    position_id=f"c2-01:{p.code}:{entry_at.strftime('%Y%m%d%H%M%S')}",
+                    strategy_id=StrategyId.C2_01_OPEN_SURGE,
+                    code=p.code,
+                    quantity=int(state.qty),
+                    entry_price=state.entry_price,
+                    entry_at=entry_at,
+                )
+            if (common_state.last_observed_at
+                    and observation.observed_at < common_state.last_observed_at):
+                return None, "OUT_OF_ORDER_SKIPPED"
+            decision = self._c2_01_common_engine.evaluate(common_state, observation)
+            state.common_exit_state = common_state.to_dict()
+            self._c2_01_exit_error = ""
+            return (decision.reason if decision.should_sell else None), quality
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            if message != self._c2_01_exit_error:
+                self._c2_01_exit_error = message
+                self.log.warning("C2_01 common exit adapter error: %s", message)
+            return None, f"ERROR:{message}"
+
     def _hold_or_sell(self, p: MarketPoint, state: FlowState) -> None:
         self._vi_track(p, state)      # ★[VI 거부 대응 2026-07-23] 보유 전 구간 VI 감지
+        if state.lane == "C2_01_OPEN_SURGE":
+            reason, quality = self._c2_01_common_exit(p, state)
+            if reason:
+                self._event(p, state, "C2_01_COMMON_EXIT", f"{quality} | {reason}")
+                self._close(p, state, reason)
+            elif quality.startswith("ERROR:"):
+                # 공통 관측 어댑터 장애 때도 공통 프로필과 같은 -2%·15:10 안전선은 유지한다.
+                ret_pct = (
+                    (p.price / state.entry_price - 1.0) * 100
+                    if state.entry_price > 0 else 0.0
+                )
+                if ret_pct <= -2.0:
+                    self._close(p, state, f"HARD_STOP_C2_01_FALLBACK {ret_pct:.2f}%")
+                elif p.ts.strftime("%H%M") >= self.cfg.force_exit:
+                    self._close(p, state, "TIME_EXIT_C2_01_FALLBACK")
+            return
         # ★[2026-07-22] RECOVERY_HOLD = RESET 맥락 복원 실패분.
         # ★[2026-07-22 재정박수술] 원본은 여기가 막다른 길이었다 — 맥락을 영영 못 되살려
         #   HARD_STOP(-3%)·TIME_EXIT(15:25)까지 슬롯을 잠근 채 방치됐다(첫날 3종목이 2시간 고착).
@@ -2058,8 +3344,16 @@ class Captain2Engine:
             if p.price > state.peak_price:
                 state.peak_price = p.price
             ret_pct = (p.price / state.entry_price - 1.0) * 100 if state.entry_price > 0 else 0.0
-            if ret_pct <= self.cfg.hard_stop_pct:
+            hard_stop_pct = self.cfg.hard_stop_bottom_pct
+            if state.lane == "PULL":
+                hard_stop_pct = (self.cfg.hard_stop_pull_buy_pct
+                                 if state.flow_ratio_recent > 0.5
+                                 else self.cfg.hard_stop_pull_pct)
+            if ret_pct <= hard_stop_pct:
                 self._close(p, state, f"HARD_STOP {ret_pct:.2f}% (RECOVERY_HOLD)")
+            elif (state.lane == "EARLY"
+                  and p.ts.strftime("%H%M") >= self.cfg.early_force_exit_hm):
+                self._close(p, state, "EARLY_TIME_EXIT_0930 (RECOVERY_HOLD)")
             elif p.ts.strftime("%H%M") >= self.cfg.force_exit:
                 self._close(p, state, "TIME_EXIT (RECOVERY_HOLD)")
             elif state.entry_price > 0:
@@ -2095,12 +3389,87 @@ class Captain2Engine:
 
         ret_pct = (p.price / state.entry_price - 1.0) * 100 if state.entry_price > 0 else 0.0
         hm = p.ts.strftime("%H%M")
-        if ret_pct <= self.cfg.hard_stop_pct:
+        hard_stop_pct = self.cfg.hard_stop_bottom_pct
+        if state.lane == "PULL":
+            hard_stop_pct = (self.cfg.hard_stop_pull_buy_pct
+                             if state.flow_ratio_recent > 0.5
+                             else self.cfg.hard_stop_pull_pct)
+        if ret_pct <= hard_stop_pct:
             self._close(p, state, f"HARD_STOP {ret_pct:.2f}%")
+            return
+        if state.lane == "EARLY" and hm >= self.cfg.early_force_exit_hm:
+            self._close(p, state, "EARLY_TIME_EXIT_0930")
             return
         if hm >= self.cfg.force_exit:
             self._close(p, state, "TIME_EXIT")
             return
+        if (state.lane == "EARLY"
+                and self.cfg.early_decision_hm <= hm < self.cfg.early_force_exit_hm):
+            vw = self._vwap_of(p)
+            ma3_permit, _m5, _m10, _m20 = self.ma3_rider.status(p.code)
+            score, score_parts = self._sell_score(p, state)
+            trend_ok, trend_why = self._early_trend_contract(
+                p.price, vw, ma3_permit, state.flow_ratio_recent,
+                p.money_speed_10s, p.money_speed_30s, previous_structure_low, score,
+                self.cfg.early_trend_min_buy_ratio,
+                self.cfg.early_trend_speed_frac,
+                self.cfg.score_sell_ready)
+            if not trend_ok:
+                self._close(p, state,
+                            f"EARLY_TREND_EXIT {trend_why} score={score:.0f}[{score_parts}]")
+                return
+            if not state.morning_hold_logged:
+                self._event(p, state, "MORNING_TREND_HOLD",
+                            f"VWAP={vw:.0f} flow={state.flow_ratio_recent:.1%} "
+                            f"speed10/30={p.money_speed_10s:.0f}/{p.money_speed_30s:.0f} score={score:.0f}")
+                state.morning_hold_logged = True
+        # ★[3분봉 상승보유 2026-07-24] RAID·PULL·BASE에 적용. 하드컷·15:10 강제청산은
+        #   위에서 이미 검사했으므로 절대 유예하지 않는다. RAID 동작은 종전 그대로이며,
+        #   PULL/BASE는 기존 매도장악 3조건이 15초 연속이면 MA20 위에서도 매도한다.
+        rider_structure_broken = previous_structure_low > 0 and p.price < previous_structure_low
+        ma3_permit, ma3_m5, ma3_m10, ma3_m20 = self.ma3_rider.status(p.code)
+        state.ma3_rider_permit = bool(state.lane in ("RAID", "PULL", "BASE") and ma3_permit)
+        state.ma3_ma5 = ma3_m5
+        state.ma3_ma10 = ma3_m10
+        state.ma3_ma20 = ma3_m20
+        if state.ma3_rider_permit:
+            trend_sell_override = bool(
+                state.lane in ("PULL", "BASE")
+                and state.flow_ratio_recent <= self.cfg.sell_buy_ratio
+                and rider_structure_broken
+                and not state.money_accel
+            )
+            if trend_sell_override:
+                if state.sell_cond_since is None:
+                    state.sell_cond_since = p.ts
+                    self._event(
+                        p, state, f"{state.lane}_MA3_SELL_WATCH",
+                        f"최근{self.cfg.flow_window_sec:.0f}초 매수비"
+                        f"{state.flow_ratio_recent:.1%}+구조붕괴")
+                override_age = (p.ts - state.sell_cond_since).total_seconds()
+                if override_age >= self.cfg.sell_confirm_sec:
+                    self._close(
+                        p, state,
+                        f"{state.lane}_MA3_SELL_OVERRIDE 최근{self.cfg.flow_window_sec:.0f}초"
+                        f"비율={state.flow_ratio_recent:.1%} 구조붕괴 지속={override_age:.0f}초")
+                    return
+            else:
+                state.sell_cond_since = None
+            # 허가 중 쌓인 다른 매도 타이머가 해제 직후 즉시 매도시키지 않도록 새로 확인한다.
+            state.phase = Phase.HOLD
+            state.watch_since = None
+            state.dryup_since = None
+            state.sell_ready_since = None
+            state.vwap_warn_since = None
+            if not state.ma3_hold_logged:
+                self._event(p, state, "MA3_RIDER_HOLD",
+                            f"3m MA5={ma3_m5:.0f} MA10={ma3_m10:.0f} MA20={ma3_m20:.0f}")
+            state.ma3_hold_logged = True
+            return
+        if state.ma3_hold_logged:
+            self._event(p, state, "MA3_RIDER_RELEASE",
+                        f"현재={p.price:.0f} MA20={ma3_m20:.0f} — 일반 매도판정 재개")
+        state.ma3_hold_logged = False
 
         # ★[보완3종→설계8단계 2026-07-22] ㉮이익 보호 = 단계식 트레일(친구님 명시값).
         #   도달한 최고 수익 구간의 되돌림 폭 적용 — 수익이 클수록 폭을 넓혀 큰 상승을 끝까지 탄다.
@@ -2185,21 +3554,38 @@ class Captain2Engine:
             if new_st == "SELL_READY":
                 if state.sell_ready_since is None:
                     state.sell_ready_since = p.ts
-                ready_age = (p.ts - state.sell_ready_since).total_seconds()
-                # 마지막 기회: 최근 5초 매수대금 > 직전 5초 매수대금이면 유예(최대 score_hold_max_sec)
+                # 마지막 기회: 최근 5초 매수대금 > 직전 5초 매수대금이면 유예
                 money_up = False
                 now_ep = p.ts.timestamp()
                 r5 = self.agg.roll(p.code, 5.0, now_ep)
                 r10 = self.agg.roll(p.code, 10.0, now_ep)
                 if r5 is not None and r10 is not None:
                     money_up = max(0.0, r5[2]) > max(0.0, r10[2] - r5[2])
-                if money_up and ready_age < self.cfg.score_hold_max_sec:
+                hold_age = (p.ts - state.entry_ts).total_seconds() if state.entry_ts else 0.0
+                min_hold = (self.cfg.score_min_hold_sec if state.lane == "PULL"
+                            else self.cfg.score_bottom_min_hold_sec)
+                # ★[2026-07-24 유예수술 친구님 "문제 수정"] 유예 상한을 '돈이 끊긴 시간'으로 재정의.
+                #   ㉮돈이 계속 들어오는 동안은 유예 시계 리셋 — 유예초과 강제매도로 살아있는 종목을
+                #     뱉지 않는다(7/24 로보티즈: 7틱 연속 유입 중 매도 → 직후 상승 실측).
+                #   ㉯유입 끊김은 실제 5초 연속 확인 후에만 매도. 하드손절·트레일·강제청산은 상위 우선.
+                if state.ma_permit:
+                    state.sell_ready_since = None
+                    self._event(p, state, "SCORE_HOLD_MA", "MA permit active")
+                elif hold_age < min_hold:
+                    state.sell_ready_since = None
+                    self._event(p, state, "SCORE_HOLD_MIN",
+                                f"minimum hold {hold_age:.0f}/{min_hold:.0f}s")
+                elif money_up:
+                    state.sell_ready_since = None
                     self._event(p, state, "SCORE_HOLD_MONEY",
-                                f"5초 매수대금 증가 — 유예 {ready_age:.0f}/{self.cfg.score_hold_max_sec:.0f}s")
+                                "5초 매수대금 증가 — 유예 시계 리셋")
                 else:
-                    force = " 강제(유예초과)" if ready_age >= self.cfg.score_hold_max_sec else ""
-                    self._close(p, state, f"SCORE_SELL {score:.0f}점{force} [{parts}]")
-                    return
+                    ready_age = (p.ts - state.sell_ready_since).total_seconds()
+                    if ready_age >= self.cfg.score_dry_confirm_sec:
+                        self._close(p, state, f"SCORE_SELL {score:.0f}점 [{parts}]")
+                        return
+                    self._event(p, state, "SCORE_HOLD_MONEY",
+                                f"유입 끊김 {ready_age:.1f}/{self.cfg.score_dry_confirm_sec:.1f}초")
             else:
                 state.sell_ready_since = None
         # ★[VWAP 3종 2026-07-23] 보유 중 VWAP 이탈 = 즉시매도 아님 → 조기경보 상태.
@@ -2276,6 +3662,10 @@ class Captain2Engine:
     def _confirm_exit(self, p: MarketPoint, state: FlowState, avg_price: float,
                       reason: str, shadow: bool = False) -> None:
         """실제 매도 체결이 확인된 뒤에만 호출 — 여기서만 CLOSED 전환 + 공용 슬롯 해제."""
+        exit_qty = int(state.qty or 0)
+        realized = (avg_price - state.entry_price) * exit_qty if state.entry_price > 0 else 0.0
+        self.daily_realized_pnl_krw += realized
+        self.consecutive_losses = self.consecutive_losses + 1 if realized < 0 else 0
         state.phase = Phase.CLOSED
         state.exit_ts = p.ts
         state.exit_price = avg_price
@@ -2287,7 +3677,9 @@ class Captain2Engine:
         self._release_slot(p.code, state, "SELL_FILLED")   # ★접수가 아니라 체결 후에만 해제
         self._event(p, state, "SHADOW_SELL_FILL" if shadow else "SELL", reason)
         ret = (avg_price / state.entry_price - 1.0) * 100 if state.entry_price > 0 else 0.0
-        self.log.info("SELL %s %s @%.0f | %s | %.2f%%", state.name, p.code, avg_price, reason, ret)
+        self.log.info("SELL %s %s @%.0f | %s | %.2f%% | 실현=%+.0f원 일누적=%+.0f원 연속손실=%d",
+                      state.name, p.code, avg_price, reason, ret, realized,
+                      self.daily_realized_pnl_krw, self.consecutive_losses)
 
     def _vi_track(self, p: MarketPoint, state: FlowState) -> None:
         """★[VI 거부 대응 2026-07-23] VI(변동성완화장치) 발동/해제를 누적거래량으로 감지.
@@ -2385,7 +3777,9 @@ class Captain2Engine:
         state.sell_requested_qty = 0
         state.sell_sent_epoch = 0.0
         state.sell_retry_count += 1
-        self._event(p, state, "SELL_ERROR", f"{status} 재시도{state.sell_retry_count}")
+        detail = self.execution.last_error_detail or "-"
+        self._event(p, state, "SELL_ERROR",
+                    f"{status}: {detail} 재시도{state.sell_retry_count}")
         self.log.warning("매도 실패 %s(%s) %s → 포지션 유지·재시도 %d/%d",
                          state.name, p.code, status, state.sell_retry_count, self.cfg.max_sell_retry)
 
@@ -2514,6 +3908,29 @@ class Captain2Engine:
             score *= 0.5; parts.append("가속감산")
         return score, "+".join(parts) if parts else "무신호"
 
+    @staticmethod
+    def _early_trend_contract(price: float, vwap: float, ma3_permit: bool,
+                              flow_ratio: float, speed10: float, speed30: float,
+                              previous_structure_low: float, sell_score: float,
+                              min_flow_ratio: float = 0.52,
+                              speed_frac: float = 0.5,
+                              sell_ready_score: float = 75.0) -> Tuple[bool, str]:
+        """09:20 연장계약. 하나라도 불충족이면 아침 포지션을 정리한다."""
+        failed = []
+        if not (vwap > 0 and price > vwap):
+            failed.append("VWAP")
+        if not ma3_permit:
+            failed.append("MA3")
+        if flow_ratio < min_flow_ratio:
+            failed.append("FLOW")
+        if not (speed30 > 0 and speed10 >= speed_frac * speed30):
+            failed.append("SPEED")
+        if previous_structure_low > 0 and price < previous_structure_low:
+            failed.append("STRUCTURE")
+        if sell_score >= sell_ready_score:
+            failed.append("SELL_SCORE")
+        return (not failed, "OK" if not failed else ",".join(failed))
+
     # ── ★[EARLY 초입레인 2026-07-23 친구님 확정] ─────────────────────────────
     def _day_open_of(self, p: MarketPoint) -> float:
         """당일 시가. 우선순위: ①엔진이 09:00~09:01에 처음 본 가격(=당일 첫 1초 가격)
@@ -2543,69 +3960,117 @@ class Captain2Engine:
             self.day_open[p.code] = op
         return op
 
+    @staticmethod
+    def _early_entry_variant(op: float, prev_close: float, below_open_seen: bool,
+                             dip_ready: bool, chased_before: bool,
+                             gap_min_pct: float = 3.0) -> str:
+        """09시 초입 3경로. 빈 문자열은 진입 경로 없음."""
+        if op <= 0 or prev_close <= 0:
+            return ""
+        if below_open_seen:
+            return "DIP_RECLAIM" if dip_ready else ""
+        if chased_before:
+            return ""
+        if op <= prev_close:
+            return "DIRECT_ONSET"
+        gap_pct = (op / prev_close - 1.0) * 100.0
+        return "GAP_ONSET" if gap_pct >= gap_min_pct else ""
+
     def _early_check(self, p: MarketPoint) -> Optional[Tuple[MarketPoint, EarlyState]]:
-        """초입 5조건: ①5초속도 ≥ early_min_speed ②5s/30s 배율 ≥ early_min_burst(개장 30초 면제)
-        ③최근 10초 FID15 매수대금비율 ≥ early_min_buy_ratio(첫 10초=개장누적 폴백)
-        ④무장(persist초 전 대비 실제 상승) 후 무장가 이상 유지 연속 persist초
-        ⑤시가 대비 0~early_max_above_open_pct% 이내. 발화는 종목당 하루 1회."""
+        """장전 압축목록 + DIRECT/GAP/DIP 3경로 + 기존 FID15 돈 조건을 모두 통과해야 발화."""
         es = self.early.setdefault(p.code, EarlyState())
         if es.fired:
             return None
+        prev_close = self._early_prev_close(p.code)
+        if prev_close <= 0:
+            return None                              # 오늘 압축목록·전일종가가 없으면 fail-closed
         if p.buy_money_cum < 0 or p.sell_money_cum < 0:
             return None                              # FID15 부재 — 판정 불가(fail-closed)
-        if p.price < self.cfg.min_price:
-            return None                              # 잡주 관문(가격)은 유지 — 100억 대금관문만 대체
+        entry_ok, _entry_reason = self._entry_filter(p, require_today_value=False)
+        if not entry_ok:
+            return None
         sec = p.ts.timestamp()
         if es.bm0 < 0:
             es.bm0, es.sm0 = p.buy_money_cum, p.sell_money_cum
-        # 최근 10초 매수대금 비율(기준선 = 10초 이상 지난 가장 최신 관측, 없으면 개장누적)
+            es.bm0_ts = sec
         base_bm, base_sm = es.bm0, es.sm0
+        base_ts = es.bm0_ts or sec
         for (t2, b2, s2, _px2) in es.hist:
             if sec - t2 >= 10.0:
                 base_bm, base_sm = b2, s2
+                base_ts = t2
             else:
                 break
         db = p.buy_money_cum - base_bm
         ds = p.sell_money_cum - base_sm
         tot = db + ds
         op = self._day_open_of(p)
+        if op <= 0:
+            return None
+        max_px = op * (1.0 + self.cfg.early_max_above_open_pct / 100.0)
+        chased_before = bool(self.cfg.early_max_above_open_pct > 0 and es.high_px > max_px)
+        es.high_px = max(es.high_px, p.price)
+        if p.price < op:
+            es.below_open_seen = True
+            if es.dip_low <= 0 or p.price < es.dip_low:
+                es.dip_low = p.price
+                es.dip_low_ts = sec
+                es.dip_low_speed = p.money_speed_5s
         open_elapsed = sec - p.ts.replace(hour=9, minute=0, second=0, microsecond=0).timestamp()
         burst = p.money_speed_5s / max(p.money_speed_30s, 1.0)
-        # ★[VWAP 3종 2026-07-23] EARLY도 VWAP 위에서만 — 발화 단계에서 걸어 하루 1회 소진을 막는다
-        #   (VWAP 위로 회복하면 그때 발화). 무효(0)면 통과.
         vw = self._vwap_of(p) if self.cfg.vwap_gate_on else 0.0
-        ok = (
-            p.money_speed_5s >= self.cfg.early_min_speed
+        dip_ready = bool(
+            es.below_open_seen and es.dip_low > 0
+            and (sec - es.dip_low_ts) >= self.cfg.early_dip_no_new_sec
+            and p.price >= op and vw > 0 and p.price > vw
+            and p.money_speed_5s > es.dip_low_speed
+        )
+        variant = self._early_entry_variant(
+            op, prev_close, es.below_open_seen, dip_ready,
+            chased_before, self.cfg.early_gap_min_pct)
+        vwap_ok = (vw > 0 and p.price > vw) if variant == "DIP_RECLAIM" else (vw <= 0 or p.price > vw)
+        ok = bool(
+            variant
+            and p.money_speed_5s >= self.cfg.early_min_speed
             and (open_elapsed < self.cfg.early_burst_waive_sec or burst >= self.cfg.early_min_burst)
             and tot > 0 and db / tot >= self.cfg.early_min_buy_ratio
-            and op > 0 and 0.0 <= (p.price / op - 1) * 100 <= self.cfg.early_max_above_open_pct
-            and (vw <= 0 or p.price > vw)
+            and p.price >= op
+            and (self.cfg.early_max_above_open_pct <= 0 or p.price <= max_px)
+            and vwap_ok
         )
         fired = None
-        if ok and es.streak > 0 and (sec - es.last_sec) <= 2.5 and p.price >= es.arm_px:
+        if (ok and es.streak > 0 and es.streak_kind == variant
+                and (sec - es.last_sec) <= 2.5 and p.price >= es.arm_px):
             es.streak += 1
             es.last_sec = sec
         elif ok:
-            ref = None                               # 무장 조건: persist초 전 대비 실제 상승
+            ref = None
             for (t2, _b2, _s2, px2) in reversed(es.hist):
                 if sec - t2 >= self.cfg.early_persist_sec:
                     ref = px2
                     break
             if ref is not None and p.price > ref:
                 es.streak, es.last_sec, es.arm_px = 1, sec, p.price
+                es.streak_kind = variant
             else:
                 es.streak = 0
+                es.streak_kind = ""
         else:
             es.streak = 0
+            es.streak_kind = ""
         if es.streak >= self.cfg.early_persist_sec:
             es.fired = True
-            es.sort_key = (db / tot, p.money_speed_5s, burst)
+            es.entry_kind = variant
+            net_buy_money_per_sec = (db - ds) / max(sec - base_ts, 1.0)
+            es.sort_key = (
+                1.0 if p.theme_leader else 0.0,
+                net_buy_money_per_sec, db / tot, p.money_speed_5s, burst)
             fired = (p, es)
         es.hist.append((sec, p.buy_money_cum, p.sell_money_cum, p.price))
         return fired
 
     def _early_select_and_open(self, fired: list) -> None:
-        """발화 후보 정렬(친구님 확정: ①매수대금비율 ②유입속도 ③증가배율) 후 빈 슬롯 수만큼 진입.
+        """Rank by theme group, net-buy inflow, buy dominance, speed, then burst.
         RESET 맥락을 현재 시점으로 합성 주입 — 기존 매도로직(트레일·돈마름·하드손절)이 그대로 관리한다.
         슬롯·쿨다운·manual_buy_block·shared_slots 검사는 _open→_can_open 계약 그대로."""
         fired.sort(key=lambda t: t[1].sort_key, reverse=True)
@@ -2641,14 +4106,23 @@ class Captain2Engine:
             state.watch_since = None
             state.recent_prices.clear()
             self._update_reset_metrics(p, state)
-            self._event(p, state, "EARLY_ONSET",
-                        f"매수비{es.sort_key[0]:.2f} 속도{es.sort_key[1] / 1e4:,.0f}만/초 "
-                        f"배율{es.sort_key[2]:.1f} 지속{es.streak}s")
-            self._open(p, state, "EARLY_ONSET")
+            early_reason = f"EARLY_{es.entry_kind or 'ONSET'}"
+            self._event(p, state, early_reason,
+                        f"theme={p.theme_signal or '-'} "
+                        f"net={es.sort_key[1] / 1e4:,.0f}man/s buy_ratio={es.sort_key[2]:.2f} "
+                        f"speed={es.sort_key[3] / 1e4:,.0f}man/s burst={es.sort_key[4]:.1f} streak={es.streak}s")
+            self._open(p, state, early_reason)
             if state.phase in (Phase.HOLD, Phase.BUY_PENDING):
                 opened += 1
             elif state.phase == Phase.RESET:
                 state.phase = Phase.FAILED           # 주문 실패 — 에피소드 종료(찌꺼기 RESET 방지)
+
+    @staticmethod
+    def _net_buy_money_per_sec(p: MarketPoint, state: FlowState) -> float:
+        if state.reset_ts is None:
+            return 0.0
+        elapsed = max((p.ts - state.reset_ts).total_seconds(), 1.0)
+        return (state.buy_exec_money - state.sell_exec_money) / elapsed
 
     def _select_and_open(self, candidates: list) -> None:
         """★[2026-07-22] BUY_READY 대기 풀 — 매 루프 전체 재정렬 후 '남은 슬롯 수'만큼 상위부터 진입.
@@ -2674,7 +4148,7 @@ class Captain2Engine:
         # 시장 필터 미달 후보는 주문 대상에서 제외(잡주 매수 금지)
         pool = []
         for p, st, reason in candidates:
-            ok, why = self._market_filter(p)
+            ok, why = self._entry_filter(p)
             if not ok:
                 self._event(p, st, "BUY_READY_NOT_SELECTED", f"MARKET_FILTER {why}")
                 continue
@@ -2690,6 +4164,8 @@ class Captain2Engine:
             return
 
         pool.sort(key=lambda item: (
+            1 if item[0].theme_leader else 0,          # same top group: all canonical theme leaders
+            self._net_buy_money_per_sec(item[0], item[1]),  # fresh net-buy money first
             round(item[1].buy_ratio * 20) / 20,          # 매수우위 5%p 버킷(스펙: 우위 우선)
             # ★[수급 가점 2026-07-23 친구님 승인·7/24 D-1 차선 추가] 같은 우위 버킷 안에서
             #   D-2 매집(2점) > D-1만 매집(1점) > 없음(0점). 관문 아님(차단 0·순서만) —
@@ -2773,8 +4249,8 @@ class Captain2Engine:
                 self._start_low_search(p, state)
             return
         if state.phase == Phase.IDLE:
-            # ★[2026-07-22] 시장 필터 — 잡주는 FLOW 탐색 자체를 시작하지 않는다(_is_surge 검사 전).
-            market_ok, _market_reason = self._market_filter(p)
+            # ★[2026-07-22/24] 공통 진입 필터 — 가격·거래대금·역배열을 FLOW 전에 차단.
+            market_ok, _market_reason = self._entry_filter(p)
             if not market_ok:
                 return None
             if self._is_surge(p):
@@ -2784,15 +4260,37 @@ class Captain2Engine:
             self._update_low_search(p, state)
             return
         if state.phase in (Phase.RESET, Phase.BUY_READY):
+            # ★[BASE 계단하락 방어] 리테스트 뒤 확정 저점보다 더 낮은 가격이 나오면
+            #   오래된 RESET에서 절대 사지 않고 BASE 저점탐색으로 되돌린다.
+            #   최초 flow_detect_ts는 유지해 전체 90초 상한을 넘기지 않는다.
+            if state.lane == "BASE" and state.reset_price > 0 and p.price < state.reset_price:
+                buy_cum, sell_cum = self.agg.cum_now(p.code)
+                buy_money, sell_money = self.agg.money_now(p.code)
+                state.phase = Phase.LOW_SEARCH
+                state.candidate_low = CandidateLow(
+                    ts=p.ts, price=p.price, cum_vol=p.cum_vol, che_str=p.che_str,
+                    ask_tot=p.ask_tot, bid_tot=p.bid_tot, imb=p.imb,
+                    buy_cum=buy_cum, sell_cum=sell_cum,
+                    buy_money=buy_money, sell_money=sell_money)
+                state.last_low_update_ts = p.ts
+                state.dominance_since = None
+                state.recent_prices.clear()
+                self._event(p, state, "BASE_LOW_RESTART",
+                            f"확정저점 {state.reset_price:.0f} 이탈 → 더 낮은 실제저점 재탐색")
+                return
             self._update_reset_metrics(p, state)
             signal_ok, reason = self._buy_signal(p, state)
+            previous_reason = state.obs_buy_signal_reason
+            state.obs_buy_signal_reason = reason
+            if state.lane == "PULL" and not signal_ok and reason != previous_reason:
+                self._event(p, state, "PULL_GATE_BLOCKED", reason)
             if signal_ok:
                 state.phase = Phase.BUY_READY
                 self._event(p, state, "BUY_READY", reason)
                 # ★[2026-07-22] 즉시 주문하지 않고 후보로 반환 — 같은 루프의 다른 BUY_READY와
                 #   경쟁시킨 뒤 1등만 주문한다(_select_and_open).
                 return (p, state, reason)
-            elif state.reset_ts and (p.ts - state.reset_ts).total_seconds() > self.cfg.buy_max_elapsed_sec:
+            elif state.reset_ts and (p.ts - state.reset_ts).total_seconds() > self._lane_windows(state)[2]:
                 state.phase = Phase.FAILED
                 state.terminal_ts = p.ts
                 state.rearm_ready = False
@@ -2829,7 +4327,7 @@ class Captain2Engine:
         "roll10_ratio", "roll30_ratio", "roll60_ratio",
         "roll10_money_ps", "roll30_money_ps", "roll60_money_ps",
         # ★[설계8단계 2026-07-22] 가속·이평허가·평상시배율 + ★[눌림레인] 레인
-        "money_accel", "ma_permit", "money_mult_dayavg", "lane",
+        "money_accel", "ma_permit", "money_mult_dayavg", "lane", "buy_signal_reason",
     ]
 
     @staticmethod
@@ -2902,6 +4400,7 @@ class Captain2Engine:
                 "ma_permit": 1 if state.ma_permit else 0,
                 "money_mult_dayavg": round(state.money_mult_dayavg, 2),
                 "lane": state.lane,
+                "buy_signal_reason": state.obs_buy_signal_reason,
             })
         except Exception:
             self.log.exception("재생로그 행 생성 실패 %s", p.code)
@@ -2968,7 +4467,15 @@ class Captain2Engine:
             "live": self.cfg.live,
             "calc_ver": 2,
             "entries_today": self.entries_today,
+            "daily_buy_krw": self.daily_buy_krw,
+            "daily_realized_pnl_krw": self.daily_realized_pnl_krw,
+            "consecutive_losses": self.consecutive_losses,
+            "entry_count_by_code": self.entry_count_by_code,
+            "last_entry_signal": self.last_entry_signal,
+            "c2_01_consumed_signals": sorted(self.c2_01_consumed_signals),
+            "c2_01_order_attempts": self.c2_01_order_attempts,
             "tick_agg": tick_agg,
+            "ma3_rider": self.ma3_rider.snapshot(),
             "states": {code: state_json(s) for code, s in self.states.items()},
         }
         # ★[2026-07-24 저장충돌] 중계가 1분마다 state를 읽는 순간 os.replace가 WinError5로
@@ -2996,7 +4503,55 @@ class Captain2Engine:
             if saved_ts[:10] != datetime.now().strftime("%Y-%m-%d"):
                 self.log.info("이전 날짜 상태(%s) — 복원하지 않음", saved_ts[:10] or "?")
                 return
+            self.ma3_rider.restore(payload.get("ma3_rider") or {})
             self.entries_today = int(payload.get("entries_today") or 0)
+            self.daily_buy_krw = safe_float(payload.get("daily_buy_krw"))
+            self.daily_realized_pnl_krw = safe_float(payload.get("daily_realized_pnl_krw"))
+            self.consecutive_losses = int(payload.get("consecutive_losses") or 0)
+            self.c2_01_consumed_signals = set(
+                str(value) for value in (payload.get("c2_01_consumed_signals") or [])
+            )
+            self.c2_01_order_attempts = int(payload.get("c2_01_order_attempts") or 0)
+            if "daily_buy_krw" not in payload and self.event_path.exists():
+                open_price: Dict[str, float] = {}
+                with self.event_path.open(encoding="utf-8-sig", newline="") as fh:
+                    for row in csv.DictReader(fh):
+                        event = str(row.get("event") or "")
+                        code = str(row.get("code") or "").zfill(6)
+                        price = safe_float(row.get("price"))
+                        if event in ("BUY", "SHADOW_FILL") and price > 0:
+                            self.daily_buy_krw += price * self.cfg.qty_fixed
+                            open_price[code] = price
+                        elif event in ("SELL", "SHADOW_SELL_FILL") and price > 0 and code in open_price:
+                            realized = (price - open_price.pop(code)) * self.cfg.qty_fixed
+                            self.daily_realized_pnl_krw += realized
+                            self.consecutive_losses = self.consecutive_losses + 1 if realized < 0 else 0
+                self.log.info("일 위험누계 이벤트 복원 매수=%.0f원 실현=%+.0f원 연속손실=%d",
+                              self.daily_buy_krw, self.daily_realized_pnl_krw,
+                              self.consecutive_losses)
+            self.entry_count_by_code = {
+                str(k).zfill(6): int(v)
+                for k, v in (payload.get("entry_count_by_code") or {}).items()
+            }
+            self.last_entry_signal = {
+                str(k).zfill(6): tuple(float(x) for x in v[:3])
+                for k, v in (payload.get("last_entry_signal") or {}).items()
+                if isinstance(v, (list, tuple)) and len(v) >= 3
+            }
+            if not self.entry_count_by_code and self.event_path.exists():
+                with self.event_path.open(encoding="utf-8-sig", newline="") as fh:
+                    for row in csv.DictReader(fh):
+                        if str(row.get("event") or "") not in ("BUY", "SHADOW_FILL"):
+                            continue
+                        code = str(row.get("code") or "").zfill(6)
+                        if not code:
+                            continue
+                        self.entry_count_by_code[code] = self.entry_count_by_code.get(code, 0) + 1
+                        self.last_entry_signal[code] = (
+                            safe_float(row.get("reset_money_add_krw")),
+                            safe_float(row.get("reset_money_per_sec_krw")),
+                            safe_float(row.get("buy_ratio"), 0.5),
+                        )
             # ★[2026-07-22 실체결 수술] 기준선 계산 버전 — 2가 아니면 저장된 reset_*_cum은
             #   역산 원점의 숫자라 새 실체결 누계와 비교 불가 → 보유분은 재정박 경로로 보낸다.
             calc_ver = int(payload.get("calc_ver") or 1)
@@ -3011,8 +4566,15 @@ class Captain2Engine:
                     continue
                 st = FlowState(code=str(code), name=str(sd.get("name") or code))
                 st.phase = ph
+                st.lane = str(sd.get("lane") or "RAID")
+                st.common_exit_state = dict(sd.get("common_exit_state") or {})
+                st.ma_permit = bool(sd.get("ma_permit"))
+                st.ma3_rider_permit = bool(sd.get("ma3_rider_permit"))
+                st.ma3_hold_logged = bool(sd.get("ma3_hold_logged"))
+                st.morning_hold_logged = bool(sd.get("morning_hold_logged"))
                 for f_ in ("entry_price", "exit_price", "peak_price", "reset_price",
-                           "buy_avg_fill_price", "sell_avg_fill_price", "structure_low"):
+                           "buy_avg_fill_price", "sell_avg_fill_price", "structure_low",
+                           "ma3_ma5", "ma3_ma10", "ma3_ma20", "buy_reserved_krw"):
                     setattr(st, f_, safe_float(sd.get(f_)))
                 for f_ in ("qty", "buy_requested_qty", "sell_requested_qty",
                            "buy_filled_qty", "sell_filled_qty", "sell_retry_count"):
@@ -3033,6 +4595,11 @@ class Captain2Engine:
                 # 경과시간 기준(epoch)은 재시작으로 무의미 — 지금부터 다시 센다(즉시 취소 폭주 방지)
                 st.buy_sent_epoch = time.time() if ph == Phase.BUY_PENDING else 0.0
                 st.sell_sent_epoch = time.time() if ph == Phase.SELL_PENDING else 0.0
+                if ph == Phase.BUY_PENDING and st.buy_reserved_krw <= 0:
+                    price_hint = max(st.buy_avg_fill_price, st.reset_price, st.entry_price)
+                    st.buy_reserved_krw = max(0, st.buy_requested_qty) * max(0.0, price_hint)
+                elif ph != Phase.BUY_PENDING:
+                    st.buy_reserved_krw = 0.0
 
                 # ★[2026-07-22] 보유 종목은 RESET 맥락까지 복원해야 전략매도를 이어갈 수 있다.
                 if ph in (Phase.HOLD, Phase.WATCH, Phase.RECOVERY_HOLD) and calc_ver != 2:
@@ -3108,18 +4675,67 @@ class Captain2Engine:
         self._restore_state()
         self.log.info("CAPTAIN2 시작 live=%s loop=%.1fs 최대보유=%d(계좌공용) %d주고정",
                       self.cfg.live, self.cfg.loop_sec, self.cfg.max_positions, self.cfg.qty_fixed)
+        self.log.info(
+            "CAPTAIN2 설정 진입=%s-%s 강제청산=%s 손절=바닥%.1f%%/눌림%.1f%%/매수우위%.1f%% "
+            "재진입=%d회 회전원금=%.0f원 일손실중단=%.0f원 연속손실중단=%d회",
+            self.cfg.entry_start, self.cfg.entry_end, self.cfg.force_exit,
+            self.cfg.hard_stop_bottom_pct, self.cfg.hard_stop_pull_pct,
+            self.cfg.hard_stop_pull_buy_pct, self.cfg.max_entries_per_code,
+            self.cfg.max_active_capital_krw, self.cfg.max_daily_loss_krw,
+            self.cfg.max_consecutive_losses)
+        self.log.info("CAPTAIN2 3분봉 상승보유=%s 5·10선 만남=%.2f%% RAID/PULL/BASE 추가TR=0",
+                      self.cfg.ma3_rider_on, self.cfg.ma3_converge_pct)
+        self.log.info("CAPTAIN2 BASE=%s 완성1분봉%d개·응집≤%.1f%%·거래량≥%.1f배·리테스트%d분 "
+                      "저점탐색%.0f초/매수확인%.0f초·추격금지",
+                      self.cfg.base_on, self.cfg.base_n, self.cfg.base_tight_pct,
+                      self.cfg.base_volx, self.cfg.base_wait_bars,
+                      self.cfg.base_low_search_max_sec, self.cfg.base_buy_max_sec)
+        self.log.info(
+            "CAPTAIN2 재가속 SHADOW=%s LIVE=%s 완성3분봉·시가+%.1f%%·고점숙성%d봉·확장≤%.1f%% "
+            "거래량≥%.1f배·60초관문",
+            self.cfg.reaccel_shadow_on, self.cfg.reaccel_live_on,
+            self.cfg.reaccel_min_day_gain_pct,
+            self.cfg.reaccel_min_age_bars, self.cfg.reaccel_max_ext_pct,
+            self.cfg.reaccel_min_volx)
         while self.running:
             loop_started = time.monotonic()
             hm = datetime.now().strftime("%H%M")
             if hm > self.cfg.program_end:
                 break
             try:
+                kill_on = self.cfg.live and self.cfg.off_flag_path.exists()
+                if kill_on and not self.kill_switch_latched:
+                    self.kill_switch_latched = True
+                    self.log.warning("CAPTAIN2_OFF_FLAG 감지 — 신규매수 즉시 중단, 보유종목 매도관리는 계속")
+                elif not kill_on and self.kill_switch_latched:
+                    self.kill_switch_latched = False
+                    self.log.info("CAPTAIN2_OFF_FLAG 해제 — 안전조건 충족 시 신규매수 재개")
                 points = self.feed.read_points()
+                if self.feed_stale_latched:
+                    if self.feed_fresh_since <= 0:
+                        self.feed_fresh_since = time.monotonic()
+                    fresh_age = time.monotonic() - self.feed_fresh_since
+                    entry_allowed = fresh_age >= self.cfg.stale_recovery_sec
+                    if entry_allowed:
+                        self.feed_stale_latched = False
+                        self.feed_fresh_since = 0.0
+                        self.log.info("보드 정상 %.1f초 확인 — 신규매수 재개", fresh_age)
+                else:
+                    entry_allowed = True
                 # ★[2026-07-22 실체결 수술] 판정 전에 전 종목 실체결 누계부터 갱신(루프당 정확히 1회)
                 self.agg.update(points.values())
+                self.ma3_rider.update(points.values())
+                # C2-01은 주문0 감시기의 fresh BUY_READY만 기존 1주 주문 경로에 전달한다.
+                if entry_allowed and self.cfg.c2_01_on:
+                    self._c2_01_signal_step(points)
+                # ★[BASE 횡보돌파] 패턴 무장/리테스트는 일반 MONEY_START와 독립.
+                #   리테스트 뒤 매수는 아래 공통 FlowState 경로에서 실제 저점·매수우위로 확정한다.
+                if entry_allowed and self.cfg.entry_start <= hm <= self.cfg.entry_end:
+                    self._base_step(points)
                 # ★[EARLY 초입레인 2026-07-23] 09:00~09:10 초입 창에서만 판정 — RAID·PULL과 독립.
                 #   같은 루프 발화 다수면 매수비→속도→배율 정렬 후 빈 슬롯 수만큼 진입(친구님 확정).
-                if self.cfg.early_on and self.cfg.early_start <= hm <= self.cfg.early_end:
+                if (entry_allowed and self.cfg.early_on
+                        and self.cfg.early_start <= hm <= self.cfg.early_end):
                     early_fired: list = []
                     for point in points.values():
                         ec = self._early_check(point)
@@ -3137,11 +4753,17 @@ class Captain2Engine:
                     has_position = bool(state and state.phase in (
                         Phase.HOLD, Phase.WATCH, Phase.RECOVERY_HOLD,
                         Phase.BUY_PENDING, Phase.SELL_PENDING))
-                    if has_position or self.cfg.entry_start <= hm <= self.cfg.entry_end:
+                    if has_position or (entry_allowed and self.cfg.entry_start <= hm <= self.cfg.entry_end):
                         candidate = self._process(point)
                         if candidate:
                             candidates.append(candidate)
                         touched.append(point)
+                reaccel_candidates = self._reaccel_shadow_step(
+                    points,
+                    allow_live=(entry_allowed
+                                and self.cfg.entry_start <= hm <= self.cfg.entry_end))
+                if reaccel_candidates:
+                    candidates.extend(reaccel_candidates)
                 if candidates:
                     self._select_and_open(candidates)
                 # ★[2026-07-22 관찰전용] 이 루프에서 처리된 종목만, 상태 전이가 모두 끝난 뒤
@@ -3152,8 +4774,35 @@ class Captain2Engine:
                         self._replay_row(point, st)
                 self._replay_flush()
                 self._save_state()
-            except Exception:
-                self.log.exception("메인 루프 오류 — 다음 루프 계속")
+            except Exception as exc:
+                if isinstance(exc, RuntimeError) and str(exc).startswith("micro board stale:"):
+                    if not self.feed_stale_latched:
+                        self.log.warning("%s — 신규매수 신호 폐기·정상 5초 확인 대기", exc)
+                    self.feed_stale_latched = True
+                    self.feed_fresh_since = 0.0
+                    for es in self.early.values():
+                        es.streak = 0
+                        es.hist.clear()
+                    for st in self.states.values():
+                        if st.phase in (Phase.FLOW_DETECTED, Phase.LOW_SEARCH,
+                                        Phase.RESET, Phase.BUY_READY):
+                            st.phase = Phase.IDLE
+                            st.candidate_low = None
+                            st.dominance_since = None
+                    try:
+                        safety_points = self.feed.read_points(allow_stale_board=True)
+                        self.agg.update(safety_points.values())
+                        for point in safety_points.values():
+                            state = self.states.get(point.code)
+                            if state and state.phase in (
+                                    Phase.HOLD, Phase.WATCH, Phase.RECOVERY_HOLD,
+                                    Phase.BUY_PENDING, Phase.SELL_PENDING):
+                                self._process(point)
+                        self._save_state()
+                    except Exception:
+                        self.log.exception("보드 장애 중 보유종목 안전감시 실패")
+                else:
+                    self.log.exception("메인 루프 오류 — 다음 루프 계속")
             self._touch_lock()   # ★[2026-07-22 보강] 락 유지(예외가 나도 갱신 — 살아있으면 락도 살아있어야 함)
             elapsed = time.monotonic() - loop_started
             time.sleep(max(0.05, self.cfg.loop_sec - elapsed))

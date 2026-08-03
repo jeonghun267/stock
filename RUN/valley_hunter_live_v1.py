@@ -67,13 +67,18 @@ from datetime import datetime, timedelta
 sys.path.insert(0, r"C:\stock_bot\RUN")
 import shared_slots as shared      # 공통 슬롯 장부(아침대장·급락주와 공유 — 2026-07-18 친구님 지시)
 from valley_low_buy_v1 import la_from_ledger, la_to_ledger, REBUY_STOP, REBUY_MAX, _trend_desc, judge_trend, direction_persists, trend_pct_changes   # 저점구간 판정+저점재매수, 매도관찰 추세공유
+from captain2_common_hold_sell_v1 import HoldSellState, StrategyId, UnifiedHoldSellEngine
+from valley_common_exit_shadow_v1 import SideWindows, build_observation
 
 SNAP   = Path(os.environ.get("VH_SNAP") or r"C:\stock_bot\IPC\live_micro_snapshot.json")
 BARS1M = Path(r"C:\stock_bot\data\돈맥_1분봉.json")
+COMMON_BOARD = Path(r"C:\stock_bot\data\micro_rank_board.json")
 POOL   = Path(r"C:\stock_bot\data\돈맥_전일상위풀.json")
 CHE    = Path(r"C:\stock_bot\data\돈흐름_che_state.json")
 EOD    = Path(r"C:\stock_bot\data\eod_daily_bars.csv")
 NAMEC  = Path(r"C:\stock_bot\data\_code_name_cache.json")
+SHARES = Path(r"C:\stock_bot\data\shares_outstanding.csv")
+MORNING_WATCH = Path(r"C:\stock_bot\IPC\micro_watch_valley.json")
 LEDGER = Path(os.environ.get("VH_LEDGER") or r"C:\stock_bot\data\valley_hunter_live_ledger.json")
 CSVLOG = Path(os.environ.get("VH_CSV") or r"C:\stock_bot\LOG\valley_hunter_live.csv")
 # ★[2026-07-20 친구님 승인 — 캡틴 ㉮ 이식] 지시가→실체결가 괴리 실측(captain_slip.csv와 동일 형식)
@@ -82,7 +87,7 @@ LOG    = Path(r"C:\stock_bot\data\LOG\valley_hunter_live.log")
 
 # ★[2026-07-20 안정성 패치①] 루프당 1회만 읽는 스냅샷 캐시 — 전략 무변경, 종목별 반복 파일읽기
 #   (_cur/_che/_che_info/_cum_vol/_bar1m가 종목마다 각자 파일을 다시 열던 것) 제거용.
-_MCACHE = {"snap": {}, "che": {}, "che_mtime": 0.0, "bars1m": {}}
+_MCACHE = {"snap": {}, "che": {}, "che_mtime": 0.0, "bars1m": {}, "board": {}}
 
 
 def _refresh_market_cache():
@@ -100,6 +105,19 @@ def _refresh_market_cache():
         _MCACHE["bars1m"] = json.loads(BARS1M.read_text(encoding="utf-8-sig"))
     except Exception:
         pass
+    try:
+        board = json.loads(COMMON_BOARD.read_text(encoding="utf-8-sig"))
+        board_ts = datetime.fromisoformat(str(board.get("ts") or ""))
+        if board_ts.tzinfo is None:
+            board_ts = board_ts.astimezone()
+        fresh = abs((datetime.now().astimezone() - board_ts).total_seconds()) <= 8
+        if str(board.get("date") or "") == datetime.now().strftime("%Y%m%d") and fresh:
+            _MCACHE["board"] = {str(r.get("code") or "").zfill(6): r
+                                for r in (board.get("all_items") or []) if r.get("code")}
+        else:
+            _MCACHE["board"] = {}
+    except Exception:
+        _MCACHE["board"] = {}
 
 LIVE     = os.environ.get("VH_LIVE", "NO").strip().upper() == "YES"
 # ★[2026-07-20 친구님 승인 — 15:13 FLAT 전용 계좌 점검] 기본 NO(본 실전 09:00 cmd는 손대지 않음).
@@ -176,9 +194,12 @@ SELL_LOG_COLS = ["일자", "종목코드", "종목명", "음봉발생시각", "�
                   "고점재돌파", "결과", "매도사유"]
 
 PX_FLR   = float(os.environ.get("VH_PX_FLOOR", "10000"))
-# ★[2026-07-19 심야] 코드 기본값을 운영 cmd 값(700억)과 통일. 상한 2조는 그대로.
+# Gate2/general은 기존 700억을 보존하고 Gate1 아침 고정풀만 100억으로 넓힌다.
 PVAL_LO  = float(os.environ.get("VH_PVAL_MIN", "700"))
 PVAL_HI  = float(os.environ.get("VH_PVAL_MAX", "20000"))
+MORNING_PVAL_LO = float(os.environ.get("VH_MORNING_PVAL_MIN", "100"))
+MORNING_MCAP_MIN = float(os.environ.get("VH_MORNING_MCAP_MIN", "1000"))
+MORNING_MCAP_MAX_AGE_DAYS = float(os.environ.get("VH_MORNING_MCAP_MAX_AGE_DAYS", "7"))
 GAP_TH   = float(os.environ.get("VH_GAP_TH", "-3"))    # 갭하락 1순위 문턱(시가 전일比 %)
 # ★[2026-07-19 심야] 당일 동일시간 거래량이 최근평균 대비 이 배수 이상인 종목만 허용(거래량 급증 필터).
 #   "동일 시간대" 과거 분봉 이력은 없어 근사한다: 최근 VOLSURGE_DAYS일 평균 일거래량 ×
@@ -283,6 +304,22 @@ def _supply_score(row):
     return sum(1 for k in ("inst", "frgn", "prog") if (row.get(k) or 0) > 0)
 
 
+def _morning_order_key(code, info, leader_info, supply_map):
+    """Gate1 순서: 테마+갭하락 → 갭하락 → 테마 → 일반."""
+    theme = code in leader_info
+    gap_down = bool(info.get("gap"))
+    if theme and gap_down:
+        lane = 0
+    elif gap_down:
+        lane = 1
+    elif theme:
+        lane = 2
+    else:
+        lane = 3
+    return (lane, -int(leader_info.get(code, 0)), -_supply_score(supply_map.get(code)),
+            info.get("pv", 0) < 700, info.get("depth", 0))
+
+
 def _supply_tags(row):
     """PROGRAM▲/FOREIGN▲/INSTITUTION▲ 표시용 — row 없으면 '수급정보없음'(매수 무관, 표시만)."""
     if not row:
@@ -318,6 +355,9 @@ ENTRY_END = os.environ.get("VH_ENTRY_END", "1430")
 #   Gate1(급락주 09:00~09:30)·제3게이트(BB)·MONEY_FLOW READY·매도/보유 관리는 전부 무접촉.
 #   (진입창 ENTRY_END를 줄이는 방식은 같은 블록 안의 BB 게이트까지 죽여서 쓰지 않는다)
 GATE2_ON = os.environ.get("VH_GATE2", "YES").strip().upper() == "YES"
+MORNING_EXIT_HM = os.environ.get("VH_MORNING_EXIT", "0930")
+MORNING_STOP_PCT = float(os.environ.get("VH_MORNING_STOP", "-2"))
+MORNING_REV_WATCH_SEC = float(os.environ.get("VH_MORNING_REV_WATCH_SEC", "10"))
 EXIT_HM  = os.environ.get("VH_EXIT", "1510")
 END_HM   = os.environ.get("VH_END", "1512")
 LOOP_SEC = float(os.environ.get("VH_LOOP_SEC", "2"))
@@ -325,6 +365,10 @@ RUN_SEC  = float(os.environ.get("VH_RUN_SEC", "55"))
 # 접수OK ≠ 체결(실체결은 Chejan 별도) — 매수 후 FILL_WAIT초 안에 게이트웨이 fills CSV에서 체결확인
 # 못 하면 미체결 잔량 취소 → 유령 판정. 확인 전엔 보유 아님(매도 안 함). 급락주와 동일 구조.
 FILL_WAIT = float(os.environ.get("VH_FILL_WAIT", "8"))
+
+_COMMON_EXIT_ENGINE = UnifiedHoldSellEngine()
+_COMMON_EXIT_WINDOWS = SideWindows()
+_COMMON_EXIT_STATES = {}
 
 COLS = ["일자", "시각", "종목코드", "종목명", "방향", "사유", "체결강도", "고점", "저점",
         "현재가", "일봉5일선", "진입가", "수익퍼센트", "재매수회차", "실전여부", "주문결과",
@@ -424,6 +468,7 @@ def _che(code):
 #   실측 체결강도(che_str·체결 콜백 직산출)로 폴백. 가격 방향 기반 추정·0 대체 금지(지침) —
 #   둘 다 없거나 낡으면 상태코드 반환 → 경로① 매수판정 자연 금지(관찰·무장은 계속).
 CHE_STALE_SEC = float(os.environ.get("VH_CHE_STALE_SEC", "120"))
+SIDE_STALE_SEC = float(os.environ.get("VH_SIDE_STALE_SEC", "6"))
 
 
 def _che_info(code):
@@ -468,12 +513,15 @@ def _che2(code):
     return che if st == "OK" else 0.0
 
 
-def _ready_verdict(r, hm, curr, anchor, che_status, ev_age, blocked, g1_end, lo, hi):
+def _ready_verdict(r, hm, curr, anchor, che_status, ev_age, blocked, g1_end, lo, hi,
+                   side_status=None):
     """★[2026-07-19 수정지침1] READY 실행 직전 재검증 — ('EXEC'|'DROP'|'HOLD', 사유).
     DROP=폐기(앵커는 계속 관찰), HOLD=대기 유지·주문 금지. 순수 함수(단위시험용)."""
     ev = r.get("ev") or {}
     if ev.get("entry_gate") == "MORNING_CRASH" and hm >= g1_end:
-        return "DROP", "09:30경계(Gate1 시간창 종료)"
+        return "DROP", f"{g1_end[:2]}:{g1_end[2:]}경계(Gate1 시간창 종료)"
+    if ev.get("entry_gate") == "MORNING_CRASH" and side_status != "OK":
+        return "HOLD", f"FID15실체결비정상({side_status or 'UNKNOWN'})"
     if blocked:
         return "DROP", "보유중/매수대기/재매수상한/매수금지"
     if curr <= 0:
@@ -487,7 +535,9 @@ def _ready_verdict(r, hm, curr, anchor, che_status, ev_age, blocked, g1_end, lo,
     if curr < ol:
         return "DROP", "신저가발생"
     reb = (curr / ol - 1) * 100
-    if not (lo <= reb <= hi):
+    ready_lo = float(ev.get("ready_lo", lo))
+    ready_hi = float(ev.get("ready_hi", hi))
+    if not (ready_lo <= reb <= ready_hi):
         return "DROP", f"구간이탈({reb:+.2f}%·추격금지)"
     if che_status != "OK":
         return "HOLD", f"체결강도비정상({che_status})"
@@ -509,6 +559,59 @@ def _cum_vol(code):
         return None
 
 
+def _side_money_info(code):
+    """FID15 실제 매수·매도 체결대금 누계. 신선한 네 필드가 모두 있을 때만 OK."""
+    try:
+        v = _MCACHE["snap"].get(str(code).zfill(6)) or {}
+        ts = str(v.get("ts") or "")
+        age = time.time() - datetime.fromisoformat(ts).timestamp()
+        bm = v.get("buy_money_cum")
+        sm = v.get("sell_money_cum")
+        bv = v.get("buy_vol_cum")
+        sv = v.get("sell_vol_cum")
+        if bm is None or sm is None or bv is None or sv is None:
+            return "SIDE_MISSING", None, None, None
+        if age < 0 or age > SIDE_STALE_SEC:
+            return "SIDE_STALE", None, None, round(age, 1)
+        bm, sm, bv, sv = float(bm), float(sm), float(bv), float(sv)
+        if min(bm, sm, bv, sv) < 0:
+            return "SIDE_INVALID", None, None, round(age, 1)
+        return "OK", bm, sm, round(age, 1)
+    except Exception:
+        return "SIDE_MISSING", None, None, None
+
+
+def _morning_structure_break(bar1m):
+    """완성 1분봉 종가가 직전 완성봉 저가 아래면 (기준저가, 붕괴봉고가, 붕괴종가)."""
+    try:
+        prev = (bar1m or {}).get("prev") or []
+        if len(prev) < 2:
+            return None
+        prior = [float(x) for x in prev[-2][:4]]
+        last = [float(x) for x in prev[-1][:4]]
+        return (prior[2], last[1], last[3]) if last[3] < prior[2] else None
+    except Exception:
+        return None
+
+
+def _morning_sell_flow(base_bm, base_sm, buy_money, sell_money):
+    """(매도우위, 구간매수대금, 구간매도대금). 누계 역행은 None."""
+    try:
+        db = float(buy_money) - float(base_bm)
+        ds = float(sell_money) - float(base_sm)
+        if db < 0 or ds < 0:
+            return None
+        return (ds > db and db + ds > 0, db, ds)
+    except Exception:
+        return None
+
+
+def _clear_morning_break(slot):
+    for key in ("morning_break_start", "morning_break_level", "morning_break_high",
+                "morning_break_bm", "morning_break_sm", "morning_break_wall"):
+        slot.pop(key, None)
+
+
 def _bar1m(code):
     """이번 분 1분봉 {o,h,l,c,pos,bull,prev[[o,h,l,c]..]} — 낡았으면 None."""
     try:
@@ -519,6 +622,69 @@ def _bar1m(code):
     except Exception:
         return None
 
+
+def _common_exit_key(code, slot):
+    return f"{str(code).zfill(6)}:{int(slot.get('re', 0) or 0)}:{float(slot.get('entry') or 0):.4f}"
+
+
+def _common_exit_inputs(code):
+    point = _MCACHE["snap"].get(code) or {}
+    board = _MCACHE["board"].get(code) or {}
+    side_fields = ("buy_vol_cum", "sell_vol_cum", "buy_money_cum", "sell_money_cum")
+    if not point or not board or any(point.get(k) is None for k in side_fields):
+        return None, None, None, "COMMON_DATA_MISSING"
+    try:
+        point_ts = datetime.fromisoformat(str(point.get("ts") or ""))
+        if point_ts.tzinfo is None:
+            point_ts = point_ts.astimezone()
+        if abs((datetime.now().astimezone() - point_ts).total_seconds()) > 8:
+            return None, None, None, "COMMON_DATA_STALE"
+        return point, board, point_ts, None
+    except Exception:
+        return None, None, None, "COMMON_DATA_INVALID"
+
+
+def _common_exit_state(code, slot, point_ts):
+    key = _common_exit_key(code, slot)
+    state = _COMMON_EXIT_STATES.get(key)
+    if state is None and slot.get("common_exit_key") == key and slot.get("common_exit_state"):
+        state = HoldSellState.from_dict(slot["common_exit_state"])
+    if state is None:
+        state = HoldSellState(position_id=f"valley-common:{key}", strategy_id=StrategyId.BASE,
+                              code=code, quantity=int(slot.get("qty") or 0),
+                              entry_price=str(slot.get("entry") or 0), entry_at=point_ts)
+    return key, state
+
+
+def _common_exit_decide(code, slot):
+    """공통 상승보유·매도엔진 판단. 반환=(매도사유|None, 데이터품질, 장부변경)."""
+    code = str(code).zfill(6)
+    point, board, point_ts, error = _common_exit_inputs(code)
+    if error:
+        return None, error, False
+    try:
+        key, state = _common_exit_state(code, slot, point_ts)
+        observation, quality = build_observation(
+            code, point, board, _MCACHE["bars1m"], _COMMON_EXIT_WINDOWS)
+        if state.last_observed_at and observation.observed_at < state.last_observed_at:
+            return None, "COMMON_OUT_OF_ORDER", False
+        reason = None
+        if quality == "FLOW_WARMUP":
+            state.last_observed_at = observation.observed_at
+            state.peak_price = max(state.peak_price, observation.price)
+        else:
+            decision = _COMMON_EXIT_ENGINE.evaluate(state, observation)
+            reason = decision.reason if decision.should_sell else None
+        _COMMON_EXIT_STATES[key] = state
+        changed = (reason is not None or quality != slot.get("common_exit_quality")
+                   or time.time() - float(slot.get("common_exit_saved_wall") or 0) >= 10)
+        if changed:
+            slot.update({"common_exit_key": key, "common_exit_state": state.to_dict(),
+                         "common_exit_quality": quality, "common_exit_saved_wall": time.time()})
+        return reason, quality, changed
+    except Exception as exc:
+        _log(f"  ⚠️공통매도판정 오류 {slot.get('name', code)}({code}) — 보유유지: {exc}")
+        return None, "COMMON_ERROR", False
 
 def _quality_watch_log(code, name, la, L, every_sec=120.0):
     """★[2026-07-24 관측성 배선(친구님 승인)] 경로① 4중조건이 어디서 걸리는지 실측용 —
@@ -843,14 +1009,52 @@ def _prev_eod_map(today):
     return best, rows
 
 
-def _build_morning_pool(prev_map, names, snap):
-    """★[2026-07-19 지침2] 아침 고정 감시풀 순수 필터 — 코스닥·전일대금 700억~2조·전일종가 존재·
-    현재가 1만원 이상(시세 없으면 전일종가로 판정). 거래량급증·체결강도·이평선 등으로 절대
-    탈락시키지 않는다(지침3 — 그것들은 매수판정 전용). eod value는 백만원 단위 → /100 = 억."""
+def _morning_market_caps():
+    """최근 shares_outstanding.csv의 시총(억). 오래되거나 비면 Gate1을 fail-closed."""
+    try:
+        age_days = (time.time() - SHARES.stat().st_mtime) / 86400.0
+        if age_days < 0 or age_days > MORNING_MCAP_MAX_AGE_DAYS:
+            return {}
+        out = {}
+        with SHARES.open(encoding="utf-8-sig", newline="") as fh:
+            for row in csv.DictReader(fh):
+                c = str(row.get("code") or "").zfill(6)
+                try:
+                    cap = float(row.get("market_cap_eok") or 0)
+                except (TypeError, ValueError):
+                    cap = 0.0
+                if len(c) == 6 and cap > 0:
+                    out[c] = cap
+        return out
+    except Exception:
+        return {}
+
+
+def _write_morning_watch(codes, source_date=""):
+    """broker가 우선 구독하는 오늘자 골짜기 전용 실시간 감시파일을 원자적으로 갱신."""
+    try:
+        now = datetime.now()
+        payload = {"codes": list(codes), "ts": now.isoformat(),
+                   "for_date": now.strftime("%Y%m%d"), "source_date": source_date,
+                   "src": "valley_gate1"}
+        MORNING_WATCH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = MORNING_WATCH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, MORNING_WATCH)
+        return True
+    except Exception as e:
+        _log(f"🚨 골짜기 전용 실시간 감시파일 쓰기 실패: {e}")
+        return False
+
+
+def _build_morning_pool(prev_map, names, snap, mcaps=None):
+    """Gate1 고정풀 — 코스닥 보통주·전일대금100억~2조·1만원↑·시총1000억↑.
+    거래량급증·체결강도·이평선은 여기서 탈락시키지 않고 매수판정에서 확인한다."""
     out = {}
+    mcaps = mcaps or {}
     for c, (m, pc, v_mil) in prev_map.items():
         pv = v_mil / 100.0
-        if m != "KOSDAQ" or pc <= 0 or not (PVAL_LO <= pv <= PVAL_HI):
+        if m != "KOSDAQ" or pc <= 0 or not (MORNING_PVAL_LO <= pv <= PVAL_HI):
             continue
         cur = float((snap.get(c) or {}).get("cur", 0) or 0)
         if (cur if cur > 0 else pc) < PX_FLR:
@@ -860,7 +1064,10 @@ def _build_morning_pool(prev_map, names, snap):
         #   없음·관리종목/거래정지는 로컬 판별 불가(정지면 시세가 안 들어와 무장 자체가 안 됨 = 자연 방어).
         if "스팩" in nm or c[5] != "0":
             continue
-        out[c] = {"name": nm, "pc": pc, "pv": pv}
+        mcap = float(mcaps.get(c, 0) or 0)
+        if mcap < MORNING_MCAP_MIN:
+            continue
+        out[c] = {"name": nm, "pc": pc, "pv": pv, "mcap": mcap}
     return out
 
 
@@ -884,16 +1091,23 @@ def _morning_watch_pool():
             _name_cache = json.loads(NAMEC.read_text(encoding="utf-8")).get("map", {})
         except Exception:
             _name_cache = {}
+    mcaps = _morning_market_caps()
+    if not mcaps:
+        if not _mpool_wait_logged:
+            _mpool_wait_logged = True
+            _log("🚨 시총 캐시가 없거나 낡음 — Gate1 아침 고정 감시풀 구축 금지(fail-closed)")
+        return {}
     try:
         snap = json.loads(SNAP.read_text(encoding="utf-8-sig")).get("codes", {})
     except Exception:
         snap = {}
-    built = _build_morning_pool(prev_map, _name_cache, snap)
-    _morning_pool = built          # ★동결 — 09:29까지 추가·삭제 금지(지침2)
-    _log(f"🌄 MORNING WATCHLIST = {len(built)} (전일 {prev_d} 일봉 직접·rows 미사용·동결): "
+    built = _build_morning_pool(prev_map, _name_cache, snap, mcaps)
+    _morning_pool = built          # Gate1 종료까지 추가·삭제 금지
+    _write_morning_watch(sorted(built, key=lambda c: (-built[c]["pv"], c)), prev_d)
+    _log(f"🌄 MORNING WATCHLIST = {len(built)} (전일 {prev_d}·대금{MORNING_PVAL_LO:.0f}억↑·"
+         f"시총{MORNING_MCAP_MIN:.0f}억↑·전용구독 발행·동결): "
          + " ".join(f"{v['name']}({c})" for c, v in sorted(built.items())))
-    # ★[수정지침2-①②] 체결강도 공급선 등록 확인 — 스냅샷(게이트웨이 실시간)·che_str 보유 여부.
-    #   게이트웨이 구독은 요청파일 메커니즘이 없어 강제 등록 불가 — 대신 공백을 즉시 검출·로그.
+    # 전용 요청 직후라 첫 루프의 누락은 정상이다. 실제 매수는 side_exact가 OK일 때만 허용된다.
     no_sub = [c for c in built if not isinstance(snap.get(c), dict)]
     no_che = [c for c in built if isinstance(snap.get(c), dict) and snap[c].get("che_str") is None]
     _log(f"   체결강도 공급선: 스냅샷 등록 {len(built) - len(no_sub)}/{len(built)}"
@@ -913,6 +1127,7 @@ def _gate1_candidates():
     except Exception:
         snap = {}
     che = _jload(CHE, {})
+    che_today = str(che.get("date") or "") == datetime.now().strftime("%Y%m%d")
     _today_iso = datetime.now().strftime("%Y-%m-%d")
     out = {}
     for c, b in base.items():
@@ -920,11 +1135,14 @@ def _gate1_candidates():
         ts = str(v.get("ts") or "")
         cur = float(v.get("cur", 0) or 0) if (not ts or ts[:10] == _today_iso) else 0.0
         depth = round((cur / b["pc"] - 1) * 100, 2) if cur > 0 else 0.0
-        cs = che.get(c) if isinstance(che.get(c), dict) else {}
+        cs = che.get(c) if che_today and isinstance(che.get(c), dict) else {}
         o = float((cs or {}).get("o", 0) or 0)
         gappct = round((o / b["pc"] - 1) * 100, 2) if o > 0 else 0.0
+        side_fields = ("buy_vol_cum", "sell_vol_cum", "buy_money_cum", "sell_money_cum")
+        realtime_ok = isinstance(v, dict) and all(v.get(k) is not None for k in side_fields)
         out[c] = {**b, "depth": depth,
-                  "gap": bool(o > 0 and gappct <= GAP_TH), "gappct": gappct}
+                  "gap": bool(o > 0 and gappct <= GAP_TH),
+                  "gappct": gappct, "realtime_ok": realtime_ok}
     return out
 
 
@@ -1406,15 +1624,18 @@ def main():
     from valley_low_buy_v1 import PEAK_DROP_PCT as LA_PEAK_DROP, BEARISH_3M_N as LA_BEAR_N, \
         OBS_PCT_LO as LA_OBS_LO, OBS_PCT_HI as LA_OBS_HI, WATCH_MIN as LA_WATCH_MIN, \
         TREND_MARGIN_PCT as LA_TREND_MARGIN, MA_CONFIRM as LA_MA_CONFIRM, \
-        GATE1_START as LA_G1_START, GATE1_END as LA_G1_END, GATE1_ARM_PCT as LA_G1_ARM
+        GATE1_START as LA_G1_START, GATE1_END as LA_G1_END, GATE2_START as LA_G2_START, \
+        GATE1_ARM_PCT as LA_G1_ARM
     _log(f"🏔️🔥 골짜기 저점앵커 {'★실전(LIVE)' if LIVE else '그림자(주문0)'} — "
          f"Gate1[MORNING_CRASH]{LA_G1_START[:2]}:{LA_G1_START[2:]}~{LA_G1_END[:2]}:{LA_G1_END[2:]} "
          f"전일종가대비{LA_G1_ARM:.0f}%↓→저점추적→완성양봉 즉시관찰(음봉패턴·거래량·몸통 조건없음) / "
-         f"Gate2[VALLEY_PEAK]{LA_G1_END[:2]}:{LA_G1_END[2:]}~{ENTRY_END[:2]}:{ENTRY_END[2:]} "
+         f"Gate2[VALLEY_PEAK]{LA_G2_START[:2]}:{LA_G2_START[2:]}~{ENTRY_END[:2]}:{ENTRY_END[2:]} "
          f"5일선위고점대비{LA_PEAK_DROP:.0f}%↓(5일선아래)+{LA_BEAR_N}연속1분음봉후양봉전환(거래량·몸통확대·Gate2전용) → 공통 저점반등+{LA_OBS_LO:.1f}~{LA_OBS_HI:.1f}%·"
          f"{LA_WATCH_MIN:.0f}초워밍업후 반등품질(체결강도·매수·거래량↑+매도↓ 변화량추세·마진{LA_TREND_MARGIN:.0f}%) "
          f"매수②20일선위+5/10일선접촉돌파{LA_MA_CONFIRM}봉확인매수(★Gate2전용·Gate1금지) · "
-         f"매도 하드손절{REBUY_STOP:.1f}%(재매수{REBUY_MAX}회까지) / "
+         f"급락주매도 공통상승보유·매도엔진·"
+         f"{MORNING_STOP_PCT:.1f}%하드컷·{MORNING_EXIT_HM[:2]}:{MORNING_EXIT_HM[2:]}청산 / "
+         f"기타매도 하드손절{REBUY_STOP:.1f}%(재매수{REBUY_MAX}회까지) / "
          f"보험선{INSURE_PCT:.1f}%즉시 또는 10일선회복후재이탈즉시(2층 안전판) / 완성음봉관찰{PEAK_WATCH_SEC:.0f}초"
          f"(점수제 4개중{SELL_SCORE_TH}개↑매도·5일선회복후재이탈시문턱-1·마진{SELL_TREND_MARGIN_PCT:.0f}%·"
          f"재매수=시간쿨다운없음·새저점사이클완성시만) / "
@@ -1568,14 +1789,14 @@ def main():
         #   계속한다 — 슬롯 부족은 아래 "주문 실행"에서만 걸린다. 재매수는 시간쿨다운이 아니라
         #   "새 저점 사이클" 완성으로만 통제(매도 시 anchors가 리셋되므로 자동으로 보장됨, item2·3).
         if ENTRY_HM <= hm <= ENTRY_END:
-            # ★[2026-07-19 친구님 지시8] 09:30 경계 1회 청소 — 미체결 MORNING_CRASH는 전부 폐기
+            # ★[2026-07-24 친구님 지시] Gate1 종료 경계 1회 청소 — 미체결 MORNING_CRASH는 전부 폐기
             #   (ARMED/WATCH=anchors·READY=슬롯대기열). 이미 매수된 포지션(slots pos)은 공통
             #   매도엔진이 계속 관리. feed의 경계컷과 동일 리셋 — 봉 이력은 남겨 Gate2 즉시판정 가능.
             if hm >= LA_G1_END and not L.get("_g1_purged"):
                 for rc in [k for k, r in list((L.get("ready") or {}).items())
                            if ((r.get("ev") or {}).get("entry_gate")) == "MORNING_CRASH"]:
                     r = L["ready"].pop(rc)
-                    _log(f"  🗑️09:30경계 — MORNING_CRASH 슬롯대기 폐기 {r.get('name')}({rc})")
+                    _log(f"  🗑️{LA_G1_END[:2]}:{LA_G1_END[2:]}경계 — MORNING_CRASH 슬롯대기 폐기 {r.get('name')}({rc})")
                 for c2, a in (L.get("anchors") or {}).items():
                     if not isinstance(a, dict) or a.get("done"):
                         continue
@@ -1585,20 +1806,30 @@ def main():
                                   "gate1_cand_low": None, "gate1_armed_ts": None,
                                   "gate1_armed_px": None})
                 L["_g1_purged"] = True
+                _write_morning_watch([], datetime.now().strftime("%Y%m%d"))
                 dirty = True
             # ★[2026-07-19 친구님 지시1] 09:30 전엔 che_state 순회가 아니라 고정 감시풀(지시2·3)
             # ★[2026-07-22] Gate2 은퇴 스위치 — VH_GATE2=NO면 09:30 이후 후보 유니버스를 비운다
-            cm = _gate1_candidates() if hm < LA_G1_END else (_crash_map() if GATE2_ON else {})
-            # 정렬 = TRUE_LEADER 우선(부하 많은 순) → 기관/외국인/프로그램 수급 가중치 → 갭하락
-            #   1순위 → 대금 700억↑ 그룹 우선 → 그룹 안에서 깊이순(급락주와 동일). 앞 두 단만
-            #   추가, 나머지 기존 그대로 — 매수 자체를 막는 조건 아님(순서만 바꿈).
+            if hm < LA_G1_END:
+                cm = _gate1_candidates()
+            elif hm < LA_G2_START:
+                cm = {}
+            else:
+                cm = _crash_map() if GATE2_ON else {}
             tl_info = _true_leader_info()
             supply_map = _supply_lookup()
-            order = sorted(cm.items(), key=lambda kv: (kv[0] not in tl_info, -tl_info.get(kv[0], 0),
-                                                       -_supply_score(supply_map.get(kv[0])),
-                                                       not kv[1].get("gap"),
-                                                       kv[1].get("pv", 0) < 700,
-                                                       kv[1]["depth"]))
+            if hm < LA_G1_END:
+                # Gate1: 테마+갭 → 갭하락 → 테마 → 일반. 갭상승은 정밀경로만 허용.
+                order = sorted(cm.items(),
+                               key=lambda kv: _morning_order_key(
+                                   kv[0], kv[1], tl_info, supply_map))
+            else:
+                # Gate2/general 기존 정렬은 보존한다.
+                order = sorted(cm.items(), key=lambda kv: (
+                    kv[0] not in tl_info, -tl_info.get(kv[0], 0),
+                    -_supply_score(supply_map.get(kv[0])),
+                    not kv[1].get("gap"), kv[1].get("pv", 0) < 700,
+                    kv[1]["depth"]))
             for code, info in order:
                 ex = L["slots"].get(code)
                 # 공통 슬롯(아침대장·급락주와 합산) · 매수 3회 실패 종목(buy_ban)은 건너뜀 — 다른 종목으로 갈아탐
@@ -1615,6 +1846,18 @@ def main():
                                     or int(ex.get("re", 0) or 0) >= REBUY_MAX)):
                     continue
                 cur = _cur(code); cv = _cum_vol(code)
+                side_st, side_bm, side_sm, side_age = _side_money_info(code)
+                side_warned = L.setdefault("side_warned", [])
+                if hm < LA_G1_END and side_st != "OK":
+                    if code not in side_warned:
+                        side_warned.append(code); dirty = True
+                        _log(f"  ⚠️골짜기전용구독 {side_st} {info['name']}({code}) "
+                             f"age={side_age if side_age is not None else '-'}s"
+                             " — 저점추적만 유지, FAST·정밀매수 금지")
+                elif code in side_warned:
+                    side_warned.remove(code); dirty = True
+                    _log(f"  ✅골짜기전용구독 회복 {info['name']}({code}) "
+                         f"age={side_age if side_age is not None else '-'}s")
                 # ★[수정지침2] 체결강도 소스 상태 — 비정상이면 값 0(경로① 판정 금지)·사유 1회 로그
                 che_st, che, che_age = _che_info(code)
                 # ★[2026-07-21 지속성 패치] 이전엔 메모리 셋(_che_warned)이라 20분 재기동마다
@@ -1643,7 +1886,9 @@ def main():
                 b1 = _bar1m(code)
                 ev = la.feed(hm, cur, cv, time.time(), ma5d.get(code, 0), b1,
                              ma10d.get(code, 0), ma20d.get(code, 0), ma60d.get(code, 0), che,
-                             prev_close=info.get("pc"))   # 반등품질 판정. prev_close=Gate1(09:00~09:30 전일종가-5%) 판정용
+                             prev_close=info.get("pc"),
+                             buy_money_cum=side_bm, sell_money_cum=side_sm,
+                             side_exact=side_st == "OK")
                 L["anchors"][code] = la_to_ledger(la)
                 dirty = True
                 _quality_watch_log(code, info["name"], la, L)   # ★[2026-07-24 관측성] 판정 무변경·로그만
@@ -1785,10 +2030,12 @@ def main():
                                                 or int(exr.get("re", 0) or 0) >= REBUY_MAX))
                 curr = _cur(rc)
                 st_r, _cv_r, _ag_r = _che_info(rc)
+                side_st_r, _bm_r, _sm_r, _side_age_r = _side_money_info(rc)
                 wait_s = time.time() - float(r.get("ts") or 0)
                 verdict, why_r = _ready_verdict(r, hm, curr, (L.get("anchors") or {}).get(rc),
                                                 st_r, wait_s, blocked,
-                                                LA_G1_END, LA_OBS_LO, LA_OBS_HI)
+                                                LA_G1_END, LA_OBS_LO, LA_OBS_HI,
+                                                side_status=side_st_r)
                 if verdict == "DROP":
                     L["ready"].pop(rc); dirty = True
                     _log(f"  🗑️READY 폐기 {r.get('name')}({rc}) — {why_r} "
@@ -1941,7 +2188,21 @@ def main():
             if ma10_now_h and cur > ma10_now_h:
                 s["ma10_reclaimed"] = True
             why = None
-            if s.get("entry_gate") == "BASE_BREAKOUT":
+            if s.get("entry_gate") == "MORNING_CRASH":
+                # 골짜기는 매수만 독립. 체결 뒤 상승보유·조기매도는 캡틴2 공통엔진을 사용하고
+                # -2% 안전손절과 09:30 최종청산은 데이터 장애 때도 반드시 유지한다.
+                if hm >= MORNING_EXIT_HM:
+                    why = f"공통엔진{MORNING_EXIT_HM[:2]}:{MORNING_EXIT_HM[2:]}청산"
+                elif ret <= MORNING_STOP_PCT:
+                    why = f"공통엔진하드손절{MORNING_STOP_PCT:.1f}%"
+                else:
+                    common_why, common_quality, common_dirty = _common_exit_decide(code, s)
+                    dirty = dirty or common_dirty
+                    if common_why:
+                        why = f"공통엔진[{common_quality}] {common_why}"
+                    else:
+                        continue
+            elif s.get("entry_gate") == "BASE_BREAKOUT":
                 # ★[2026-07-19 심야] 응집폭발 전용 출구(백테 확정 프레임 그대로) — 목표/손절/시간청산만.
                 #   골짜기 매도사슬(보험선·10일선·음봉관찰)은 이 포지션에 적용하지 않는다(전략별 출구 분리).
                 if hm >= EXIT_HM:

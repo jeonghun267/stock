@@ -4,7 +4,7 @@
    sell(09:00): 전날 산 EOD_GAP 종목 익일 시가매도. 위치(52주/20일선)는 로그만. 상한가 안 컷(오후거래대금으로 판정).
    ★안전: EOD_GAP_LIVE=NO면 모의(주문0)·소액캡·검증된 broker경로·env즉시롤백. -X utf8.
    실행: python eod_gap_live_executor_v1.py pick   /   sell"""
-import sys, io, csv, json, uuid
+import sys, io, csv, json, uuid, time
 from pathlib import Path
 from datetime import datetime
 
@@ -44,7 +44,31 @@ FRI_UNIFIED_MIN = float(os.environ.get("EOD_GAP_FRI_UNIFIED_MIN", "60") or "0")
 #   ★실데이터검증(6/20)으로 '거래대금최고 LOCKED'안은 갭버려 폐기(거래대금↑=갭↓) → 현 score의 갭선호 유지.
 #   LOCKED=종가 +28.5%↑. 체결성은 orderbook(FROM_RUNNER walk) 몫. 롤백 setx EOD_GAP_LOCKED_PRIORITY NO. LOCKED픽 floor 기본60.
 LOCKED_PRIORITY = os.environ.get("EOD_GAP_LOCKED_PRIORITY", "YES").strip().upper() == "YES"
-LOCKED_MIN = float(os.environ.get("EOD_GAP_LOCKED_MIN", "60"))   # LOCKED픽 전용 품질 floor(비-LOCKED는 MIN_SCORE)
+# ★[2026-07-29 친구님 지시 "0으로 해"] LOCKED 점수 문턱 60 → 0(사실상 해제).
+#   이유: 상한가는 거래가 잠겨 거래대금이 적다 → 거래대금 점수를 못 받는다 → 총점이 구조적으로 낮다.
+#     (7/29 실측: 엔젤로보틱스 31.1점 = 거래대금2 + 종가22 + 폭발3. 5억뿐이라 2점)
+#     즉 상한가라는 이유로 점수가 깎여서 문턱 60에 전부 걸렸다.
+#   근거: 상한가 950건 전체가 +5.963%/승률 75.8%(익일 시가매도·비용 0.38% 차감).
+#     점수로 거를 이유가 없다. "찔끔찔끔"(저가 -3%↓ 눌린) 상한가도 +5.399%.
+#     기존 메모 "MIN_SCORE 75 미만이 더 좋다"와도 방향이 같다.
+#   남는 안전장치: 거래대금 상한(VAL_CEIL_EOK)·스마트머니 던지기 차단·외국계 매도 게이트·
+#     종가 체결강도(EOD_CHE_WEAK)·중복보유 방지. 롤백: setx EOD_GAP_LOCKED_MIN 60
+LOCKED_MIN = float(os.environ.get("EOD_GAP_LOCKED_MIN", "0"))   # LOCKED픽 전용 품질 floor(비-LOCKED는 MIN_SCORE)
+# ★[2026-07-29 친구님 지시 "상한가 우선 경로 지금 해"] 상한가(LOCKED)를 전략A/B보다 먼저 집는다.
+#   근거(일봉 1년·상한가 950건·종가매수→익일 시가매도·왕복 0.38% 차감):
+#     상한가 전체 +5.963%/승률 75.8% · 폭락일에도 +6.262%/승률 73.1%(67건)
+#     vs 비-LOCKED 강세주 +0.2%(위 42줄 기존 백테와 일치) · +25~28% 구간은 -0.155% 적자
+#     ⇒ 엣지는 "상한가에 잠김" 상태 자체에 있다. 등락률 절벽.
+#   기존 구조에서 상한가는 4겹으로 막혀 매수가 아예 불가능했다:
+#     ①전략A/B 조건의 `and not is_locked`(611·623줄) ②전략A/B가 켜져 elif SKIP_LOCKED 미도달
+#     ③SKIP_LOCKED=YES ④정배열 관문(상한가 46% 탈락·성과차 0.334%p뿐·승률은 탈락이 더 높음)
+#   ⚠️상한가는 매도호가 0이라 15:18 즉시체결은 안 될 수 있다. 그래도 주문을 넣어두면
+#     15:20~15:30 장마감 동시호가까지 유효하다(7/29 엔젤로보틱스 동시호가 25,848주 체결 실측).
+#     지금까지는 주문 자체를 안 넣어 동시호가 기회조차 없었다.
+#   롤백: setx EOD_GAP_LOCKED_FIRST NO
+LOCKED_FIRST = os.environ.get("EOD_GAP_LOCKED_FIRST", "YES").strip().upper() == "YES"
+# 상한가에 한해 정배열(5>20>60) 관문 면제. 비-LOCKED는 종전대로 유지(거기선 검증 안 했다).
+JB_EXEMPT_LOCKED = os.environ.get("EOD_GAP_JB_EXEMPT_LOCKED", "YES").strip().upper() == "YES"
 # [2026-06-22 친구님] ★score경로가 잠긴 상한가(LOCKED=종가+28.5%↑=호가0=못삼) 1등을 고르면 체결안돼 NO_TRADE.
 #   SKIP_LOCKED=YES면 LOCKED 건너뛰고 '살 수 있는(비잠김) 강세주 중 점수≥MIN_SCORE 최고'를 매수. 롤백 setx EOD_GAP_SKIP_LOCKED NO.
 SKIP_LOCKED = os.environ.get("EOD_GAP_SKIP_LOCKED", "YES").strip().upper() == "YES"
@@ -73,6 +97,11 @@ LEAD_SHADOW = Path(r"C:\stock_bot\data\shadow\eod_gap_leader_shadow.csv")
 #   "오늘 캔들모양이 핵심" → 전략A(횡보후 장대양봉 돌파) + 전략B(수렴선) 2택1로 재설계.
 #   26거래일 백테스트(06-11~07-16, top60): A 하루1.24건/승71.0%/+2.59% · B 하루1.96건/승55.1%/+0.66% · 합계 하루3.20건/승61.3%/+1.41%.
 TOP_N_UNI = int(os.environ.get("EOD_GAP_TOPN", "60"))   # 대상풀: 거래대금 상위 N위(공용)
+# ★[2026-07-29] 거래대금 상위에 못 든 상한가를 유니버스에 보탠다(_limitup_extra 주석 참조).
+LIMITUP_ADD = os.environ.get("EOD_GAP_LIMITUP_ADD", "YES").strip().upper() == "YES"
+LIMITUP_ADD_MAX = int(os.environ.get("EOD_GAP_LIMITUP_ADD_MAX", "10"))   # 보탤 상한가 최대 개수(TR 절약)
+# ★[2026-07-29 친구님 지시] 상한가는 CAP 금액이 아니라 무조건 1주만 산다(변동폭이 커서).
+LOCKED_QTY_ONE = os.environ.get("EOD_GAP_LOCKED_QTY_ONE", "YES").strip().upper() == "YES"
 
 # [전략A 2026-07-17] 사전횡보(14:00~15:09 종가박스 좁음) 후 돌파캔들(15:00~15:16 마지막3틱)이 5일선 걸치거나 위·장대양봉.
 STRATA_ON = os.environ.get("EOD_GAP_STRATA", "YES").strip().upper() == "YES"
@@ -157,6 +186,50 @@ def _jload(p):
         return {}
 
 
+def _pos_update_locked(mutate):
+    """eod_gap_positions.json 잠금 갱신 — 전용 추적 매도기(eod_gap_lowbuy_sell_v1)와
+    같은 DATA\\eod_gap_positions.lock 공유.
+
+    ★[2026-07-31 친구님 승인 #6] 09:01 공용매도가 '시작 때 읽은 사본'을 매도 후
+    통째로 저장하면, 그 사이 전용 매도기(09:00~09:32 2초 루프)가 쓴 CLOSED 가
+    낡은 사본에 밀려 OPEN 으로 되살아난다(경합→유령). 잠금 → 재읽기 →
+    자기 종목만 수정 → 저장. 잠금 3초 실패 시 잠금 없이 진행(fail-open)."""
+    import msvcrt
+    lock_path = POS.with_suffix(".lock")
+    handle = None
+    locked = False
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+")
+        try:  # 씨앗 1바이트 — 상대가 잠근 중이면 읽기/쓰기 자체가 PermissionError → 무시
+            if lock_path.stat().st_size == 0:
+                handle.write("1")
+                handle.flush()
+        except OSError:
+            pass
+        for _ in range(30):
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                locked = True
+                break
+            except OSError:
+                time.sleep(0.1)
+        held = _jload(POS)
+        mutate(held)
+        _jsave(POS, held)
+        return held
+    finally:
+        if handle is not None:
+            if locked:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            handle.close()
+
+
 def _jsave(p, d):
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")          # [원자적쓰기 2026-06-29] 임시파일→os.replace = 쓰기중 크래시시 손상방지
@@ -203,7 +276,12 @@ def _order(bc, code, qty, side, tag):
         if not ACCOUNT:
             _log(f"[{tag}] 계좌없음 → 주문불가"); return False
         ot = 1 if side == "BUY" else 2
-        r = bc.send_order_real(idempotency_key=f"eodgap_{side.lower()}_{code}_{uuid.uuid4()}",
+        # ★[2026-07-31] 매수만 고정 키 — uuid 면 게이트웨이 중복주문 차단(TTL 5분)이 안 걸린다.
+        #   매도는 uuid 유지: 실패 응답도 캐시되므로(broker_gateway_v1.py:2087) 고정하면
+        #   직전 실패에 막혀 재시도가 안 나간다 — 못 파는 쪽이 더 나쁘다.
+        _idem = (f"eodgap_buy_{datetime.now():%Y%m%d}_{code}" if side == "BUY"
+                 else f"eodgap_{side.lower()}_{code}_{uuid.uuid4()}")
+        r = bc.send_order_real(idempotency_key=_idem,
                                account=ACCOUNT, code=code, qty=int(qty), order_type=ot,
                                price=0, hoga_gb="06", rqname=f"EODGAP_{side}_{code}", screen_no="9703")
         _log(f"[{tag}][LIVE] {side} {code} x{qty} acct={ACCOUNT[:4]}** → {str(r)[:100]}")
@@ -233,6 +311,62 @@ def _opt10032_top(bc, n=100):
         except ValueError:
             v = 0
         out.append((code, str(r.get("종목명", "")).strip(), v))  # v=누적거래대금(백만원)
+    return out
+
+
+def _limitup_extra(bc, exclude, min_chg=28.0, max_add=10):
+    """★[2026-07-29 친구님 지시 "유니버스에 상한가 합치는것도 지금 해"]
+       거래대금 상위 N(TOP_N_UNI)에 못 든 상한가를 유니버스에 보탠다.
+
+       왜 필요한가 — 상한가는 거래가 '잠겨서' 거래대금이 낮아진다. 그래서
+       opt10032(거래대금상위) 안에 잘 못 든다. 7/29 실측: 상위 100 중 상한가는
+       매드업(40위) 하나뿐이고 엔젤로보틱스(+29.87%)·오가닉티코스메틱(+29.72%)은 밖.
+       그런데 엣지는 상한가에만 있다(950건 +5.963%/승률75.8% vs 비-LOCKED +0.2%).
+
+       opt10027(등락률상위)은 거래대금을 안 준다(빈값) → opt10001 로 거래량을 받아
+       거래량×현재가 로 채운다(상한가는 종일 그 가격 근처라 오차 작음).
+       거래대금이 0이면 점수의 큰 축(로그의 '거래대금NN점')이 죽어 LOCKED_MIN 미달로 탈락한다.
+
+       반환 형식은 _opt10032_top 과 동일: (code, name, v_백만원)
+       실패해도 빈 리스트 → 종전 유니버스 그대로(fail-open). 롤백: setx EOD_GAP_LIMITUP_ADD NO
+    """
+    try:
+        res = bc.tr("opt10027",
+                    inputs={"시장구분": "101", "정렬구분": "1", "거래량조건": "0000",
+                            "종목조건": "0", "신용조건": "0", "가격조건": "0",
+                            "거래대금조건": "0"},
+                    output_fields=["종목코드", "종목명", "현재가", "등락률"],
+                    timeout_sec=12.0, rqname="opt10027_limitup_universe")
+    except Exception as exc:
+        _log(f"[LIMITUP-ADD] opt10027 실패 fail-open: {exc}")
+        return []
+    out = []
+    for r in (((res or {}).get("data") or {}).get("records") or []):
+        code = str(r.get("종목코드", "")).strip().lstrip("A").zfill(6)
+        if len(code) != 6 or code in exclude:
+            continue
+        try:
+            chg = float(str(r.get("등락률", "0")).replace("+", "").strip() or 0)
+            px = abs(float(str(r.get("현재가", "0")).replace("+", "").replace("-", "").strip() or 0))
+        except ValueError:
+            continue
+        if chg < min_chg or px <= 0:
+            continue
+        v = 0.0
+        try:                                    # 거래대금(백만원) = 거래량 x 현재가 / 1e6
+            time.sleep(0.4)                     # 키움 조회 페이스
+            r2 = bc.tr("opt10001", inputs={"종목코드": code},
+                       output_fields=["거래량"], timeout_sec=10.0,
+                       rqname="opt10001_limitup_value")
+            recs2 = ((r2 or {}).get("data") or {}).get("records") or []
+            if recs2:
+                vol = abs(float(str(recs2[0].get("거래량", "0")).replace(",", "").strip() or 0))
+                v = vol * px / 1_000_000.0
+        except Exception:
+            v = 0.0
+        out.append((code, str(r.get("종목명", "")).strip(), v, px))
+        if len(out) >= max_add:
+            break
     return out
 
 
@@ -271,6 +405,17 @@ def _prev_eod():
         e[c] = pd.to_numeric(e[c], errors="coerce")
     e = e.dropna(subset=["close", "value"]).sort_values(["code", "date"])
     e["code"] = e["code"].str.zfill(6)
+    # ★[2026-07-29 친구님 승인 "미조치 3건도 고쳐"] 오늘 날짜 행은 제외한다(함수 설명의 "전일까지" 그대로).
+    #   일봉 수집기가 16:05 에 당일 봉을 넣기 때문에, 그 뒤 실행하면 close_prev 자리에 '오늘 종가'가
+    #   들어가 등락률이 0 이 되고 상한가 판정(day_ret>=0.285)이 통째로 죽는다(7/29 밤 실측: CSV에
+    #   이미 20260729 행 존재 → 재실행 시 상한가 0건). 15:18 정규 실행은 당일 행이 아직 없어 무변화.
+    #   ⚠️남은 위험: 수집이 하루 빠지면 close_prev 가 이틀 전 종가가 되어 2일 합산 등락률을 상한가로
+    #   오판할 수 있다. 그래서 아래에서 실제 사용한 기준일을 로그로 남긴다. 롤백: *.bak_20260729_prevdate
+    _today = datetime.now().strftime("%Y%m%d")
+    e = e[e["date"] < _today]
+    if e.empty:
+        _log("⛔ 일봉 기준일 없음(오늘 이전 데이터 0건) — 상한가/이평 판정 불가")
+        return {}
     g = e.groupby("code")
     e["v20"] = g["value"].transform(lambda s: s.rolling(20).mean())
     e["ma20"] = g["close"].transform(lambda s: s.rolling(20).mean())
@@ -279,6 +424,10 @@ def _prev_eod():
     e["ma200"] = g["close"].transform(lambda s: s.rolling(200, min_periods=200).mean())  # [D-2 tiebreak] 200일선
     e["c5"] = g["close"].shift(5)
     last = e.groupby("code").tail(1)
+    _base = str(e["date"].max())
+    _gap = (datetime.now() - datetime.strptime(_base, "%Y%m%d")).days
+    _warn = " ⚠️수집 누락 의심(등락률이 여러 날 합산이라 상한가 오판 가능)" if _gap > 4 else ""
+    _log(f"[일봉 기준일] close_prev = {_base} 기준 (오늘로부터 {_gap}일 전·종목 {len(last)}개){_warn}")
     out = {}
     for r in last.itertuples(index=False):
         out[r.code] = {"v20": r.v20, "w52": r.w52_high_pct, "ma20": r.ma20, "c5": r.c5,
@@ -370,15 +519,28 @@ def _buy_one(bc, pick, today, held):
     if code in held and held[code].get("status") == "OPEN":
         return False                              # 이미 보유 → 중복방지
     qty = max(1, int(CAP // px))
+    # ★[2026-07-29 친구님 지시 "상한가도 무조건 1주로 해줘 15만원 아니야"]
+    #   상한가는 익일 변동폭이 크다(1년 950건 최악 -29.14%). CAP 15만원어치가 아니라 1주만 산다.
+    #   비-상한가는 종전대로 CAP 기준 수량. 롤백: setx EOD_GAP_LOCKED_QTY_ONE NO
+    if bool(_lim) and LOCKED_QTY_ONE:
+        qty = 1
     if _eod_micro_skip(code):
         return False                              # ★종가 매도우위 → 매수보류
     # [2026-07-17 친구님 "종가매수 통합" 정배열 면제 전면 폐지] 전략A/B 무관 무조건 5>20>60 확인. 데이터없으면 통과(fail-open).
-    try:
-        import trend_filter as _tf
-        if not _tf.is_jeongbae(code, "strict"):
-            _log(f"EOD_GAP {code} 스킵(정배열 strict 5>20>60 아님)"); return False
-    except Exception:
-        pass
+    # ★[2026-07-29 친구님 지시 "상한가만 정배열 면제해"] 상한가(_lim)만 이 관문을 건너뛴다.
+    #   근거(일봉 1년·상한가 950건·익일 시가매도·비용 0.38% 차감):
+    #     정배열 통과 512건 +6.117%/승률 75.4%  vs  탈락 438건 +5.783%/승률 76.3%
+    #     차이 0.334%p뿐이고 승률은 오히려 탈락이 높다 = 상한가에 선별력이 없는데 기회의 46%를 버린다.
+    #   비-LOCKED 는 종전대로 관문 유지(거기선 검증하지 않았다). 롤백: setx EOD_GAP_JB_EXEMPT_LOCKED NO
+    if bool(_lim) and JB_EXEMPT_LOCKED:
+        _log(f"EOD_GAP {code} 정배열 면제(상한가·근거 950건 성과차 0.33%p)")
+    else:
+        try:
+            import trend_filter as _tf
+            if not _tf.is_jeongbae(code, "strict"):
+                _log(f"EOD_GAP {code} 스킵(정배열 strict 5>20>60 아님)"); return False
+        except Exception:
+            pass
     # [FOREIGN-GATE 2026-06-28 친구님] 거래원 외국계 매도우세 게이트(env FOREIGN_GATE: LOG/BLOCK)
     try:
         import foreign_supply as _fs
@@ -531,6 +693,20 @@ def mode_pick():
             _log(f"[FALLBACK] opt10032 빈결과 → 전날 대장주 순위표 {len(top)}종목으로 진행")
         else:
             _log("opt10032 빈결과 + 순위표 없음 → 중단"); return
+    # ★[LIMITUP-ADD 2026-07-29] 상한가는 거래가 잠겨 거래대금 상위 N 밖으로 밀린다 → 따로 보탠다.
+    limitup_px = {}     # ★유니버스 밖 상한가는 분봉(im)이 없다 → 현재가를 여기서 받아 day_ret 계산에 쓴다
+    if LIMITUP_ADD and top:
+        _have = {c for c, _n, _v in top}
+        _extra = _limitup_extra(bc, _have, max_add=LIMITUP_ADD_MAX)
+        if _extra:
+            top = top + [(c, n, v) for c, n, v, _p in _extra]
+            limitup_px = {c: p for c, _n, _v, p in _extra if p > 0}
+            _log("[LIMITUP-ADD] 거래대금 상위 %d 밖 상한가 %d개 보탬 → %s"
+                 % (TOP_N_UNI, len(_extra),
+                    ", ".join("%s %s(%.0f억)" % (c, (n or "")[:6], v / 100.0)
+                              for c, n, v, _p in _extra)))
+        else:
+            _log("[LIMITUP-ADD] 유니버스 밖 상한가 없음")
     memb = G._load_memb(); block = G._load_block()
     intra = G._intraday(today)
     opt_aft = G._load_opt10032_aft(today)
@@ -583,7 +759,10 @@ def mode_pick():
                         + (5 if im["follow"] else 0) + (3 if im["vwap_over"] else 0), 20)
         vrt = vrank.get(code, 99)
         p_theme = 6 if vrt == 1 else 4 if vrt == 2 else 0
-        cur_close = im["close"] if im else cl_prev
+        # ★[LIMITUP-ADD 2026-07-29] 유니버스 밖에서 보탠 상한가는 분봉(im)이 없다.
+        #   im 이 없으면 cur_close=cl_prev 가 되어 day_ret=0 → is_locked 가 영원히 False 였다.
+        #   opt10027 에서 받아둔 현재가로 채워 상한가 판정이 되게 한다.
+        cur_close = im["close"] if im else (limitup_px.get(code) or cl_prev)
         p_rs = (3 if (pe.get("c5") and cur_close > pe["c5"]) else 0) + 2
         score = round(p_value + p_close + p_boom + p_theme + p_rs, 1)
         day_ret = (cur_close / cl_prev - 1) if cl_prev else 0   # 당일 상승률
@@ -653,7 +832,19 @@ def mode_pick():
         _frtag = "·금요일엄선" if (_isfri and UNIFIED_PICK and FRI_UNIFIED_MIN > 0) else ("·금요일(그림자)" if _isfri else "")
         _log(f"[통일점수·{_mode}{_frtag}] top5: " + ", ".join(f"{c} {(_unm.get(c,'') or '')[:6]} {s:.0f}" for c, s in _utop))
     picks = None   # [MULTIPOS] setup분기=리스트 / 레거시분기=단일 pick→아래서 [pick] 변환
-    if STRATA_ON or STRATB_ON:
+    # ★[LOCKED-FIRST 2026-07-29] 상한가가 있으면 전략A/B보다 먼저 집는다(위 LOCKED_FIRST 주석 참조).
+    #   상한가 없으면 picks=None 유지 → 종전 흐름(전략A/B → LEADER_ONLY → SKIP_LOCKED) 그대로.
+    if LOCKED_FIRST and n_locked:
+        _lk = [c for c in cands if c[8] and c[0] >= LOCKED_MIN
+               and (VAL_CEIL_EOK <= 0 or c[3] <= VAL_CEIL_EOK)]
+        if _lk:
+            picks = _lk[:MAX_POS]
+            _log("[LOCKED-FIRST] 상한가 %d개 중 상위 %d 매수 → " % (len(_lk), len(picks))
+                 + ", ".join("%s %s %s점" % (c[1], (c[2] or "")[:6], c[0]) for c in picks))
+        else:
+            _log("[LOCKED-FIRST] 상한가 %d개 있으나 점수<%g 또는 대금상한 초과 → 종전 경로"
+                 % (n_locked, LOCKED_MIN))
+    if picks is None and (STRATA_ON or STRATB_ON):
         # [2026-07-17 친구님 "종가매수 통합"] 전략A(횡보후돌파) OR 전략B(수렴선) 2택1. 중복종목 제거 안 함.
         _setup = []
         if STRATA_ON:
@@ -735,6 +926,8 @@ def mode_pick():
         _shadow_log(today, picks[0] if picks else None, leader_pick, True)
         if not picks:
             _log(f"[전략A/B] 통과 {len(_coil)}개 — 매수가능 없음(중복/유동성/0개) → NO_TRADE"); return
+    elif picks is not None:
+        pass                    # ★LOCKED-FIRST 로 이미 골랐다 — 아래 레거시 분기 타지 않는다
     elif LEADER_ONLY:
         _shadow_log(today, leader_pick, leader_pick, True)
         if leader_pick is None:
@@ -808,21 +1001,35 @@ def mode_pick():
 def mode_sell():
     _log(f"=== EOD_GAP sell (익일 시가매도, LIVE={LIVE}) ===")
     held = _jload(POS)
-    opens = {c: p for c, p in held.items() if isinstance(p, dict) and p.get("status") == "OPEN"}
+    # ★[2026-07-30 친구님 "다음날 아침은 매도조건대로 — 우상향이면 끝까지 끌고 가"]
+    #   저점매수(route=LOWBUY)는 09:01 일괄 시가매도에서 제외 — 전용 추적 매도기
+    #   (eod_gap_lowbuy_sell_v1.py·고점 대비 -3% 꺾임 매도·15:10 강제)가 전담한다.
+    #   15:18 종가매수 픽(상한가 포함)은 백테 확정대로 종전 09:01 시가매도 유지.
+    #   롤백: backup\eod_gap_live_executor_v1_20260730_lowbuy_sellsplit.py
+    opens = {c: p for c, p in held.items()
+             if isinstance(p, dict) and p.get("status") == "OPEN"
+             and str(p.get("route", "")) != "LOWBUY"}
     if not opens:
-        _log("매도할 EOD_GAP 보유 없음"); return
+        _log("매도할 EOD_GAP 보유 없음(LOWBUY 는 전용 추적 매도기 담당)"); return
     bc = _broker()
     if not bc and LIVE:
         _log("broker dead → 매도불가"); return
     for code, p in opens.items():
         if _order(bc, code, int(p["qty"]), "SELL", "SELL"):
-            p["status"] = "CLOSED"; p["sell_date"] = datetime.now().strftime("%Y%m%d")
+            # ★[2026-07-31 #6] 잠금 갱신 — 자기 종목만 고쳐 저장(전용 매도기와 경합 방지)
+            _sell_day = datetime.now().strftime("%Y%m%d")
+            def _close(h, _c=code, _d=_sell_day):
+                row = h.get(_c)
+                if isinstance(row, dict):
+                    row["status"] = "CLOSED"; row["sell_date"] = _d
+            _pos_update_locked(_close)
             if LIVE:
                 rt = _jload(RT_OPEN)
                 if code in rt and rt[code].get("strategy") == "EOD_GAP":
                     del rt[code]; _jsave(RT_OPEN, rt)
             _log(f"매도 {code} x{p['qty']}")
-    _jsave(POS, held)
+    # ★[2026-07-31 #6] 마지막 전체 저장(_jsave(POS, held)) 제거 — 시작 때 사본을
+    #   통째로 덮어써 전용 매도기의 CLOSED 를 OPEN 으로 되살리던 경합의 원인이었다.
 
 
 if __name__ == "__main__":

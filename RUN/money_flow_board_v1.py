@@ -738,7 +738,10 @@ def _publish_micro_watch(snap):
             if chg <= thr:
                 rows.append((chg, code))
         rows.sort()                                   # 많이 빠진 순
-        codes = [c for _, c in rows[:int(os.environ.get("MF_MICRO_WATCH_N", "60"))]]
+        ordered = [c for _, c in rows]
+        seen = set(ordered)
+        ordered.extend(c for c in _UNIV[0] if c not in seen)
+        codes = ordered[:int(os.environ.get("MF_MICRO_WATCH_N", "200"))]
         if not codes:
             return
         p = Path(r"C:\stock_bot\IPC\micro_watch_moneyflow.json")
@@ -946,8 +949,14 @@ def _captain_map(snap, caps):
                 if _sh:
                     cap = _sh * cur / 1e8       # 억
 
-            prev = b.get("prev") or []      # [[o,h,l,c], ...] 오래된 → 최근
-            pv = b.get("pv") or []          # [v, ...] 같은 순서
+            # ★[2026-07-29 친구님 승인 "돈흐름판 한 줄 고쳐"] 최근 4봉만 사용(+현재봉=5봉).
+            #   공급자(deep_bottom_signal_recorder)가 같은 날 S02용 3분봉 MA20·ATR14 때문에
+            #   보관을 4→60봉으로 늘렸는데, 아래 hh_rate·bull·val 은 창 전체를 나누는 식이라
+            #   창이 커질수록 관문이 구조적으로 빡빡해진다(09:30이면 봉 30개 → 통과 훨씬 어려움).
+            #   지시 밖 파급이므로 소비 지점에서만 종전 창(4봉)으로 복원 — 공급 파일은 60봉 유지라
+            #   S02는 영향 없다. 창 크기를 바꾸려면 검증 후 여기 숫자만 조정. 롤백: *.bak_20260729_prevslice
+            prev = (b.get("prev") or [])[-4:]   # [[o,h,l,c], ...] 오래된 → 최근
+            pv = (b.get("pv") or [])[-4:]       # [v, ...] 같은 순서
             # ★09:00부터 지금까지의 봉 = 완성봉들 + 현재봉
             ohlc = [[float(x[0]), float(x[1]), float(x[2]), float(x[3])] for x in prev]
             ohlc.append([float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"])])

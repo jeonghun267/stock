@@ -23,6 +23,7 @@ NOW = datetime.now()
 
 BROKER_LOG = BASE / "LOG" / "broker_journal.log"
 SNAPSHOT = BASE / "IPC" / "live_micro_snapshot.json"
+EARLY_WATCH = BASE / "IPC" / "micro_watch_captain2.json"
 MF1S_CSV = BASE / "data" / "shadow" / "mf_1s_capture" / f"mf_1s_{TODAY}.csv"
 C2_LOCK = BASE / "data" / "captain2.lock"
 C2_LOG = BASE / "LOG" / "captain2_moneyflow.log"
@@ -67,6 +68,35 @@ try:
 except Exception as e:
     check(False, "차단 깃발", f"점검 실패: {e}")
 
+# ── ⓪-1 캡틴2 EARLY 장전 압축목록 ───────────────────────────────
+try:
+    watch = json.loads(EARLY_WATCH.read_text(encoding="utf-8-sig"))
+    required = {"codes", "qualified_codes", "meta", "for_date", "source_date"}
+    missing = sorted(required - set(watch))
+    qualified = watch.get("qualified_codes")
+    meta = watch.get("meta")
+    watch_ts = datetime.fromisoformat(str(watch.get("ts") or ""))
+    age = (NOW - watch_ts).total_seconds()
+    contract_ok = isinstance(qualified, list) and isinstance(meta, dict)
+    meta_ok = contract_ok and all(
+        str(code).zfill(6) in meta
+        and float((meta.get(str(code).zfill(6)) or {}).get("prev_close") or 0) > 0
+        for code in qualified
+    )
+    ok = (not missing and str(watch.get("for_date") or "") == TODAY
+          and 0 <= age <= 2700 and contract_ok and meta_ok)
+    check(
+        ok,
+        "캡틴2 EARLY 장전 압축목록",
+        f"대상일={watch.get('for_date') or '-'} · 기준일={watch.get('source_date') or '-'} · "
+        f"장전100={len(watch.get('codes') or [])} · 압축={len(qualified or [])} · "
+        f"갱신 {age:.0f}초 전"
+        + (f" · 누락키={','.join(missing)}" if missing else "")
+        + ("" if meta_ok else " · qualified/meta 계약 불일치"),
+    )
+except Exception as e:
+    check(False, "캡틴2 EARLY 장전 압축목록",
+          f"읽기/계약 점검 실패: {e} — EARLY는 fail-closed, 일반 09:30 레인은 별도")
 # ── ① 브로커 FID15 실수신 ────────────────────────────────────────
 try:
     lines = [ln for ln in tail_lines(BROKER_LOG) if "[REAL-SIDE-VERIFY]" in ln]

@@ -34,9 +34,13 @@ REM   limit entry, own exit +2%/-1.5%/15:10). Backtest 26d PF 1.18. VH_BB=NO kil
 set VH_BB=NO
 set VH_SLOTS=6
 set SHARED_MAX_SLOTS=6
-REM universe - identical to crash engine (prev-day trading value band, gap-down priority)
+REM Gate2/general universe remains 700eok+. Gate1 09:00-09:20 has its own wider
+REM 100eok+ pool plus a 1000eok market-cap safety floor.
 set VH_PVAL_MIN=700
 set VH_PVAL_MAX=20000
+set VH_MORNING_PVAL_MIN=100
+set VH_MORNING_MCAP_MIN=1000
+set VH_MORNING_MCAP_MAX_AGE_DAYS=7
 set VH_GAP_TH=-3
 REM 2026-07-19 late-night unified patch: VH_SELL_CHE/VH_DEFENSE/VH_TRAIL/VH_STOP/VH_DROP
 REM   removed - dead in code now (STOP/TARGET_PROFIT_PCT/DROP filter deleted, DEFENSE
@@ -71,11 +75,29 @@ REM 2026-07-19 late-night: new-entry window now hard-stops at 14:30 (was 14:20)
 REM 2026-07-20: Gate1 integration - crash engine's 09:00 morning window absorbed into this
 REM   engine (entry_gate=MORNING_CRASH, prev-close -5% basis). VH_ENTRY moved 0930->0900.
 REM   Gate2 (entry_gate=VALLEY_PEAK, existing 5MA-high -5% basis) still starts at 0930 -
-REM   see VLA_GATE1_END in valley_low_buy_v1.py (default 0930, do not need to set here).
+REM   Gate1 runtime end is explicitly set to 0920 below; Gate2 remains 0930.
 REM   crash_flow_live_v1.py itself is NOT touched/disabled yet - stays live in parallel
 REM   until this engine's Gate1 shadow results are verified (user decision 2026-07-20).
 set VH_ENTRY=0900
 set VLA_ENTRY=0900
+REM 2026-07-24 owner: Gate1 morning crash arms at previous-close -4% or lower.
+set VLA_GATE1_ARM_PCT=-4
+REM 2026-07-24 owner: no new MORNING_CRASH entries after 09:20; hold until 09:30
+REM unless the entry-price -2% hard stop is hit.
+set VLA_GATE1_END=0920
+set VLA_GATE2_START=0930
+set VH_MORNING_EXIT=0930
+set VH_MORNING_STOP=-2
+set VH_MORNING_REV_WATCH_SEC=10
+set VH_SIDE_STALE_SEC=6
+set VLA_GATE1_FAST=YES
+set VLA_FAST_MIN_SEC=2
+set VLA_FAST_MAX_SEC=6
+set VLA_FAST_CONFIRM_SEC=2
+set VLA_FAST_REBOUND_LO=0.6
+set VLA_FAST_REBOUND_HI=3.0
+set VLA_FAST_MIN_MONEY=10000000
+set VLA_FAST_MIN_BUY_RATIO=0.70
 set VH_ENTRY_END=1430
 REM 2026-07-22 owner: retire Gate2 (VALLEY_PEAK, 5MA-high pullback) - CAPTAIN2 live
 REM   covers money-driven rebounds better. Gate1 (morning crash) + BB gate + sells

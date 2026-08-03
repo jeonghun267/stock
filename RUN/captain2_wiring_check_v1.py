@@ -30,12 +30,91 @@ def verdict(tag, ok, detail="", miss=False):
     w(f"  [{mark}] {tag}" + (f" — {detail}" if detail else ""))
     return mark
 
+def mock_contracts() -> None:
+    """주문·프로세스·외부파일 쓰기 없이 오늘 캡틴2 계약만 검증한다."""
+    sys.path.insert(0, str(BASE / "RUN"))
+    import CAPTAIN2_MONEYFLOW_ENGINE_V1 as M
+    import captain2_common_hold_sell_v1 as C
+    import captain2_strategy_01_live_bridge_v1 as B
+    import strategy_watchlist as W
+
+    results = []
+    def check(name, ok, detail=""):
+        results.append((name, bool(ok), detail))
+        print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" - {detail}" if detail else ""))
+
+    cfg = M.Config()
+    cmd = (BASE / "RUN" / "hidden" / "SAFEPLUS_CAPTAIN2_SHADOW.cmd").read_text(
+        encoding="utf-8", errors="replace")
+    required = (
+        "set CAPTAIN2_LIVE=YES",
+        "set CAPTAIN2_QTY_FIX=1",
+        "set CAPTAIN2_C2_01_ON=1",
+        "set CAPTAIN2_C2_01_MAX_ORDER_ATTEMPTS=1",
+        "set CAPTAIN2_EARLY_ON=0",
+        "set CAPTAIN2_ENTRY_START=2400",
+        "set CAPTAIN2_BASE_ON=0",
+        "set CAPTAIN2_REACCEL_LIVE_ON=0",
+    )
+    check("기본값 fail-closed", not cfg.c2_01_on, "직접 실행은 C2-01 OFF")
+    check("월요일 C2-01 단독설정", all(line in cmd for line in required))
+    check("1주·하루1회 주문시도", cfg.qty_fixed == 1
+          and cfg.c2_01_max_order_attempts == 1,
+          f"qty={cfg.qty_fixed} attempts={cfg.c2_01_max_order_attempts}")
+    check("신호계약", B.STRATEGY_ID == "C2_01_OPEN_SURGE"
+          and B.SIGNAL_MODE == "SHADOW_ORDER_ZERO")
+    check("기존 안전주문 배선", all(hasattr(M.Captain2Engine, name) for name in (
+          "_c2_01_signal_step", "_open", "_buy_pending_step")))
+    check("공통매도 배선", hasattr(M.Captain2Engine, "_c2_01_common_exit")
+          and C.STRATEGY_PROFILES[C.StrategyId.C2_01_OPEN_SURGE].force_exit_at.strftime("%H%M") == "1510")
+
+    hist = [(f"202607{i + 1:02d}", 100.0, 105.0, 100.0) for i in range(20)]
+    hist.append(("20260721", 100.0, 112.0, 700.0))
+    metrics = W._captain2_metrics(hist)
+    check("장전 압축지표", bool(metrics)
+          and metrics["ret_5d_pct"] >= -10
+          and metrics["high_close_pct"] >= 10
+          and metrics["value_ratio_20d"] >= 6,
+          str(metrics))
+
+    engine = object.__new__(M.Captain2Engine)
+    engine.states = {
+        "000001": M.FlowState(code="000001", phase=M.Phase.HOLD, entry_price=100_000, qty=10),
+        "000002": M.FlowState(code="000002", phase=M.Phase.BUY_PENDING, buy_reserved_krw=500_000),
+        "000003": M.FlowState(code="000003", phase=M.Phase.SELL_PENDING, entry_price=200_000, qty=2),
+    }
+    check("회전원금 합산", engine._capital_in_use_krw() == 1_900_000,
+          f"actual={engine._capital_in_use_krw():.0f}")
+    engine.states["000001"].phase = M.Phase.CLOSED
+    check("매도 후 원금 재사용", engine._capital_in_use_krw() == 900_000,
+          f"actual={engine._capital_in_use_krw():.0f}")
+
+    trend = M.Captain2Engine._early_trend_contract
+    trend_ok, _ = trend(110, 100, True, 0.60, 60, 100, 105, 50)
+    trend_bad, trend_why = trend(99, 100, False, 0.40, 20, 100, 105, 80)
+    check("09:20 추세연장 PASS", trend_ok)
+    check("09:20 약화정리 FAIL", not trend_bad and all(k in trend_why for k in
+          ("VWAP", "MA3", "FLOW", "SPEED", "STRUCTURE", "SELL_SCORE")), trend_why)
+
+
+    engine_src = ENGINE.read_text(encoding="utf-8", errors="replace")
+    check("개별손절 유지", "HARD_STOP {ret_pct:.2f}%" in engine_src)
+    check("중복·부분체결 복구 유지", all(k in engine_src for k in
+          ("def _duplicate_reason", "BUY_PARTIAL_CONFIRMED", "Phase.BUY_PENDING")))
+
+    failed = [name for name, ok, _detail in results if not ok]
+    print(f"MOCK_CONTRACTS total={len(results)} pass={len(results) - len(failed)} fail={len(failed)}")
+    if failed:
+        raise AssertionError(", ".join(failed))
+
 def main() -> None:
     w(f"══ 캡틴2 배선 6종 아침점검 ({datetime.now():%Y-%m-%d %H:%M:%S}) ══")
     w("   판정: PASS / FAIL / 미발생(장중 조건 미도래 — 오류 아님)")
 
     # ── 소스·설정 로드 ──
     src = ENGINE.read_text(encoding="utf-8", errors="replace")
+    cmd_txt = (BASE / "RUN" / "hidden" / "SAFEPLUS_CAPTAIN2_SHADOW.cmd").read_text(
+        encoding="utf-8", errors="replace")
     sys.path.insert(0, str(BASE / "RUN"))
     cfg = None
     try:
@@ -59,26 +138,35 @@ def main() -> None:
         log_txt = LOGF.read_text(encoding="utf-8", errors="replace")[-400_000:]
     today_log = "\n".join(ln for ln in log_txt.splitlines() if f"{TODAY[:4]}-{TODAY[4:6]}-{TODAY[6:]}" in ln)
 
-    # ══ [1] EARLY 초입 레인 ══
-    w("\n[1] EARLY 초입 레인")
-    if cfg:
-        verdict("설정 로드", cfg.early_on and cfg.early_start == "0900" and cfg.early_end == "0910",
-                f"on={cfg.early_on} 창={cfg.early_start}~{cfg.early_end}")
-        verdict("파라미터 5종", abs(cfg.early_min_speed - 1666667) < 1 and cfg.early_min_burst == 3.0
-                and cfg.early_min_buy_ratio == 0.70 and cfg.early_persist_sec == 3
-                and cfg.early_max_above_open_pct == 2.0,
-                f"속도{cfg.early_min_speed:,.0f}·배율{cfg.early_min_burst}·매수비{cfg.early_min_buy_ratio}"
-                f"·지속{cfg.early_persist_sec}s·이격{cfg.early_max_above_open_pct}%")
-    verdict("100억 관문 우회(구조)", "_market_filter" not in src.split("def _early_check")[1].split("def ")[0],
-            "_early_check에 100억 관문 호출 없음(min_price 1만원만 유지)")
-    n_early = ev_names.count("EARLY_ONSET")
-    if n_early:
-        ex = [e for e in events if e[2] == "EARLY_ONSET"][:3]
-        verdict("EARLY 발화 로그", True, f"{n_early}건 예: " + " / ".join(f"{e[0][11:19]} {e[1]}" for e in ex))
+    # ══ [1] C2-01 장초반 급상승 초입 ══
+    w("\n[1] C2-01 장초반 급상승 초입")
+    c2_required = (
+        "set CAPTAIN2_QTY_FIX=1",
+        "set CAPTAIN2_C2_01_ON=1",
+        "set CAPTAIN2_C2_01_MAX_ORDER_ATTEMPTS=1",
+        "set CAPTAIN2_EARLY_ON=0",
+        "set CAPTAIN2_ENTRY_START=2400",
+        "set CAPTAIN2_BASE_ON=0",
+        "set CAPTAIN2_REACCEL_LIVE_ON=0",
+    )
+    verdict("월요일 1주 단독설정", all(line in cmd_txt for line in c2_required),
+            "C2-01 1주·1회, 다른 신규 실매수 레인 OFF")
+    verdict("신호→안전주문 배선", "def _c2_01_signal_step" in src
+            and "self._open(point, state, order_reason)" in src,
+            "기존 _open·BUY_PENDING·체결복구 사용")
+    verdict("공통 상승보유·매도 배선", "def _c2_01_common_exit" in src
+            and 'state.lane == "C2_01_OPEN_SURGE"' in src,
+            "공통 엔진 판정 뒤 기존 _close 사용")
+    n_c2 = ev_names.count("C2_01_SIGNAL")
+    if n_c2:
+        ex = [e for e in events if e[2] == "C2_01_SIGNAL"][:3]
+        verdict("C2-01 발화 로그", True, f"{n_c2}건 예: "
+                + " / ".join(f"{e[0][11:19]} {e[1]}" for e in ex))
     else:
-        verdict("EARLY 발화 로그", True, "오늘 발화 0건 — VWAP 관문·조건 미충족 가능", miss=True)
-    verdict("RAID·PULL 무변경(구조)", "_buy_signal" in src and "PULL 5조건" in src and "MARKET_STRONGEST" in src,
-            "기존 함수·경로 존재(정밀 비교는 공통점검 해시로)")
+        verdict("C2-01 발화 로그", True, "오늘 조건 충족 신호 없음", miss=True)
+    verdict("다른 전략 코드는 보존", "_buy_signal" in src and "PULL 5조건" in src
+            and "MARKET_STRONGEST" in src,
+            "코드는 삭제하지 않고 월요일 실행설정에서 신규매수만 정지")
 
     # ══ [2] VWAP 진입 관문 ══
     w("\n[2] VWAP 진입 관문")
@@ -119,8 +207,8 @@ def main() -> None:
     w("\n[4] 매도 점수 엔진")
     if cfg:
         verdict("스위치·문턱", cfg.score_sell_on and cfg.score_watch == 25 and cfg.score_warning == 50
-                and cfg.score_sell_ready == 75 and cfg.score_hold_max_sec == 10,
-                f"ON={cfg.score_sell_on} 25/50/75 유예최대={cfg.score_hold_max_sec:.0f}s")
+                and cfg.score_sell_ready == 75 and cfg.score_dry_confirm_sec == 5,
+                f"ON={cfg.score_sell_on} 25/50/75 유입끊김확인={cfg.score_dry_confirm_sec:.0f}s")
     verdict("배점 3계열+가속감산(구조)", all(k in src for k in
             ("score += 25; parts.append(\"VWAP↓\")", "속도20%↓", "역전35%↓", "score *= 0.5")),
             "ⓐ25 ⓑ25/40 ⓒ25/35 ⓓ×0.5")
@@ -133,7 +221,8 @@ def main() -> None:
                 " ".join(f"{k}={v}" for k, v in score_ev.items()) + f" SCORE_SELL매도={n_score_sell}")
     else:
         verdict("상태전이·매도 로그", True, "오늘 보유 발생 전이거나 전이 미도래", miss=True)
-    verdict("HARD_STOP 최후 보험(구조)", "hard_stop_pct" in src and "HARD_STOP {ret_pct" in src, "-3% 유지")
+    verdict("HARD_STOP 최후 보험(구조)", "hard_stop_bottom_pct" in src and "HARD_STOP {ret_pct" in src,
+            "바닥 -2%·눌림 -3/-4%")
 
     # ══ [5] VI 거부 대응 ══
     w("\n[5] VI 거부 대응")
@@ -260,8 +349,11 @@ def main() -> None:
     print("\n".join(L))
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        OUT.write_text(f"점검 스크립트 자체 오류: {type(e).__name__}: {e}", encoding="utf-8")
-        raise
+    if "--mock-contracts" in sys.argv:
+        mock_contracts()
+    else:
+        try:
+            main()
+        except Exception as e:
+            OUT.write_text(f"점검 스크립트 자체 오류: {type(e).__name__}: {e}", encoding="utf-8")
+            raise

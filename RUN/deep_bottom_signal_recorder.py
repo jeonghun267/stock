@@ -106,7 +106,12 @@ def main():
         hm = now.strftime("%H%M")
         if hm > END_HM:
             break
-        if hm < "0900":
+        # ★[MA3-COMMON 2026-08-03 친구님 지시 "8시 30분 장외 캔들 쓸 수 있게"]
+        #   종전 09:00 → 08:30. 장전 동시호가 30분치 봉을 미리 쌓아야 장 시작
+        #   시점에 3분봉 20선이 선다(60분 평균이라 09:00 부터 쌓으면 10:00 에야 생김).
+        #   ⚠️앞당기는 것은 '봉 쌓기'뿐이다. 신호 판정과 CSV 기록은 아래 관문에서
+        #     종전대로 09:00 부터 — 동시호가 예상체결가로 신호가 나가면 안 된다.
+        if hm < "0830":
             time.sleep(LOOP_SEC)
             continue
 
@@ -145,13 +150,22 @@ def main():
                     b["done"] = True
                     # ★[7/14] 완성된 봉을 버리지 말고 남긴다 — 매매기 '양봉 N개 연속' 관문용.
                     #   매매기는 55초마다 죽어 과거 봉을 못 들고 있다 → 여기서 최근 5개를 넘긴다.
+                    # ★[2026-07-29 친구님 지시] 보관 5봉 → 60봉.
+                    #   3분봉 MA20(=1분봉 60개)과 1분봉 ATR14 를 계산하려면 과거 봉이 필요한데
+                    #   5봉뿐이라 MA3 허가증(ma3_permit)과 변동성 손절이 둘 다 불가능했다.
+                    #   되돌리기: deep_bottom_signal_recorder.py.bak_20260729_60bars 복원.
+                    # ★[MA3-COMMON 2026-08-03] 60봉 → 70봉.
+                    #   3분봉 20선의 '우상향'을 보려면 20선과 직전 20선을 비교해야 하고
+                    #   그러려면 완성 3분봉이 21개 = 1분봉 63개 필요하다. 60봉으로는
+                    #   3분 격자 양끝이 잘려 완성 3분봉이 19개뿐이라 판정 자체가 불가였다
+                    #   (8/3 실측: 고저폭30 전 종목 19개). 70봉이면 22~23개가 나온다.
                     _bh = bars_hist.setdefault(code, [])
                     _bh.append([b["o"], b["h"], b["l"], b["c"]])
-                    del _bh[:-5]
+                    del _bh[:-70]
                     # ★[7/14 밤] 완성봉의 거래량도 같은 순서로 남긴다(별도 리스트 = 기존 prev 구조 불변).
                     _vh = vols_hist.setdefault(code, [])
                     _vh.append(max(0.0, _cv - float(b.get("v0") or _cv)))
-                    del _vh[:-5]
+                    del _vh[:-70]
                 bars[code] = {"hm": hm, "o": cur, "h": cur, "l": cur, "c": cur, "done": False,
                               "v0": _cv}      # ★봉 시작 시점의 누적거래량
                 # ★[7/14 밤 아침대장] 09:00 봉의 시가를 붙잡아 둔다.
@@ -160,6 +174,21 @@ def main():
                 #   ⚠️스냅샷엔 시가 필드가 없다 → 09:00 첫 관측가로 근사(동시호가 직후라 오차 미미).
                 if hm == "0900" and code not in v_open:
                     v_open[code] = cur
+                # ★[OPEN-FID 2026-08-03 친구님 승인] 09:00 창을 놓친 종목 구제.
+                #   위 조건은 "09:00 그 1분에 관측된 종목"만 시가를 얻는다. 09:01 이후
+                #   구독에 들어온 종목은 하루 종일 시가가 없었고, 8/3 실측에서 S03 후보
+                #   230종목 중 86종목(37%)이 OPEN_PRICE_MISSING 으로 판정 자체가 막혔다.
+                #   브로커가 실시간 FID 16(당일 시가)을 스냅샷에 실어주면 그 값을 쓴다
+                #   (broker_gateway_v1.py 동일자 수정). 시가는 정적 값이라 장중 어느
+                #   시점에 받아도 정확하다.
+                #   ⚠️op 가 없으면 종전과 100% 동일하게 동작한다 — 되돌림 안전.
+                if code not in v_open:
+                    try:
+                        _op = float(sc.get("op") or 0)
+                    except Exception:
+                        _op = 0.0
+                    if _op > 0:
+                        v_open[code] = _op
             else:
                 b["h"] = max(b["h"], cur); b["l"] = min(b["l"], cur); b["c"] = cur
             # ---- ★[7/14 친구님 "깊은바닥 그대로 이식하고 바닥 잡는 것만 1분봉으로"] 자체 3분봉 구성 ----
@@ -177,6 +206,12 @@ def main():
             hs.append((sec, cur))
             if len(hs) > 200:
                 del hs[:len(hs) - 200]
+
+            # ★[MA3-COMMON 2026-08-03] 여기까지가 '봉 쌓기'(08:30 부터).
+            #   아래 신호 판정·CSV 기록은 종전대로 09:00 부터만 돈다.
+            #   동시호가 예상체결가는 체결이 아니므로 신호 근거로 쓰면 안 된다.
+            if hm < "0900":
+                continue
 
             # ================= 결과 채움 (이미 기록한 종목) =================
             if code in seen and code not in done:
@@ -287,13 +322,14 @@ def main():
                                 "pos": round((_b["c"] - _b["l"]) / _rng, 3) if _rng > 0 else 0.5,
                                 "bull": 1 if _b["c"] > _b["o"] else 0,
                                 # ★[7/14] 직전 완성봉(오래된 것 → 최근 순). 매매기가 '양봉 N개 연속'을 판정한다.
-                                "prev": (bars_hist.get(_c) or [])[-4:],
+                                # ★[MA3-COMMON 2026-08-03] 60 → 70(위 보관 확장과 짝).
+                                "prev": (bars_hist.get(_c) or [])[-70:],
                                 # ★[7/14 밤 아침대장] 아래 3개는 **추가만** — 기존 소비자(매매기) 무영향.
                                 #   v   = 현재 봉 거래량        (분당 대금 계산)
                                 #   pv  = 직전 완성봉 거래량들   (직전 3분 평균 분당 대금)
                                 #   op  = ★09:00 봉의 시가      (시가 대비 상승률 = 대장 1번 신호)
                                 "v": _vnow,
-                                "pv": (vols_hist.get(_c) or [])[-4:],
+                                "pv": (vols_hist.get(_c) or [])[-70:],
                                 "op": v_open.get(_c)}
             _tmp = BARS_OUT.with_suffix(".tmp")
             _tmp.write_text(json.dumps(_bo, ensure_ascii=False), encoding="utf-8")
