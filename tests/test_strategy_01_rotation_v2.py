@@ -5,14 +5,19 @@ import json
 import logging
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import timedelta, time as day_time
+from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 from strategy_01_rotation_engine_v2 import (
     Config,
     Strategy01Engine,
     kst_now,
 )
+from strategy_common_hold_sell_v1 import STRATEGY_PROFILES, StrategyId
+from hold_sell_audit_v1 import load_verified_post_exit_rows
 
 
 class FakeSlots:
@@ -77,7 +82,7 @@ class Strategy01RotationV2Tests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def config(self, *, capital: int = 2_000_000, live: bool = False) -> Config:
+    def config(self, *, capital: int = 2_000_000, live: bool = False, quantity: int = 1) -> Config:
         return Config(
             signal_path=self.root / "signal.json",
             snapshot_path=self.root / "snapshot.json",
@@ -88,12 +93,14 @@ class Strategy01RotationV2Tests(unittest.TestCase):
             fills_dir=self.root / "fills",
             event_dir=self.root / "events",
             log_path=self.root / "engine.log",
+            audit_root=self.root / "audit",
+            audit_enabled=False,
             approval_path=self.root / "approved.flag",
             off_flag_path=self.root / "off.flag",
             manual_buy_block_path=self.root / "manual.flag",
             lock_path=self.root / "engine.lock",
             live_requested=live,
-            quantity=1,
+            quantity=quantity,
             max_slots=6,
             max_daily_codes=6,
             max_cycles_per_code=2,
@@ -115,12 +122,14 @@ class Strategy01RotationV2Tests(unittest.TestCase):
         observed_at,
         *,
         sequences: dict[str, list[int]] | None = None,
+        stages: dict[str, list[str]] | None = None,
     ) -> None:
         rows = []
         sequences = sequences or {code: [1] for code in codes}
+        stages = stages or {}
         for rank, code in enumerate(codes):
-            for sequence in sequences.get(code, [1]):
-                rows.append({
+            for index, sequence in enumerate(sequences.get(code, [1])):
+                row = {
                     "ts": observed_at.isoformat(timespec="seconds"),
                     "code": code,
                     "name": f"TEST-{code}",
@@ -131,7 +140,11 @@ class Strategy01RotationV2Tests(unittest.TestCase):
                     "money_speed_5s": 10_000_000 - rank,
                     "buy_ratio": 0.75,
                     "theme_bonus": 0,
-                })
+                }
+                if index < len(stages.get(code, [])):
+                    row["entry_stage"] = stages[code][index]
+                    row["requested_quantity"] = 1
+                rows.append(row)
         signal = {
             "schema": "strategy_01_open_surge_signal_v2",
             "date": observed_at.strftime("%Y%m%d"),
@@ -169,6 +182,22 @@ class Strategy01RotationV2Tests(unittest.TestCase):
         self.config().bars_path.write_text("{}", encoding="utf-8")
         self.config().names_path.write_text("{}", encoding="utf-8")
 
+    def write_ma3_seed(self, codes: list[str], price: float) -> None:
+        start = (self.now - timedelta(days=1)).replace(
+            hour=13, minute=50, second=0)
+        labels = [
+            (start + timedelta(minutes=index)).strftime("%Y%m%d%H%M")
+            for index in range(70)
+        ]
+        payload = {
+            "ts": self.now.isoformat(timespec="seconds"),
+            "hm": self.now.strftime("%H%M"),
+            "m": {code: {"prev": [[price] * 4 for _ in labels],
+                         "pm": labels, "c": price} for code in codes},
+        }
+        self.config().bars_path.write_text(
+            json.dumps(payload), encoding="utf-8")
+
     def engine(self, config: Config, broker: FakeBroker | None = None):
         broker = broker or FakeBroker()
         return (
@@ -192,7 +221,67 @@ class Strategy01RotationV2Tests(unittest.TestCase):
             1,
         )
 
+    def test_two_share_setting_submits_and_records_two_shares(self) -> None:
+        code = "100099"
+        self.write_market([code], {code: 10_000}, self.now)
+        engine, broker = self.engine(self.config(quantity=2))
+
+        engine.tick(self.now)
+
+        self.assertEqual(broker.submissions[0]["quantity"], 2)
+        self.assertEqual(engine._active_positions()[code]["qty"], 2)
+
+    def test_staged_signals_buy_one_share_then_add_one_share(self) -> None:
+        code = "100097"
+        engine, broker = self.engine(self.config(quantity=2))
+        self.write_market(
+            [code], {code: 10_000}, self.now,
+            stages={code: ["EARLY_FLOW"]},
+        )
+        engine.tick(self.now)
+        self.assertEqual(engine._active_positions()[code]["qty"], 1)
+
+        later = self.now + timedelta(seconds=1)
+        self.write_market(
+            [code], {code: 10_100}, later,
+            sequences={code: [2]},
+            stages={code: ["STRONG_FLOW"]},
+        )
+        engine.tick(later)
+
+        position = engine._active_positions()[code]
+        self.assertEqual(
+            [row["quantity"] for row in broker.submissions], [1, 1])
+        self.assertEqual(position["qty"], 2)
+        self.assertEqual(
+            position["entry_stages"], ["EARLY_FLOW", "STRONG_FLOW"])
+        self.assertAlmostEqual(position["entry_price"], 10_050)
+
+
+    def test_two_share_partial_exit_banks_one_and_keeps_runner(self) -> None:
+        code = "100098"
+        self.write_market([code], {code: 10_000}, self.now)
+        engine, _ = self.engine(self.config(quantity=2))
+        engine.tick(self.now)
+        position = engine._active_positions()[code]
+        point = engine._snapshot_point(code, self.now)
+        engine._start_sell(
+            position, self.now, "S01_PEAK_FLOW_PARTIAL", point,
+            quantity_override=1, partial=True,
+        )
+        self.assertEqual(position["phase"], "HOLD")
+        self.assertEqual(position["qty"], 1)
+        self.assertTrue(position["hold_state"]["peak_partial_taken"])
+        self.assertEqual(position["partial_exits"][0]["quantity"], 1)
+        self.assertEqual(engine.state["cycles_by_code"].get(code, 0), 0)
+
+        engine._start_sell(position, self.now, "FINAL_EXIT", point)
+        self.assertEqual(position["phase"], "CLOSED")
+        self.assertEqual(position["qty"], 0)
+        self.assertEqual(engine.state["cycles_by_code"][code], 1)
+
     def test_sell_releases_slot_and_capital_for_waiting_code(self) -> None:
+
         codes = ["200001", "200002"]
         prices = {code: 3_000_000 for code in codes}
         self.write_market(codes, prices, self.now)
@@ -285,6 +374,7 @@ class Strategy01RotationV2Tests(unittest.TestCase):
     def test_timeout_blocks_replay_and_reconciles_without_duplicate(self) -> None:
         code = "500001"
         self.write_market([code], {code: 10_000}, self.now)
+        self.write_ma3_seed([code], 10_000)
         broker = FakeBroker(real=True, status="TIMEOUT")
         engine, _ = self.engine(self.config(live=True), broker)
 
@@ -297,6 +387,85 @@ class Strategy01RotationV2Tests(unittest.TestCase):
         self.assertEqual(len(broker.submissions), 1)
         self.assertEqual(engine._active_positions(), {})
         self.assertEqual(engine.state["history"][-1]["phase"], "FAILED")
+
+    def test_real_buy_is_blocked_when_ma3_seed_is_missing(self) -> None:
+        code = "500002"
+        self.write_market([code], {code: 10_000}, self.now)
+        broker = FakeBroker(real=True, status="OK")
+        engine, _ = self.engine(self.config(live=True), broker)
+
+        with patch("strategy_01_rotation_engine_v2.ma3_request_missing_history") as request:
+
+            engine.tick(self.now)
+
+
+        self.assertEqual(broker.submissions, [])
+
+        self.assertEqual(engine.state["last_error"], "MA3_SEED_NOT_READY:500002")
+
+        request.assert_called_once()
+
+        self.assertEqual(request.call_args.args[0], code)
+
+    def test_s01_ma_support_needs_buy_side_rate(self) -> None:
+        code = "500003"
+        self.write_market([code], {code: 10_000}, self.now)
+        self.write_ma3_seed([code], 10_000)
+        engine, _ = self.engine(self.config())
+
+        point = engine._snapshot_point(code, self.now)
+        self.assertIsNotNone(point)
+        observation = engine._build_observation(
+            {"code": code, "real": True}, point,
+        )
+
+        self.assertFalse(observation.daily_ma_permit)
+        self.assertFalse(observation.common_peak_flow_ready)
+        profile = STRATEGY_PROFILES[StrategyId.S01_OPEN_SURGE]
+        self.assertTrue(profile.common_peak_flow_exit_enabled)
+        self.assertFalse(profile.profit_trail_enabled)
+        self.assertTrue(profile.trail_needs_sell_pressure)
+
+    def test_missing_real_flag_is_recovery_blocked(self) -> None:
+        config = self.config(live=True)
+        config.state_path.write_text(
+            json.dumps({
+                "schema": config.state_schema,
+                "date": self.now.strftime("%Y%m%d"),
+                "order_attempts_total": 0,
+                "consumed_signals": [],
+                "positions": {
+                    "000001": {
+                        "code": "000001",
+                        "name": "LEGACY",
+                        "phase": "HOLD",
+                        "qty": 1,
+                        "entry_price": 10_000,
+                        "entry_at": self.now.isoformat(),
+                    },
+                },
+                "cycles_by_code": {},
+                "entered_codes": [],
+                "history": [],
+                "recovery_blocked": False,
+                "last_error": "",
+            }),
+            encoding="utf-8",
+        )
+
+        engine, broker = self.engine(config, FakeBroker(real=True))
+
+        self.assertTrue(engine.state["recovery_blocked"])
+        self.assertEqual(
+            engine.state["positions"]["000001"]["phase"],
+            "RECOVERY_BLOCKED",
+        )
+        self.assertEqual(
+            engine.state["last_error"],
+            "POSITION_REAL_FLAG_MISSING_MANUAL_CHECK:000001",
+        )
+        engine.tick(self.now)
+        self.assertEqual(broker.submissions, [])
 
 
     def test_trade_audit_records_rank_excursions_and_post_exit(self) -> None:
@@ -347,6 +516,31 @@ class Strategy01RotationV2Tests(unittest.TestCase):
         text = event_file.read_text(encoding="utf-8-sig")
         self.assertIn("rank=1/2", text)
         self.assertIn("mfe=5.000% mae=-2.000%", text)
+
+    def test_post_exit_observation_capture_is_order_zero_and_hash_verified(self) -> None:
+        code = "600003"
+        self.write_market([code], {code: 10_000}, self.now)
+        config = replace(self.config(), audit_enabled=True)
+        engine, broker = self.engine(config)
+        engine.tick(self.now)
+        position = engine._active_positions()[code]
+        submissions_before_capture = len(broker.submissions)
+
+        engine._confirm_exit(position, 10_000, "TEST_CAPTURE", shadow=True)
+        exit_at = engine.state["positions"][code]["exit_at"]
+        engine._cleanup_terminal()
+        observed_at = kst_now() + timedelta(seconds=1)
+        self.write_market([code], {code: 10_100}, observed_at)
+        engine._update_post_exit_audit(observed_at)
+
+        archived = engine.state["history"][-1]
+        capture = archived["post_exit_audit"]["observation_capture"]
+        self.assertEqual(capture["rows"], 1)
+        rows = load_verified_post_exit_rows(Path(capture["path"]))
+        self.assertEqual(rows[0]["code"], code)
+        self.assertEqual(rows[0]["exit_at"], exit_at)
+        self.assertEqual(rows[0]["observation"]["price"], "10100.0")
+        self.assertEqual(len(broker.submissions), submissions_before_capture)
 
 if __name__ == "__main__":
     unittest.main()

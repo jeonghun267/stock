@@ -2,7 +2,12 @@
 """전략 03 골짜기 급반등 신호 계약. 주문과 브로커 호출은 없다."""
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import sys
 from datetime import datetime, time
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 STRATEGY_NUMBER = "03"
@@ -12,12 +17,33 @@ SIGNAL_SCHEMA = "strategy_03_valley_rapid_rebound_signal_v1"
 SIGNAL_MODE = "SIGNAL_ONLY_ORDER_ZERO"
 OPEN_CRASH_LANE = "OPEN_CRASH"
 INTRADAY_CRASH_LANE = "INTRADAY_CRASH"
+EARLY_LOW_LANE = "EARLY_LOW"
 OPEN_CRASH_ALGORITHM = "S06_STAIRCASE_RETEST_V1"
-INTRADAY_CRASH_ALGORITHM = OPEN_CRASH_ALGORITHM
+INTRADAY_CRASH_ALGORITHM = "S03_INTRADAY_CRASH_REBOUND_V1"
+EARLY_LOW_ALGORITHM = "S03_EARLY_60S_REBOUND_V1"
 ALGORITHM = OPEN_CRASH_ALGORITHM
 OPEN_ARM_DROP_PCT = -4.0
 OPEN_HANDOFF_DROP_PCT = -8.0
+# ★[S03-EXPRESS 2026-08-06 친구님 지시 "-7% 이하로 해 / 배선해"] 급행 매수 경로 상수.
+#   깊은 급락(당일 고점 대비 -7%↓)에서 '매도 감속 + 매수 가속 + 매수 우위'(flow_accel)가
+#   나오면 눌림·2차반등을 기다리지 않고 즉시 산다 — 3번의 정체(급락 후 급반등 즉시 타기).
+#   근거: 8/6 닷새 캡처 전수 — 얕은 구간(-6~-8%)은 -0.90%, -8%↓ +0.74%, -10%↓ +1.67%.
+#   친구님이 -6(지시값)과 -8(실측값) 사이 -7 로 결정. 매수창은 09:02~09:20(레인 그대로),
+#   강제청산은 09:50 → 10:30(친구님 지시). 흘러내리는 날 대조(049080)는 급락속도 관문이 거른다.
+EXPRESS_DEPTH_PCT = -7.0        # 당일 고점 대비 이만큼 깊어야 급행 자격
+EXPRESS_FAST_WINDOW_SEC = 600.0  # 직전 10분 안에
+EXPRESS_FAST_DROP_PCT = -3.0     # -3% 이상 빠진 '빠른 낙하' 직후여야 함(흘러내림 배제)
+EXPRESS_NEAR_LOW_PCT = 1.5       # 저점 +1.5% 안에서만(멀어지면 이미 늦음)
 OPEN_MIN_REBOUND_PCT = 1.0
+# ★[2026-08-06 친구님 지시 "두번째 저점도 -5% 이하 아니니 / 셋 다 고쳐"] 1.5 -> 5.0.
+#   1.5 는 너무 얕았다 - 8/6 코스텍시스가 -2.008% 에서 신호가 났다.
+#   같은 날 '장중 고점'을 10분 창 최대값에서 당일 고점으로 바꿨으므로(낙폭이 실제대로
+#   깊게 잡힌다) 문턱을 함께 올려야 뜻이 맞는다. 두 변경은 짝이다.
+#   비교: 1번 레인(OPEN_CRASH)은 시가 대비 감시 -4.0% / 인계 -8.0%.
+#   되돌리기: backup\s03_fix_20260806\ 의 파일 복원(고점 변경과 같이 되돌릴 것).
+INTRADAY_MIN_DRAWDOWN_PCT = 5.0
+INTRADAY_MIN_REBOUND_PCT = 0.5
+INTRADAY_MAX_REBOUND_PCT = 1.0
 # ★[SPEED-GATE 2026-08-03 친구님 지시] 매수 허용 상한 2.0 -> 1.5.
 #   저점 +1.0~+1.5% 구간이 곧 감시창이다. 시간(60초) 대신 이 가격 구간 안에서
 #   저점 후 매수속도가 매도속도를 넘는지로 판단한다.
@@ -42,6 +68,130 @@ MIN_OBSERVE_SEC = 0.0
 MIN_PULLBACK_PCT = 0.4
 MIN_HIGHER_LOW_PCT = 0.3
 MIN_SECOND_REBOUND_PCT = 0.5
+EARLY_LOW_CAPTURE_START = time(9, 0, 0)
+EARLY_LOW_CAPTURE_END = time(9, 1, 0)
+EARLY_LOW_MIN_REBOUND_PCT = 1.0
+EARLY_LOW_MAX_REBOUND_PCT = 2.0
+
+# ★[EARLY-LOW-AUDIT 2026-08-12 친구님 승인 "영구 실전 연결"] 장초 레인 생산 감사.
+#   실전 활성화(S03_EARLY_LOW_LIVE=YES)는 이 감사 기록을 실제 생산 코드로 재생해
+#   통과한 뒤에만 허용한다(재생기: RUN\s03_early_low_prod_replay_v1.py).
+#   신호기(골짜기_급반등)와 매매엔진(strategy_03_rotation_engine_v1)이 각자의 파일에
+#   기록한다 — 두 프로세스가 한 파일을 쓰면 해시 사슬이 끊어진다.
+EARLY_LOW_AUDIT_SCHEMA = "s03_early_low_audit_v1"
+EARLY_LOW_AUDIT_DEFAULT_DIR = r"C:\stock_bot\data\audit\s03_early_low"
+
+
+def early_low_audit_dir() -> Path:
+    return Path(os.environ.get(
+        "S03_EARLY_LOW_AUDIT_DIR", EARLY_LOW_AUDIT_DEFAULT_DIR))
+
+
+def production_file_sha256(paths: Iterable[Path]) -> dict[str, str]:
+    """의사결정에 쓰인 생산 파일의 SHA-256. 읽기 실패는 값 대신 사유를 남긴다."""
+    output: dict[str, str] = {}
+    for path in paths:
+        path = Path(path)
+        try:
+            output[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            output[path.name] = f"UNREADABLE:{exc.__class__.__name__}"
+    return output
+
+
+class EarlyLowAuditChain:
+    """append 전용 JSONL + 해시 사슬. 검증은 verify_file 로 한다.
+
+    사슬 규칙: record_hash = sha256(정규화 JSON(레코드 - record_hash)).
+    정규화 = sort_keys + ensure_ascii + 공백 없는 구분자. prev_hash 는 직전
+    레코드의 record_hash(첫 레코드는 "GENESIS"). 프로세스 재시작 시 기존 파일의
+    마지막 정상 레코드에 이어붙인다 — 중간에 손상 줄이 있으면 그대로 남겨
+    verify_file 이 잡아내게 한다(몰래 잇지 않는다).
+    """
+
+    def __init__(self, stream: str, day: str, *, directory: Path | None = None) -> None:
+        directory = Path(directory) if directory else early_low_audit_dir()
+        self.path = directory / f"s03_early_low_{stream}_{day}.jsonl"
+        self.stream = stream
+        self.day = day
+        self._seq = 0
+        self._prev_hash = "GENESIS"
+        try:
+            if self.path.exists():
+                for line in self.path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        self._seq = int(record["seq"])
+                        self._prev_hash = str(record["record_hash"])
+                    except (ValueError, KeyError, TypeError):
+                        continue
+        except OSError:
+            pass
+
+    @staticmethod
+    def canonical(record: Mapping[str, Any]) -> bytes:
+        body = {k: v for k, v in record.items() if k != "record_hash"}
+        return json.dumps(
+            body, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")
+
+    def append(self, record: Mapping[str, Any]) -> dict[str, Any] | None:
+        """기록 실패는 신호·주문 흐름을 죽이지 않는다(stderr 보고 후 계속)."""
+        row = dict(record)
+        row["schema"] = EARLY_LOW_AUDIT_SCHEMA
+        row["stream"] = self.stream
+        row["trade_day"] = self.day
+        row["seq"] = self._seq + 1
+        row["prev_hash"] = self._prev_hash
+        row["record_hash"] = hashlib.sha256(self.canonical(row)).hexdigest()
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(row, ensure_ascii=True) + "\n")
+                handle.flush()
+        except OSError as exc:
+            print(
+                f"S03_EARLY_LOW_AUDIT_WRITE_FAILED path={self.path} error={exc}",
+                file=sys.stderr, flush=True,
+            )
+            return None
+        self._seq = row["seq"]
+        self._prev_hash = row["record_hash"]
+        return row
+
+    @staticmethod
+    def verify_file(path: Path) -> tuple[bool, str, list[dict[str, Any]]]:
+        """(정상여부, 사유, 레코드들). 줄 손상·순번 단절·해시 불일치 전부 실패."""
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            return False, f"UNREADABLE:{exc.__class__.__name__}", []
+        records: list[dict[str, Any]] = []
+        prev_hash = "GENESIS"
+        for index, line in enumerate(lines, start=1):
+            line = line.strip()
+            if not line:
+                return False, f"BLANK_LINE:{index}", records
+            try:
+                record = json.loads(line)
+            except ValueError:
+                return False, f"CORRUPT_LINE:{index}", records
+            if not isinstance(record, dict):
+                return False, f"NOT_OBJECT:{index}", records
+            expected = hashlib.sha256(
+                EarlyLowAuditChain.canonical(record)).hexdigest()
+            if str(record.get("record_hash")) != expected:
+                return False, f"HASH_MISMATCH:seq={record.get('seq')}", records
+            if str(record.get("prev_hash")) != prev_hash:
+                return False, f"CHAIN_BROKEN:seq={record.get('seq')}", records
+            if int(record.get("seq") or 0) != len(records) + 1:
+                return False, f"SEQ_GAP:seq={record.get('seq')}", records
+            prev_hash = str(record["record_hash"])
+            records.append(record)
+        return True, "OK", records
 
 
 def _parse_local(value: Any) -> datetime | None:
@@ -72,17 +222,55 @@ def _signal_id(day: str, row: Mapping[str, Any]) -> str:
 def _lane_valid(raw: Mapping[str, Any], ts: datetime) -> bool:
     lane = str(raw.get("entry_lane") or OPEN_CRASH_LANE)
     algorithm = str(raw.get("algorithm") or "")
-    if lane not in {OPEN_CRASH_LANE, INTRADAY_CRASH_LANE}:
+    if lane not in {EARLY_LOW_LANE, OPEN_CRASH_LANE, INTRADAY_CRASH_LANE}:
         return False
-    if lane == OPEN_CRASH_LANE:
+    if lane == EARLY_LOW_LANE:
+        in_window = EARLY_LOW_CAPTURE_END < ts.time() < time(14, 30)
+    elif lane == OPEN_CRASH_LANE:
         in_window = time(9, 2) <= ts.time() < time(9, 20)
     else:
         in_window = time(9, 20) <= ts.time() < time(14, 30)
+    rebound = float(raw.get("rebound_pct") or 0)
+    if lane == EARLY_LOW_LANE:
+        anchor_low = float(raw.get("anchor_low") or 0)
+        anchor_ts = _parse_local(raw.get("anchor_low_ts"))
+        return (
+            algorithm == EARLY_LOW_ALGORITHM
+            and in_window
+            and anchor_low > 0
+            and anchor_ts is not None
+            and EARLY_LOW_CAPTURE_START
+            <= anchor_ts.time() <= EARLY_LOW_CAPTURE_END
+            and EARLY_LOW_MIN_REBOUND_PCT
+            <= rebound <= EARLY_LOW_MAX_REBOUND_PCT
+        )
+    if lane == INTRADAY_CRASH_LANE:
+        intraday_high = float(raw.get("intraday_high") or 0)
+        anchor_low = float(raw.get("anchor_low") or 0)
+        drawdown = float(raw.get("intraday_drawdown_pct") or 0)
+        return (
+            algorithm == INTRADAY_CRASH_ALGORITHM
+            and in_window
+            and intraday_high > anchor_low > 0
+            and drawdown <= -INTRADAY_MIN_DRAWDOWN_PCT
+            and INTRADAY_MIN_REBOUND_PCT
+            <= rebound <= INTRADAY_MAX_REBOUND_PCT
+        )
+
     open_price = float(raw.get("open_price") or 0)
     drop_from_open = float(raw.get("drop_from_open_pct") or 0)
-    rebound = float(raw.get("rebound_pct") or 0)
+    # ★[S03-EXPRESS 2026-08-06] 급행 신호는 제 잣대로 검산한다 — 4단계 잣대(눌림·2차반등·
+    #   반등 1.0~1.5%)를 들이대면 급행이 전부 버려진다(급행은 저점 +0~1.5% 어디서든 산다).
+    if str(raw.get("reason") or "").startswith("S03_EXPRESS"):
+        return (
+            algorithm == OPEN_CRASH_ALGORITHM
+            and in_window
+            and open_price > 0
+            and float(raw.get("express_depth_pct") or 0) <= EXPRESS_DEPTH_PCT
+            and 0.0 <= rebound <= EXPRESS_NEAR_LOW_PCT
+        )
     return (
-        algorithm == ALGORITHM
+        algorithm == OPEN_CRASH_ALGORITHM
         and in_window
         and open_price > 0
         and OPEN_HANDOFF_DROP_PCT < drop_from_open <= OPEN_ARM_DROP_PCT
@@ -92,12 +280,7 @@ def _lane_valid(raw: Mapping[str, Any], ts: datetime) -> bool:
         and float(raw.get("pullback_depth_pct") or 0) >= MIN_PULLBACK_PCT
         and float(raw.get("higher_low_pct") or 0) >= MIN_HIGHER_LOW_PCT
         and float(raw.get("second_rebound_pct") or 0) >= MIN_SECOND_REBOUND_PCT
-        # ★[SPEED-GATE 2026-08-03 친구님 지시] flow_flip·flow_accel 강제 조건 제거.
-        #   신호기에서 이 두 관문을 뺐는데 계약서가 그대로면 신호가 나가도 매매엔진이
-        #   전부 걸러낸다(테스트가 잡아낸 두 번째 구멍). 둘 다 저점 '전' 자료나 10초
-        #   구간 2개가 필요해 8/3 실전에서 99%가 빈 값이었고, 그 때문에 3번은 하루 종일
-        #   0건이었다. 값은 계속 기록된다 — 문턱만 없앤다.
-        #   판정 근거는 신호기가 이미 확인한 "저점 후 매수속도 > 매도속도"다.
+        # 저점 뒤 매수속도가 매도속도를 넘은 신호만 주문엔진으로 넘긴다.
         and float(raw.get("post_buy_rate") or 0)
         > float(raw.get("post_sell_rate") or 0)
     )

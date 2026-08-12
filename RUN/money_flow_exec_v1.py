@@ -20,9 +20,13 @@ import threading
 from pathlib import Path
 from datetime import datetime
 sys.path.insert(0, r"C:\stock_bot\RUN")
+import capital_config
+import position_budget
 
 LIVE      = os.environ.get("MF_EXEC_LIVE", "NO").strip().upper() == "YES"     # 기본 그림자
-CAP       = int(float(os.environ.get("MF_EXEC_CAP") or "100000"))            # 소액(기본 10만)
+COMMON_ORDER_QUANTITY = capital_config.get_order_quantity()
+COMMON_CAPITAL_KRW = capital_config.get_limit("daily_total_max")
+CAP       = COMMON_CAPITAL_KRW
 MAX_POS   = int(os.environ.get("MF_EXEC_MAXPOS", "3"))
 MIN_PRICE = int(float(os.environ.get("MF_MIN_PRICE") or os.environ.get("SAFEPLUS_MIN_PRICE") or "50000"))  # 돈흐름 전용 하한(MF_MIN_PRICE)·미설정시 SAFEPLUS_MIN_PRICE — 미만은 시도 안 함
 # [2026-07-07 친구님 "3% 컷 삭제·바닥사냥꾼 통합"] 고정%컷 삭제 → 구조붕괴(저점이탈) 손절로 대체. 재앙방지 failsafe만 넓게 유지.
@@ -104,11 +108,11 @@ MORNING_END  = os.environ.get("MF_MORNING_END", "1030")
 # [2026-07-08 친구님 4대지시+정정] ①동시보유 제한 폐지(기회 우선권·MAXPOS는 cmd에서 99) ②횟수 무제한 —
 #   **원금 200만 회전**: 지금 투입 중인 금액 ≤ 200만. 팔면 돈이 돌아와 그걸로 계속 재매수(로테이션·하루 누적 1000만도 가능).
 #   "보급 없음" = 원금 200만 밖에서 새 돈 추가투입 금지. ③09:00~09:03 관찰, 단 급행(날아가는 놈)은 1분 포착.
-DAILY_BUDGET = float(os.environ.get("MF_DAILY_BUDGET_KRW", "2000000"))   # 회전 원금 한도(원·동시 투입중 금액 상한)
+DAILY_BUDGET = float(COMMON_CAPITAL_KRW)   # 공통 회전 원금 한도
 # [7/11 친구님 "500만 재편"] 역할별 건당/풀 한도 — 깊은바닥 100만×4·그 외(눌림/바닥/MA전환/갑툭이) 20만×풀100만
-DEEP_CAP   = float(os.environ.get("MF_DEEP_CAP_KRW", "1000000"))    # 깊은바닥 건당(원)
-DEEP_POOL  = float(os.environ.get("MF_DEEP_POOL_KRW", "4000000"))   # 깊은바닥 동시투입 풀(원) = 100만×4종목
-OTHER_POOL = float(os.environ.get("MF_OTHER_POOL_KRW", "1000000"))  # 그 외 역할 동시투입 풀(원)
+DEEP_CAP   = float(COMMON_CAPITAL_KRW)
+DEEP_POOL  = float(COMMON_CAPITAL_KRW)
+OTHER_POOL = float(COMMON_CAPITAL_KRW)
 OPEN_OBS_END = os.environ.get("MF_OPEN_OBSERVE_END", "0903")             # 개장 관찰 종료(이전엔 급행만)
 FAST_MARGIN  = float(os.environ.get("MF_FAST_MARGIN_EOK", "10")) * 100.0 # 급행: 큰손 우위 최소(기본 10억=별표눈금·친구님 "아침 몇분에 30억 힘들다")
 FAST_CHE     = float(os.environ.get("MF_FAST_CHE", "120"))               # 급행: 실시간 체결강도 최소(지금 매수가 이기는 중)
@@ -1239,8 +1243,8 @@ def _entries(bc, pos, hm, today, mode):
         _pre_buy = False                             # [7/10 분할] 이번 매수가 선매수(1/3)인지
         # [7/8 친구님 정정→7/11 500만 재편] 두 풀(깊은바닥 400만·그 외 100만) 모두 찼을 때만 스캔 중단.
         #   한쪽만 찼으면 계속 순회(역할별 체크는 매수 직전에서). 팔리면 자동 회복 → 재매수.
-        if (_invested_deep + DEEP_CAP > DEEP_POOL) and ((_invested - _invested_deep) + CAP > OTHER_POOL):
-            _log(f"원금 한도 대기 — 깊은바닥 {_invested_deep:,.0f}/{DEEP_POOL:,.0f} · 그외 {(_invested-_invested_deep):,.0f}/{OTHER_POOL:,.0f} (매도로 회수되면 재개)")
+        if _invested >= DAILY_BUDGET:
+            _log(f"공통 원금 한도 대기 — {_invested:,.0f}/{DAILY_BUDGET:,.0f} (매도로 회수되면 재개)")
             break
         # [7/8 친구님] 09:00~09:03 관찰 — 단 '기관/외인 달고 바로 날아가는' 놈은 급행(1분 이내 포착).
         #   급행 3중확인: 큰손우위 ≥30억(확실) & 실시간 체결강도 ≥120(지금 매수가 이김) & 전일比 +1%↑(날아가는 중)
@@ -1479,16 +1483,18 @@ def _entries(bc, pos, hm, today, mode):
             if (isinstance(he, dict) and he.get("status") == "HOLDING"
                     and he.get("split_pre") and not he.get("topped_up")):
                 if _in_ok:
-                    _sp0 = float(he.get("buy_price", 0) or 0) * int(he.get("qty", 0) or 0)
-                    _q2 = int(max(0.0, DEEP_CAP - _sp0) / cur)   # [7/11 500만] 깊은바닥 본매수는 건당 100만까지 채움
-                    if _q2 >= 1 and _invested_deep + _q2 * cur <= DEEP_POOL:
+                    _q0 = int(he.get("qty", 0) or 0)
+                    _q2 = max(0, COMMON_ORDER_QUANTITY - _q0)
+                    if (_q2 >= 1
+                            and _invested + _q2 * cur <= DAILY_BUDGET
+                            and position_budget.can_open_krw(_q2 * cur)):
                         if _order(bc, code, _q2, "BUY", f"돈흐름 분할본매수 {_in_src}"):
                             if LIVE:
                                 try:
                                     import rt_registry as _RT2; _RT2.register(code, _q2, cur, "MFLOW")
                                 except Exception:
                                     pass
-                            _q0 = int(he.get("qty", 0) or 0); _b0 = float(he.get("buy_price", 0) or 0)
+                            _b0 = float(he.get("buy_price", 0) or 0)
                             he["buy_price"] = round((_b0 * _q0 + cur * _q2) / (_q0 + _q2), 2)
                             he["qty"] = _q0 + _q2; he["topped_up"] = True
                             he["grade"] = f"🕳깊은바닥·{_in_src}"
@@ -1631,23 +1637,15 @@ def _entries(bc, pos, hm, today, mode):
                     _log(f"⛔ {code} 던짐차단 [{smi}]"); continue
             except Exception:
                 pass
-        # [7/11 500만 재편] 역할별 건당/풀 한도 — 깊은바닥 100만(풀 400만=동시 4종목) / 그 외 20만(풀 100만)
-        _role_cap = DEEP_CAP if role == "깊은바닥" else CAP
-        if role == "깊은바닥":
-            if _invested_deep + _role_cap > DEEP_POOL:
-                continue   # 깊은바닥 풀 참(4종목) → 다음 후보(그 외 역할은 계속 가능)
-        else:
-            if (_invested - _invested_deep) + _role_cap > OTHER_POOL:
-                continue   # 그 외 풀 참 → 다음 후보
-        # [7/9 친구님 "최소 1주 규칙은 없어 — 20만 내에서·30만도 괜찮고"] 상한 내 수량. 1주가 상한 초과면
-        #   MF_MAX_SINGLE_KRW(기본 30만)까지만 1주 허용·그 위는 스킵(레인보우 1주 43만=상한 2배 사례 방지).
-        _cap_use = _role_cap * SPLIT_FRAC if _pre_buy else _role_cap   # [7/10 분할] 선매수는 1/3만
-        qty = int(_cap_use / cur)
-        if qty < 1:
-            if (not _pre_buy) and cur <= float(os.environ.get("MF_MAX_SINGLE_KRW", "300000")):
-                qty = 1
-            else:
-                continue    # 선매수는 1주 상한확대 없음(1/3 초과 방지) → 고가주는 본매수(돈유입)만
+        # 모든 전략과 같은 공통 목표수량을 쓴다. 선매수는 그 목표 안에서만 분할하고,
+        # 본매수를 포함한 최종 보유수량도 COMMON_ORDER_QUANTITY를 넘지 않는다.
+        qty = (
+            max(1, int(COMMON_ORDER_QUANTITY * SPLIT_FRAC))
+            if _pre_buy else COMMON_ORDER_QUANTITY
+        )
+        if (_invested + qty * cur > DAILY_BUDGET
+                or not position_budget.can_open_krw(qty * cur)):
+            continue
         _pm = _pmgap_map().get(code)   # [7/9] 장전 예상갭 참고(없으면 None·매수판단 무영향)
         if _order(bc, code, qty, "BUY", f"돈흐름진입 {r.get('grade')}"):
             if LIVE:

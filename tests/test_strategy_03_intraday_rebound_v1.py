@@ -12,6 +12,7 @@ if str(RUN) not in sys.path:
 
 from strategy_03_rotation_engine_v1 import build_config
 from strategy_03_signal_contract_v1 import (
+    INTRADAY_CRASH_ALGORITHM,
     INTRADAY_CRASH_LANE,
     SIGNAL_MODE,
     SIGNAL_SCHEMA,
@@ -36,21 +37,52 @@ class Strategy03UnifiedIntradayStaircaseTests(unittest.TestCase):
             open_price=10_500,
             buy_money_cum=buy,
             sell_money_cum=sell,
+            buy_volume_cum=buy,
+            sell_volume_cum=sell,
+            best_ask_px=price + 10,
+            best_bid_px=price,
+            best_ask_qty=100,
+            best_bid_qty=1000,
         )
 
     def points(self) -> list[MicroPoint]:
-        # ★[SPEED-GATE 2026-08-03] 새 규칙에 맞춘 시나리오(주 시험과 동일한 모양).
-        #   저점 9,700 → 1차반등 +1.03% → 눌림(더 높은 저점) → 2차반등 +0.53%
-        #   → 저점 +1.13% 에서 매수. 옛 매수가 9,855(+1.598%)는 좁아진 매수구간
-        #   (+1.0~+1.5%) 밖이라 더는 체결되지 않는다.
+        # 장중 두 번째 로직: 당일 고점 대비 -5.0% 이상 급락 후
+        # 저점이 2초 안정되고 60초 안에 +0.5~1.0% 첫 반등 + 매수 방법 확인에서 진입한다.
+        # ★[S03-LANE2 2026-08-06 친구님 지시 "2초 관찰·1분 안에 상승 없으면 매수 금지"]
+        #   매수 방법이 1레인 급행과 같아져(매도 감속+매수 가속+매수 우위, 10초 두 구간)
+        #   시나리오를 그 흐름이 실리게 다시 짰다: 매도 폭주(120/s) → 감속(86/s 매수 우위).
         return [
-            self.point(0, 10_050, 0, 0),
-            self.point(20, 9_900, 100, 500),
-            self.point(40, 9_700, 200, 1_500),
-            self.point(50, 9_800, 300, 1_520),
-            self.point(60, 9_758, 400, 1_540),
-            self.point(70, 9_810, 900, 1_600),
+            self.point(0, 10_000, 100, 100),
+            self.point(10, 9_700, 150, 1_300),    # 매도 폭주로 하락
+            self.point(20, 9_450, 200, 2_500),    # -5.5% 무장
+            self.point(28, 9_440, 250, 3_600),    # 신저점 (매도 여전히 강함)
+            self.point(34, 9_490, 1_500, 3_700),  # 감속+역매수 + 반등 +0.53% → 매수
         ]
+
+    def slow_points(self) -> list[MicroPoint]:
+        """당일 고점이 10분 창 밖으로 밀려난 뒤에 급락하는 흐름.
+
+        ★[2026-08-06 친구님 "장중 고점 잘못된 거야 / 당일 고점으로"]
+          고점 10,000 은 t=0 에 찍히고, 그 뒤 9,700 이 계속되다가 t=840 에 9,250 으로 빠진다.
+          t=840 시점에서 10분 창(600초)에 남는 것은 9,700 뿐이라
+            창 고점 기준 낙폭 = -4.64%  -> 5% 문턱을 못 넘어 종전 코드는 못 잡는다
+            당일 고점 기준 낙폭 = -7.50% -> 잡는다
+          즉 이 흐름이 잡히면 '당일 고점'이 실제로 쓰이고 있다는 증거다.
+          자료 공백 리셋을 피하려고 간격은 120초로 둔다(max_gap_sec=150).
+        """
+        rows = [self.point(0, 10_000, 100, 100)]
+        cum = 100
+        for i in range(1, 8):                     # t=120 .. 840
+            cum += 100
+            rows.append(self.point(120 * i, 9_700, cum, cum))
+        # ★[S03-LANE2 2026-08-06] 새 매수 방법(감속+역매수·10초 두 구간)이 실리도록
+        #   끝부분을 촘촘하게 다시 짰다: 매도 폭주(50/s) → 감속(8/s)·매수 폭발(86/s).
+        rows.append(self.point(946, 9_480, cum + 10, cum + 100))   # -5.2% 무장
+        rows.append(self.point(950, 9_400, cum + 20, cum + 300))   # 신저점
+        rows.append(self.point(958, 9_250, cum + 40, cum + 700))   # 신저점 (매도 폭주)
+        rows.append(self.point(962, 9_250, cum + 60, cum + 740))   # 저점 버팀
+        rows.append(self.point(968, 9_305, cum + 900, cum + 780))  # 감속+역매수 → 매수
+        return rows
 
     def fire(self) -> dict:
         monitor = RapidReboundMonitor()
@@ -60,19 +92,40 @@ class Strategy03UnifiedIntradayStaircaseTests(unittest.TestCase):
                 "043260", "TEST", point, self.profile, allow_signal=True)
         return row
 
-    def test_post_0920_uses_same_s06_staircase_detector(self) -> None:
-        """★[SPEED-GATE 2026-08-03] 장중 레인도 장초 레인과 같은 새 판정을 쓴다.
-
-        시간 관찰(60초)과 flow_flip·flow_accel 강제는 빠졌고, 저점 후
-        매수속도 > 매도속도 로 판정한다. 계단 재테스트 4단계는 그대로다.
-        """
+    def test_post_0920_uses_intraday_crash_detector(self) -> None:
         row = self.fire()
         self.assertEqual(row["action"], "BUY_READY")
         self.assertEqual(row["entry_lane"], INTRADAY_CRASH_LANE)
-        self.assertLess(row["observe_sec"], 60.0)
-        self.assertGreater(row["post_buy_rate"], row["post_sell_rate"])
-        self.assertGreaterEqual(row["rebound_pct"], 1.0)
-        self.assertLessEqual(row["rebound_pct"], 1.5)
+        self.assertEqual(row["algorithm"], INTRADAY_CRASH_ALGORITHM)
+        self.assertLessEqual(row["intraday_drawdown_pct"], -5.0)
+        self.assertGreaterEqual(row["rebound_pct"], 0.5)
+        self.assertLessEqual(row["rebound_pct"], 1.0)
+        self.assertIn("EXACT_SHORT_BUY_DOMINANCE", row["reason"])
+        self.assertFalse(row["long_flow_gates_enabled"])
+
+    # ★[2026-08-06] 회전엔진 선별기가 open_price 로 진입 가격대를 재검산한다.
+    #   이 값이 빠지면(strategy_03_rotation_engine_v1.py:141) 신호가 통째로 버려진다 —
+    #   S03 가 역대 한 주도 못 산 진짜 원인이었다. 다시 빠지면 여기서 잡는다.
+    def test_signal_carries_open_price(self) -> None:
+        row = self.fire()
+        self.assertEqual(row["action"], "BUY_READY")
+        self.assertIn("open_price", row)
+        self.assertGreater(float(row["open_price"] or 0), 0)
+
+    # ★[2026-08-06 친구님 "장중 고점 잘못된 거야 / 당일 고점으로"]
+    #   고점이 10분 창 밖으로 밀려나도 당일 고점으로 낙폭을 재야 한다.
+    #   창 고점 기준이면 -4.64% 라 5% 문턱을 못 넘어 신호가 안 난다.
+    def test_uses_day_high_not_rolling_window(self) -> None:
+        monitor = RapidReboundMonitor()
+        row = {}
+        for point in self.slow_points():
+            row, _ = monitor.process_point(
+                "043260", "TEST", point, self.profile, allow_signal=True)
+        self.assertEqual(row["action"], "BUY_READY",
+                         "당일 고점이 아니라 10분 창 고점을 쓰고 있다")
+        self.assertEqual(float(row["intraday_high"]), 10_000.0,
+                         "고점이 당일 고점(10,000)이 아니다")
+        self.assertLessEqual(row["intraday_drawdown_pct"], -7.0)
 
     def test_contract_accepts_unified_intraday_lane_only_inside_window(self) -> None:
         row = self.fire()
@@ -88,7 +141,7 @@ class Strategy03UnifiedIntradayStaircaseTests(unittest.TestCase):
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0]["entry_lane"], INTRADAY_CRASH_LANE)
         before_window = dict(row)
-        before_window["ts"] = before_window["ts"].replace("09:31", "09:19")
+        before_window["ts"] = before_window["ts"].replace("09:30", "09:19")
         payload["signals"] = [before_window]
         payload["updated_at"] = before_window["ts"]
         self.assertEqual(select_fresh_signals(
@@ -101,6 +154,9 @@ class Strategy03UnifiedIntradayStaircaseTests(unittest.TestCase):
         config = build_config()
         self.assertEqual(config.entry_start, time(9, 0))
         self.assertEqual(config.entry_end, time(14, 30))
+        # ★[2026-08-06 친구님 지시 "QTY 2주 원래대로 1주로 돌려줘"] 2 -> 1.
+        #   되돌린 뒤 이 단언이 하루 종일 실패한 채 있었다. 상시 실패 시험은
+        #   진짜 회귀를 가린다(오늘 실제로 그럴 뻔했다). 새 값으로 잠근다.
         self.assertEqual(config.quantity, 1)
         self.assertEqual(config.max_slots, 6)
         self.assertEqual(config.max_daily_codes, 6)

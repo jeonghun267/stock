@@ -73,6 +73,12 @@ WINNER_MARGIN = float(os.environ.get("MF_WINNER_MARGIN_EOK", "10")) * 100.0  # �
 LOOP_SEC  = float(os.environ.get("MF_LOOP_SEC", "5"))              # 등수 재계산·보드 저장 주기(초·TR 0)
 RUN_SEC   = float(os.environ.get("MF_RUN_SEC", "55"))             # 프로세스 수명(초)·이후 1분 태스크가 재기동
 
+
+def _eod_close_quiet_window(now=None):
+    """14:58~15:19에는 종가매수용 브로커 통로를 비워 둔다."""
+    now = now or datetime.now()
+    return (14, 58) <= (now.hour, now.minute) < (15, 20)
+
 # ── TR 페이스/캐시 ──
 MCAP_REFRESH_N = int(os.environ.get("MF_MCAP_REFRESH_N", "25"))    # 사이클당 시총 TR 신규조회 종목수(일1회면 됨)
 CACHE_MAX_AGE  = float(os.environ.get("MF_CACHE_MAX_AGE", "3600"))  # 초. 수급이 이보다 오래되면 grade 제외. [700/200] 정원200·TR예산 600/h이면 한바퀴 ~40분 → 900이면 대부분 탈락해서 3600으로(보드에 ts 표시됨)
@@ -492,6 +498,8 @@ def _supply_poller(bc, today):
     budget_trh = float(os.environ.get("MF_POLL_BUDGET_TRH", "600"))
     min_gap = 7200.0 / max(budget_trh, 60.0)                 # 종목폴 1회=2TR → 간격(초)=2*3600/예산
     while not _STOP:
+        if _eod_close_quiet_window():
+            return
         _t0 = time.time()
         try:
             codes = list(_UNIV[0])
@@ -1254,6 +1262,8 @@ def run():
         _hm = datetime.now().strftime("%H%M")
         if _hm < "0855" or _hm > "1535":
             print(f"장외({_hm}) → skip"); return
+        if _eod_close_quiet_window():
+            print(f"종가매수 우선시간({_hm}) → 돈맥 TR skip"); return
     from broker_client import BrokerClient, is_broker_alive
     if not is_broker_alive():
         print("broker dead → skip"); return
@@ -1298,6 +1308,9 @@ def run():
     deadline = time.monotonic() + RUN_SEC
     n = 0
     while True:
+        if (os.environ.get("MF_BOARD_FORCE", "").strip().upper() != "YES"
+                and _eod_close_quiet_window()):
+            break
         try:
             snap = json.loads(SNAP.read_text(encoding="utf-8-sig")).get("codes", {})
         except Exception:

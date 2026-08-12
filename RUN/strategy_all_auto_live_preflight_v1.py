@@ -18,6 +18,7 @@ from preflight_context_selftest_v1 import (
     SelftestFailure,
     validate_audit as validate_context_selftest,
 )
+from ma3_common_v1 import load_payload, ma3_rows, request_missing_history
 from strategy_03_auto_live_preflight_v1 import (
     OLD_TASKS,
     PreflightFailure,
@@ -45,6 +46,17 @@ VALLEY_OFF = CONFIG / "valley_off.flag"
 MANUAL_BLOCK = CONFIG / "manual_buy_block.flag"
 OLD_LEDGER = DATA / "valley_hunter_live_ledger.json"
 SHARED_SLOTS = DATA / "shared_slots.json"
+HIGH_RANGE = DATA / "common_high_range_top30.json"
+
+BROKER_RETRYABLE_PREFIXES = (
+    "BROKER_CONNECT:",
+    "BROKER_HOLDINGS:",
+    "BROKER_OPEN_ORDERS:",
+)
+BROKER_SNAPSHOT_MAX_ATTEMPTS = 3
+BROKER_SNAPSHOT_RETRY_DELAY_SEC = 0.5
+AUTO_RECOVERY_END = time(9, 5)
+AUTO_RECOVERY_DELAY_SEC = 1.0
 
 STRATEGIES = {
     "S01": {
@@ -80,6 +92,85 @@ REQUIRED_SOURCES = (
     "moneyflow_watch",
     "high_range_top30",
 )
+
+
+def _broker_snapshot_with_retry(
+    *,
+    deadline: datetime,
+    snapshot_reader=_broker_snapshot,
+    max_attempts: int = BROKER_SNAPSHOT_MAX_ATTEMPTS,
+    retry_delay_sec: float = BROKER_SNAPSHOT_RETRY_DELAY_SEC,
+) -> tuple[dict[str, Any], int, list[str]]:
+    """Retry only transient broker reads; all other failures remain closed."""
+    attempts = 0
+    errors: list[str] = []
+    while attempts < max(1, int(max_attempts)):
+        attempts += 1
+        try:
+            return snapshot_reader(), attempts, errors
+        except PreflightFailure as exc:
+            message = str(exc)
+            errors.append(message)
+            retryable = message.startswith(BROKER_RETRYABLE_PREFIXES)
+            if (
+                not retryable
+                or attempts >= max_attempts
+                or datetime.now() > deadline
+            ):
+                raise
+            time_module.sleep(max(0.0, retry_delay_sec))
+    raise PreflightFailure("BROKER_SNAPSHOT_RETRY_EXHAUSTED")
+
+
+def _preload_s01_ma3(
+    now: datetime,
+    *,
+    candidate_path: Path = HIGH_RANGE,
+    payload_loader=load_payload,
+    row_reader=ma3_rows,
+    requester=request_missing_history,
+) -> dict[str, Any]:
+    """Check S01 high-range MA3 locally and queue missing history early."""
+    source = _read_json(candidate_path)
+    if str(source.get("for_date") or "") != now.strftime("%Y%m%d"):
+        return {
+            "status": "SKIPPED_DATE_MISMATCH",
+            "candidate_count": 0,
+            "ready_count": 0,
+            "missing_count": 0,
+            "requested_count": 0,
+        }
+    codes: list[str] = []
+    for row in source.get("candidates") or []:
+        code = str((row or {}).get("code") or "").strip().zfill(6)
+        if len(code) == 6 and code.isdigit() and code not in codes:
+            codes.append(code)
+    payload = payload_loader()
+    ready: list[str] = []
+    missing: list[str] = []
+    requested: list[str] = []
+    request_errors: list[str] = []
+    for code in codes:
+        try:
+            if row_reader(code, payload) is not None:
+                ready.append(code)
+                continue
+            missing.append(code)
+            if requester(code, "S01_PREFLIGHT_HIGH_RANGE"):
+                requested.append(code)
+        except Exception as exc:
+            missing.append(code)
+            request_errors.append(f"{code}:{type(exc).__name__}:{exc}")
+    return {
+        "status": "READY" if not missing else "BACKFILL_REQUESTED",
+        "candidate_count": len(codes),
+        "ready_count": len(ready),
+        "missing_count": len(missing),
+        "requested_count": len(requested),
+        "missing_codes": missing,
+        "requested_codes": requested,
+        "request_errors": request_errors,
+    }
 
 
 def _strategy_state(path: Path) -> dict[str, Any]:
@@ -325,7 +416,12 @@ def _write_audit_preserving_approved_pass(
     return True
 
 
-def run_preflight(*, activate: bool, allow_opening_recovery: bool = False) -> dict[str, Any]:
+def run_preflight(
+    *,
+    activate: bool,
+    allow_opening_recovery: bool = False,
+    persist_audit: bool = True,
+) -> dict[str, Any]:
     started = datetime.now()
     result: dict[str, Any] = {
         "schema": "strategy_all_auto_live_preflight_v1",
@@ -339,13 +435,28 @@ def run_preflight(*, activate: bool, allow_opening_recovery: bool = False) -> di
         "activated_strategies": [],
     }
     try:
+        deadline_time = (
+            time(9, 19, 30) if allow_opening_recovery else time(9, 0, 15)
+        )
+        deadline = datetime.combine(started.date(), deadline_time)
+        # Local-only preparation: this cannot place orders or open a broker TR.
+        # A missing MA3 remains an entry block until the common worker fills it.
+        try:
+            result["s01_ma3_preload"] = _preload_s01_ma3(started)
+        except Exception as exc:
+            result["s01_ma3_preload"] = {
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}:{exc}",
+            }
         # 브로커 조회를 맨 앞에서 한다(2026-07-28 사고).
         # 태스크 점검(PowerShell 폴백)·시장데이터 수집을 거친 뒤에 부르면
         # 같은 프로세스에서 잔고 조회가 12s 타임아웃되고 재연결로도 못 살린다.
-        broker_snapshot = _broker_snapshot()
+        broker_snapshot, broker_attempts, broker_errors = (
+            _broker_snapshot_with_retry(deadline=deadline)
+        )
+        result["broker_snapshot_attempts"] = broker_attempts
+        result["broker_snapshot_retry_errors"] = broker_errors
         result["local_state"] = _validate_local_state(started)
-        deadline_time = time(9, 19, 30) if allow_opening_recovery else time(9, 0, 15)
-        deadline = datetime.combine(started.date(), deadline_time)
         market: dict[str, Any] | None = None
         last_error = ""
         while datetime.now() <= deadline:
@@ -377,7 +488,50 @@ def run_preflight(*, activate: bool, allow_opening_recovery: bool = False) -> di
             }
             for strategy, paths in STRATEGIES.items()
         }
-        _write_audit_preserving_approved_pass(result)
+        if persist_audit:
+            _write_audit_preserving_approved_pass(result)
+    return result
+
+
+def _auto_recovery_retryable(result: Mapping[str, Any]) -> bool:
+    reason = str(result.get("reason") or "")
+    return reason.startswith((
+        "PreflightFailure:BROKER_CONNECT:",
+        "PreflightFailure:BROKER_HOLDINGS:",
+        "PreflightFailure:BROKER_OPEN_ORDERS:",
+        "PreflightFailure:MARKET_DATA_DEADLINE:",
+        "PreflightFailure:PREFLIGHT_CONTEXT_SELFTEST:",
+    ))
+
+
+def run_preflight_with_auto_recovery(*, activate: bool) -> dict[str, Any]:
+    """Keep transient opening failures in WAIT, retrying safely through 09:05."""
+    started = datetime.now()
+    cutoff = datetime.combine(started.date(), AUTO_RECOVERY_END)
+    reasons: list[str] = []
+    attempt = 0
+    while True:
+        attempt += 1
+        result = run_preflight(
+            activate=activate,
+            allow_opening_recovery=attempt > 1,
+            persist_audit=False,
+        )
+        reasons.append(str(result.get("reason") or "UNKNOWN"))
+        if (
+            result.get("passed") is True
+            or not _auto_recovery_retryable(result)
+            or datetime.now() >= cutoff
+        ):
+            break
+        time_module.sleep(AUTO_RECOVERY_DELAY_SEC)
+    result["auto_recovery"] = {
+        "attempts": attempt,
+        "cutoff": cutoff.isoformat(timespec="seconds"),
+        "reasons": reasons,
+        "final_state": "PASS" if result.get("passed") else "BLOCKED",
+    }
+    _write_audit_preserving_approved_pass(result)
     return result
 
 
@@ -392,10 +546,13 @@ def main() -> int:
         help="Explicit one-run recovery path; keep fail-closed after 09:19:30.",
     )
     args = parser.parse_args()
-    result = run_preflight(
-        activate=args.activate,
-        allow_opening_recovery=args.allow_opening_recovery,
-    )
+    if args.activate and not args.allow_opening_recovery:
+        result = run_preflight_with_auto_recovery(activate=True)
+    else:
+        result = run_preflight(
+            activate=args.activate,
+            allow_opening_recovery=args.allow_opening_recovery,
+        )
     print(json.dumps(result, ensure_ascii=False), flush=True)
     return 0 if result.get("passed") else 2
 

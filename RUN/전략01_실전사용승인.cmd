@@ -15,7 +15,7 @@ if not "%S01_CONFIRM%"=="실전승인" (
   exit /b 1
 )
 if exist C:\stock_bot\config\strategy_01_off.flag move /Y C:\stock_bot\config\strategy_01_off.flag C:\stock_bot\config\strategy_01_off.flag.disabled >nul
->C:\stock_bot\config\strategy_01_live_approved.flag echo APPROVED_BY_OWNER
+powershell.exe -NoProfile -Command "$stamp=Get-Date -Format 'yyyyMMdd HH:mm:ss'; Set-Content -LiteralPath 'C:\stock_bot\config\strategy_01_live_approved.flag' -Value ('APPROVED_BY_OWNER '+$stamp) -Encoding Ascii"
 echo 관리자 권한으로 기존 캡틴2 예약을 끄고 새전략 예약을 확정합니다.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File C:\stock_bot\RUN\install_strategy01_tasks.ps1'"
 if not %errorlevel%==0 (

@@ -64,14 +64,21 @@ def read_json(path: Path, default: Any) -> Any:
         return default
 
 
-def write_json_atomic(path: Path, payload: Any) -> None:
+def write_json_atomic(path: Path, payload: Any) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    tmp.replace(path)
+    for attempt in range(6):
+        try:
+            tmp.replace(path)
+            return True
+        except PermissionError:
+            if attempt == 5:
+                return False
+            time.sleep(0.2)
 
 
 def output_path(day: str) -> Path:
@@ -246,6 +253,7 @@ def build_observation(
         structure_broken=bool(structure_low > 0 and price < structure_low),
         money_accelerating=bool(speed10 > 0 and speed5 >= speed10),
         recent_buy_money_rising=bool(rate10 and rate30 and rate10[0] >= rate30[0]),
+        common_peak_flow_ready=bool(rate10),
     )
     return observation, quality
 
@@ -390,7 +398,8 @@ def run() -> None:
         changed = register_new_positions(states, day)
         changed = evaluate_once(states, day, engine, windows) or changed
         if changed:
-            write_json_atomic(STATE_PATH, serialize(states, day))
+            if not write_json_atomic(STATE_PATH, serialize(states, day)):
+                print(f"STATE_SAVE_LOCKED_CONTINUING path={STATE_PATH}", file=sys.stderr, flush=True)
         time.sleep(LOOP_SEC)
 
 

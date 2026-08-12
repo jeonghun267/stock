@@ -10,6 +10,7 @@ env: SAFEPLUS_GLOBAL_MAX_POS(기본10) · SAFEPLUS_GLOBAL_BUDGET(기본YES·NO�
 import os, json, time
 from pathlib import Path
 from datetime import datetime, timedelta
+import capital_config
 
 _D = Path(r"C:\stock_bot\DATA")
 # 전략별 포지션 파일(live 필드 있음). rt_open은 중복이라 제외.
@@ -17,6 +18,11 @@ _FILES = [_D / "new_pb_positions.json", _D / "brk_positions.json", _D / "deepv_p
           _D / "mbb_positions.json", _D / "eod_gap_positions.json"]
 _PICKUP = _D / "eod_pickup" / "rt_eod_pickup_positions.json"   # nested {date:{code:rec}} · live daemon
 _RT_OPEN = _D / "rt_open_positions.json"   # [2026-06-30 친구님] 전 전략 통합 live 레지스트리(돌파/골든 포함·reconcile로 계좌동기) — 합집합 카운트
+_MODERN_STATES = [
+    _D / "strategy_01_rotation_state_v2.json",
+    _D / "strategy_02_rotation_state_v1.json",
+    _D / "strategy_03_rotation_state_v1.json",
+]
 
 
 def global_max():
@@ -33,10 +39,7 @@ def budget_on():
 def budget_krw():
     """[2026-06-30 친구님 '200만 한도 안에서만 운영'] 전 전략 합산 보유원가 상한(원).
     0 = 비활성(개수 상한만). 예: 2000000 = 보유원가 합계 200만 넘으면 신규매수 차단."""
-    try:
-        return float(os.environ.get("SAFEPLUS_GLOBAL_BUDGET_KRW", "0") or 0)
-    except ValueError:
-        return 0.0
+    return float(capital_config.get_limit("daily_total_max"))
 
 
 def daily_max():
@@ -106,6 +109,22 @@ def _open(rec, assume_live=False):
     return True if assume_live else bool(rec.get("live", False))
 
 
+def _modern_positions():
+    """Yield real active positions from the three current rotation engines."""
+    for state_path in _MODERN_STATES:
+        state = _load(state_path)
+        if not isinstance(state, dict):
+            continue
+        for code, rec in (state.get("positions") or {}).items():
+            if not isinstance(rec, dict) or not rec.get("real"):
+                continue
+            if str(rec.get("phase") or "") not in {
+                "BUY_PENDING", "HOLD", "SELL_PENDING", "RECOVERY_BLOCKED"
+            }:
+                continue
+            yield _z(code), rec
+
+
 def _scan():
     """(보유코드 집합, degraded) — degraded=존재하지만 못읽은 파일이 있어 카운트 불완전."""
     codes = set(); degraded = False
@@ -140,6 +159,8 @@ def _scan():
                 if str(rec.get("route", "")) == "LOWBUY":   # ★저점매수 제외(위 _open 주석)
                     continue
                 codes.add(_z(code))
+    for code, _rec in _modern_positions():
+        codes.add(code)
     return codes, degraded
 
 
@@ -187,7 +208,23 @@ def total_open_krw():
                 if str(rec.get("route", "")) == "LOWBUY":   # ★저점매수 제외(위 _open 주석)
                     continue
                 _put(code, _rec_krw(rec))
+    for code, rec in _modern_positions():
+        _put(code, _rec_krw(rec))
     return sum(m.values())
+
+
+def can_open_krw(required_krw):
+    """Common pre-buy capital check used by every live entry path."""
+    if not budget_on():
+        return True
+    try:
+        required = float(required_krw)
+    except (TypeError, ValueError):
+        return False
+    if required <= 0:
+        return False
+    cap = budget_krw()
+    return remaining_intraday() > 0 and total_open_krw() + required <= cap
 
 
 def remaining():

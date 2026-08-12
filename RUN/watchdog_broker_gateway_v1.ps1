@@ -27,24 +27,39 @@ $LOG_FILE      = Join-Path $LOG_DIR ("watchdog_broker_{0}.log" -f (Get-Date -For
 $PY            = "C:\Python310-32\python.exe"
 
 $HB_STALE_SEC       = 30   # heartbeat stale threshold (broker 5s x 6)
-$CHECK_INTERVAL_SEC = 60   # 1min cycle
-$MAX_RESTARTS_DAY   = 15   # [2026-07-07] 5->15: opt10080 수집기 등 연속TR수집기 6개 OFF로 부하감소·프리징 빈도↓ 기대. 5는 오후에 소진돼 죽은채 방치됨. 여전히 무한루프 방지.
+$CHECK_INTERVAL_SEC = 60   # 1min cycle (off-hours)
+
+# [FAST-CYCLE 2026-08-04] 8/3 10:41 the broker was stopped by an IPC command and the
+# price feed went blank for 27s. The watchdog polls every 60s, so in the worst case the
+# engines trade blind for a full minute (stop-loss and trailing included).
+# During market hours we poll 4x faster. IMPORTANT: only the heartbeat/PID check speeds
+# up. Is-Broker-Frozen stays on a 60s gap because it lists IPC\requests, which is a hot
+# path during trading - scanning it 4x more often could slow the broker's own IPC.
+$CHECK_INTERVAL_MARKET_SEC = 15   # intraday cycle
+$MARKET_WATCH_START_HOUR   = 8    # from 08:00
+$MARKET_WATCH_END_HOUR     = 15   # until 15:40
+$MARKET_WATCH_END_MINUTE   = 40
+$FROZEN_CHECK_MIN_GAP_SEC  = 60   # frozen scan keeps the original 60s spacing
+$MAX_RESTARTS_DAY   = 15   # [2026-07-07] 5->15: six continuous-TR collectors incl. opt10080 turned OFF, so lower load and fewer freezes expected. 5 ran out in the afternoon and left the broker dead. Still guards an infinite loop.
 $LOGIN_WAIT_SEC     = 60   # LOGIN OK wait after restart
 
-# [FROZEN-DETECT 2026-07-02] TR루프만 정지·하트비트 생존 모드 감지 (13:06 2차 프리징 재발방지)
-# 정상: 요청파일은 수초내 소비됨. 프리징: last_request_ts 정지 + requests에 미처리 파일 방치.
-# 두 조건 동시 성립시에만 발동 — 과부하(처리는 계속됨)시 last_request_ts 갱신되므로 오탐 없음.
+# [FROZEN-DETECT 2026-07-02] Detect "TR loop stopped but heartbeat still alive" (13:06 second freeze).
+# Normal: request files are consumed within seconds. Frozen: last_request_ts stalls AND unprocessed
+# files pile up under requests. Both must hold at once - under mere overload processing continues so
+# last_request_ts keeps advancing, hence no false positive.
 $REQ_DIR            = "$BASE\IPC\requests"
-$FROZEN_LASTREQ_SEC = 120  # 마지막 TR 처리 후 경과 (heartbeat.last_request_ts)
-$FROZEN_PENDING_SEC = 180  # 가장 오래된 미처리 요청파일 나이 (janitor가 300s에 삭제하므로 그 이하)
+$FROZEN_LASTREQ_SEC = 120  # elapsed since the last TR was processed (heartbeat.last_request_ts)
+$FROZEN_PENDING_SEC = 180  # age of the oldest unprocessed request file (below the janitor's 300s delete)
 
 if (-not (Test-Path $LOG_DIR)) {
     New-Item -ItemType Directory -Path $LOG_DIR -Force | Out-Null
 }
 
-# [2026-07-08 친구님 "토·일·국경일엔 아무것도 안 뜨게"] 휴장일 게이트 — 주말/공휴일엔 브로커를 아예 안 켬.
-#   브로커가 없으면 전 엔진이 "브로커 없음 → 건너뜀"으로 조용히 잠듦(키움 로그인 창도 안 뜸).
-#   공휴일 목록: config\holidays_kr.txt (한 줄에 YYYYMMDD·# 주석 가능·KRX 임시휴장시 한 줄 추가).
+# [2026-07-08 owner: "nothing should pop up on Sat/Sun/national holidays"] Market-closed gate -
+#   on weekends and holidays the broker is not started at all.
+#   With no broker every engine quietly skips ("no broker -> skip"); no Kiwoom login window either.
+#   Holiday list: config\holidays_kr.txt (one YYYYMMDD per line, # comments allowed,
+#   add one line for an ad-hoc KRX closure).
 $MKT_TODAY = Get-Date
 $MKT_HOLIDAY = $false
 try {
@@ -58,9 +73,9 @@ try {
     }
 } catch {}
 if ($MKT_TODAY.DayOfWeek -eq "Saturday" -or $MKT_TODAY.DayOfWeek -eq "Sunday" -or $MKT_HOLIDAY) {
-    $why = if ($MKT_HOLIDAY) { "공휴일(holidays_kr.txt)" } else { [string]$MKT_TODAY.DayOfWeek }
+    $why = if ($MKT_HOLIDAY) { "holiday(holidays_kr.txt)" } else { [string]$MKT_TODAY.DayOfWeek }
     $ts0 = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "[$ts0] MARKET-CLOSED: $why - 워치독/브로커 기동 안 함(전 시스템 휴식)" | Add-Content $LOG_FILE
+    "[$ts0] MARKET-CLOSED: $why - watchdog/broker not started (whole system resting)" | Add-Content $LOG_FILE
     exit 0
 }
 
@@ -88,15 +103,15 @@ function Get-Broker-Pid-From-Heartbeat() {
     }
 }
 
-# [FROZEN-DETECT 2026-07-02] hb 신선+PID 생존이어도 TR루프 정지면 $true
+# [FROZEN-DETECT 2026-07-02] $true when the TR loop has stalled even though hb is fresh and the PID is alive
 function Is-Broker-Frozen() {
     try {
         $hb = Get-Content $HB_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
-        if (-not $hb.last_request_ts) { return $false }  # 기동직후 등 — 판정불가시 정상 취급
+        if (-not $hb.last_request_ts) { return $false }  # just after startup etc - treat "cannot decide" as normal
         $since_req = ((Get-Date) - [datetime]$hb.last_request_ts).TotalSeconds
         if ($since_req -lt $FROZEN_LASTREQ_SEC) { return $false }
         $pend = Get-ChildItem $REQ_DIR -Filter *.json -File -ErrorAction SilentlyContinue
-        if (-not $pend) { return $false }  # 대기 요청 없으면 한가한 것 (장외시간 등)
+        if (-not $pend) { return $false }  # no pending requests means it is simply idle (off-hours etc)
         $oldest = ($pend | Sort-Object LastWriteTime | Select-Object -First 1)
         $pend_age = ((Get-Date) - $oldest.LastWriteTime).TotalSeconds
         if ($pend_age -ge $FROZEN_PENDING_SEC) {
@@ -107,6 +122,17 @@ function Is-Broker-Frozen() {
     } catch {
         return $false
     }
+}
+
+# [FAST-CYCLE 2026-08-04] 15s during market hours, 60s otherwise.
+function Get-Check-Interval() {
+    $now = Get-Date
+    if ($now.Hour -lt $MARKET_WATCH_START_HOUR) { return $CHECK_INTERVAL_SEC }
+    if ($now.Hour -gt $MARKET_WATCH_END_HOUR)   { return $CHECK_INTERVAL_SEC }
+    if ($now.Hour -eq $MARKET_WATCH_END_HOUR -and $now.Minute -gt $MARKET_WATCH_END_MINUTE) {
+        return $CHECK_INTERVAL_SEC
+    }
+    return $CHECK_INTERVAL_MARKET_SEC
 }
 
 function Restart-Broker() {
@@ -124,7 +150,7 @@ function Restart-Broker() {
 
     # broker spawn
     try {
-        $env:REAL_MICRO = "ON"   # [REAL-MICRO 2026-06-24] 실시간 체결강도(228)/호가(121·125) 구독 강제 — setx 캐시 무관 보장
+        $env:REAL_MICRO = "ON"   # [REAL-MICRO 2026-06-24] force realtime che-str(228)/quote(121,125) subscription - independent of the setx cache
         $proc = Start-Process -FilePath $PY `
                               -ArgumentList "-X", "utf8", $BROKER_SCRIPT `
                               -WorkingDirectory $BASE `
@@ -159,17 +185,19 @@ function Restart-Broker() {
 $today_date    = Get-Date -Format "yyyy-MM-dd"
 $restart_count = 0
 $last_date     = $today_date
+$last_frozen_check = [datetime]::MinValue   # [FAST-CYCLE 2026-08-04]
 
 Write-Log "==============================================="
 Write-Log "watchdog_broker v1.0 START"
 Write-Log "  PY=$PY"
 Write-Log "  BROKER_SCRIPT=$BROKER_SCRIPT"
 Write-Log "  HB_FILE=$HB_FILE"
-Write-Log "  CHECK=${CHECK_INTERVAL_SEC}s HB_STALE=${HB_STALE_SEC}s MAX_RESTARTS=$MAX_RESTARTS_DAY"
+Write-Log "  CHECK=${CHECK_INTERVAL_SEC}s (market ${CHECK_INTERVAL_MARKET_SEC}s) HB_STALE=${HB_STALE_SEC}s MAX_RESTARTS=$MAX_RESTARTS_DAY"
 Write-Log "==============================================="
 
-# [STARTUP FROZEN-KILL 2026-07-03] 기동시 TR루프 프리징(heartbeat 신선하나 last_request_ts 정지) 브로커 즉시 정리.
-# 승격 워치독이 프리징 브로커를 kill → 아래 메인루프가 dead 감지해 재기동+재로그인. (장전/장중 프리징 즉시복구)
+# [STARTUP FROZEN-KILL 2026-07-03] At startup, immediately clear a broker whose TR loop is frozen
+# (heartbeat fresh but last_request_ts stalled). The elevated watchdog kills it, the main loop below
+# sees it dead and restarts + re-logs-in. Recovers a pre-market or intraday freeze at once.
 try {
     if (Test-Path $HB_FILE) {
         $hb0 = Get-Content $HB_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -215,8 +243,12 @@ while ($true) {
     }
 
     if ($hb_alive) {
-        # [FROZEN-DETECT 2026-07-02] 살아 보여도 TR루프 정지면 kill 후 아래 재기동 경로로 진입
-        if (Is-Broker-Frozen) {
+        # [FROZEN-DETECT 2026-07-02] looks alive but TR loop stalled -> kill, then fall through to the restart path below
+        # [FAST-CYCLE 2026-08-04] keep the frozen scan on its original 60s spacing -
+        # it lists IPC\requests and that folder is hot during trading hours.
+        $do_frozen_check = (((Get-Date) - $last_frozen_check).TotalSeconds -ge $FROZEN_CHECK_MIN_GAP_SEC)
+        if ($do_frozen_check) { $last_frozen_check = Get-Date }
+        if ($do_frozen_check -and (Is-Broker-Frozen)) {
             $frozen_pid = Get-Broker-Pid-From-Heartbeat
             Write-Log "frozen broker kill attempt: PID=$frozen_pid"
             try {
@@ -224,13 +256,13 @@ while ($true) {
                 Write-Log "  frozen broker PID=$frozen_pid killed"
             } catch {
                 Write-Log "  frozen broker kill failed: $_ - retry next cycle"
-                Start-Sleep -Seconds $CHECK_INTERVAL_SEC
+                Start-Sleep -Seconds (Get-Check-Interval)
                 continue
             }
             $hb_alive = $false
         } else {
             # broker alive - normal
-            Start-Sleep -Seconds $CHECK_INTERVAL_SEC
+            Start-Sleep -Seconds (Get-Check-Interval)
             continue
         }
     }
@@ -253,5 +285,5 @@ while ($true) {
         Write-Log "restart failed (count $restart_count/$MAX_RESTARTS_DAY) - retry next cycle"
     }
 
-    Start-Sleep -Seconds $CHECK_INTERVAL_SEC
+    Start-Sleep -Seconds (Get-Check-Interval)
 }

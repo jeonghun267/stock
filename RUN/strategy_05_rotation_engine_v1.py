@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import replace
 from datetime import datetime, time as day_time
 from pathlib import Path
 
@@ -34,6 +35,18 @@ class Strategy05Engine(Strategy02Engine):
     def _build_observation(self, position, point):
         observation = super()._build_observation(position, point)
         code = str(position["code"]).zfill(6)
+        # ★[RISING-HOLD 단일화 2026-08-05 친구님 승인 "ⓐ로 해"] 여기서 '일봉'
+        #   5/10/20선(_daily_ma_permit_legacy)이 참이면 daily_ma_permit ·
+        #   ma10_support · ma20_rising 세 개를 통째로 참으로 덮어썼다.
+        #   8/3 에 일봉→3분봉 전면 교체를 했는데 S05 만 이 경로로 빠져 있었다.
+        #   일봉 5일선은 장중에 안 움직이는 고정값이라, 일봉 정배열 종목을 잡으면
+        #   하루 종일 상승보유가 참이 되어 매도가 통째로 막힌다(8/3 에스피지 사고).
+        #   8/5 확인 — 그날 S05 종목 403870 은 일봉 10선·20선이 하락이라 이 경로가
+        #   참이 되지 않았다(정배열 1단계 False). 오늘 사고는 없었고 잠복 경로만 뺀다.
+        #   이제 상승보유 판정은 3분봉 하나(ma3_common_v1)로 통일된다.
+        #   ⚠️아래 s05 자체 규칙(_evaluate_exit 의 ma10_support and ma20_rising)은
+        #     S05 소유라 그대로 살아 있다.
+        #   되돌리기: backup\strategy_05_rotation_engine_v1_20260805_before_rising_hold_unify.py
         self._s05_last_observation[code] = observation
         self._s05_last_point[code] = dict(point)
         return observation

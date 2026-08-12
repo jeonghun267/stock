@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""장세 우선권 자동 판정기 (주문 0 · 깃발만).
+"""장세 관찰 기록기 (주문 0 · 전략 차단 없음).
 
 ★[2026-08-01 친구님 확정 원칙 "표시해놔 → 자동 판정해서 실행할 수 있게 해야지"]
   급상승하는 날  = 전략 1번이 우선권
@@ -17,15 +17,13 @@
   문턱 근거: 6개월(121거래일) 고저폭30 시가갭 중앙값 분포의 상위 10% 경계(p90=+3.33%).
     7/31 전종목 폭등일은 +11.31%(6개월 2위)라 확실히 걸린다.
 
-실행(우선권의 실체 — 기존 off깃발 방식·기존 코드 무수정):
-  급상승일       → 1번 매수 허용 (이 판정기가 만든 off깃발이 있으면 제거)
-  보통·급하락일  → config\\strategy_01_off.flag 생성 = 1번 매수 차단
-                   (공용 6슬롯을 3번이 쓰고, 6번은 독립 10슬롯으로 원래대로)
-  ★안전: 깃발 내용이 "REGIME_JUDGE"로 시작할 때만 지운다 — 사람이 만든 수동
-    깃발은 절대 건드리지 않는다. 판정 불가(자료 없음)면 아무것도 바꾸지 않되,
-    날짜 지난 내 깃발만 청소한다(어제 판정을 오늘로 끌고 가지 않음 = 1번 살림).
+실행:
+  모든 장세에서 전략 1~6은 각자 매수조건을 계속 평가한다. 이 프로그램은 장세를
+  기록만 하고 전략 off깃발을 만들지 않는다. 과거 이 프로그램이 만든
+  strategy_01_off.flag 는 제거하며, 사람이 만든 수동 깃발은 건드리지 않는다.
+  장세 위험 조절은 주문 공통부의 수량축소·극단장 안전관문이 담당한다.
 
-롤백: 태스크 REGIME_PRIORITY_JUDGE Disable + config\\strategy_01_off.flag 삭제.
+롤백: 과거 버전 복원 후 태스크 REGIME_PRIORITY_JUDGE 재실행.
 """
 import json
 import os
@@ -101,9 +99,9 @@ def main() -> int:
     if str(top.get("for_date") or "") != today:
         log(f"판정 불가 — 고저폭30 목록이 오늘 것이 아님 "
             f"(for_date={top.get('for_date')}) → 변경 없음(1번 현상 유지)")
-        if FLAG.exists() and flag_is_mine() and not flag_is_mine_today(today):
+        if FLAG.exists() and flag_is_mine():
             FLAG.unlink()
-            log("어제 판정 깃발 청소 — 1번 살림")
+            log("과거 장세판정 깃발 청소 — 전 전략 조건진입 유지")
         save_record({"date": today, "verdict": "UNKNOWN",
                      "reason": "TOP30_NOT_TODAY", "checked_at": now.isoformat()})
         return 0
@@ -133,9 +131,9 @@ def main() -> int:
     if len(gaps) < MIN_CODES:
         log(f"판정 불가 — 예상체결가 확보 {len(gaps)}종목(<{MIN_CODES}) "
             f"→ 변경 없음(1번 현상 유지)")
-        if FLAG.exists() and flag_is_mine() and not flag_is_mine_today(today):
+        if FLAG.exists() and flag_is_mine():
             FLAG.unlink()
-            log("어제 판정 깃발 청소 — 1번 살림")
+            log("과거 장세판정 깃발 청소 — 전 전략 조건진입 유지")
         save_record({"date": today, "verdict": "UNKNOWN",
                      "reason": f"ONLY_{len(gaps)}_CODES",
                      "checked_at": now.isoformat()})
@@ -148,27 +146,13 @@ def main() -> int:
     verdict = "SURGE" if surge else "NORMAL_OR_CRASH"
     log(f"판정: {verdict} — 갭 중앙값 {med:+.2f}% (문턱 {SURGE_GAP_MED}%·{len(gaps)}종목)")
 
-    action = "NONE"
-    if surge:
-        if FLAG.exists():
-            if flag_is_mine():
-                FLAG.unlink()
-                action = "S01_ON(깃발 제거)"
-            else:
-                action = "수동 깃발 존중 — 그대로 둠"
-        else:
-            action = "S01 이미 켜져 있음"
+    if FLAG.exists() and flag_is_mine():
+        FLAG.unlink()
+        action = "ALL_STRATEGIES_OPEN(REGIME_JUDGE 깃발 제거)"
+    elif FLAG.exists():
+        action = "수동 깃발 존중 — 장세 판정은 기록만"
     else:
-        if FLAG.exists():
-            action = "이미 꺼져 있음(깃발 유지)"
-        else:
-            FLAG.parent.mkdir(parents=True, exist_ok=True)
-            FLAG.write_text(
-                f"{MARKER} {today} gap_med={med:+.2f}% "
-                f"(보통·급하락일 — 6번·3번 우선권)\n",
-                encoding="utf-8",
-            )
-            action = "S01_OFF(깃발 생성)"
+        action = "ALL_STRATEGIES_OPEN(장세 기록만)"
     log(f"실행: {action}")
     save_record({"date": today, "verdict": verdict, "gap_med_pct": round(med, 2),
                  "codes": len(gaps), "threshold_pct": SURGE_GAP_MED,

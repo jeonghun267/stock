@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time
 from decimal import Decimal
 from enum import Enum
@@ -24,6 +24,7 @@ from strategy_common_foundation_v1 import (
     as_kst,
     normalize_code,
 )
+from hold_sell_audit_v1 import HoldSellAuditRecorder
 
 
 STATE_SCHEMA = "strategy_common_hold_sell_v1"
@@ -49,6 +50,7 @@ class StrategyId(str, Enum):
 class HoldSellAction(str, Enum):
     HOLD = "HOLD"
     WATCH = "WATCH"
+    PARTIAL_SELL = "PARTIAL_SELL"
     SELL = "SELL"
     EMERGENCY_SELL = "EMERGENCY_SELL"
 
@@ -125,6 +127,17 @@ class StrategyExitProfile:
     trail_needs_sell_pressure: bool = False
     # 트레일 판정 주기 덮어쓰기(초). None 이면 공용값(180초).
     trail_eval_interval_sec: Optional[int] = None
+    # One peak/flow state machine shared by every entry strategy.
+    common_peak_flow_exit_enabled: bool = True
+    # Optional longer confirmation for a weak peak-flow reversal while the
+    # strategy's MA10/MA20 support structure is still intact.
+    supported_weak_peak_confirm_sec: Optional[int] = None
+    supported_weak_peak_active_date: Optional[str] = None
+    supported_weak_peak_arm_return_pct: Optional[Decimal] = None
+    supported_weak_peak_drop_pct: Optional[Decimal] = None
+    supported_weak_peak_score: Optional[int] = None
+    # Legacy price-only trailing is off for standard strategies.
+    profit_trail_enabled: bool = False
 
     def stop_pct(self, buy_ratio_recent: Decimal) -> Decimal:
         if buy_ratio_recent > Decimal("0.50"):
@@ -162,6 +175,13 @@ def _profile(
     stop_ladder: Optional[tuple] = None,
     trail_needs_sell_pressure: bool = False,
     trail_eval_interval_sec: Optional[int] = None,
+    common_peak_flow_exit: bool = True,
+    supported_weak_peak_confirm_sec: Optional[int] = None,
+    supported_weak_peak_active_date: Optional[str] = None,
+    supported_weak_peak_arm_return_pct: Optional[str] = None,
+    supported_weak_peak_drop_pct: Optional[str] = None,
+    supported_weak_peak_score: Optional[int] = None,
+    profit_trail: bool = False,
 ) -> StrategyExitProfile:
     return StrategyExitProfile(
         strategy_id=strategy_id,
@@ -180,6 +200,19 @@ def _profile(
         stop_ladder=stop_ladder,
         trail_needs_sell_pressure=trail_needs_sell_pressure,
         trail_eval_interval_sec=trail_eval_interval_sec,
+        common_peak_flow_exit_enabled=common_peak_flow_exit,
+        supported_weak_peak_confirm_sec=supported_weak_peak_confirm_sec,
+        supported_weak_peak_active_date=supported_weak_peak_active_date,
+        supported_weak_peak_arm_return_pct=(
+            Decimal(supported_weak_peak_arm_return_pct)
+            if supported_weak_peak_arm_return_pct is not None else None
+        ),
+        supported_weak_peak_drop_pct=(
+            Decimal(supported_weak_peak_drop_pct)
+            if supported_weak_peak_drop_pct is not None else None
+        ),
+        supported_weak_peak_score=supported_weak_peak_score,
+        profit_trail_enabled=profit_trail,
     )
 
 
@@ -218,10 +251,53 @@ STRATEGY_PROFILES = {
     #   ⚠️하루 표본이다. S02·S05 는 되돌림이 절반이라 공용값을 그대로 두고,
     #     고저폭 30 으로 좁힌 기록이 3거래일 쌓이면 같은 방식으로 재서 판단한다.
     #   롤백: backup\strategy_common_hold_sell_v1_20260731_s01trail.py 복원
+    # ★[2026-08-03 저녁 친구님 지시 "조기추세 삭제해 / 상승보유는 트레일 앞으로"]
+    #   S01 에서 조기추세 판정(early)을 없애고, 상승보유를 트레일보다 앞에 둔다.
+    #   왜 — 조기추세는 09:20(진입창이 닫히는 시각)에 09:00~09:20 매수분 전체를
+    #     한꺼번에 판정대에 올리고, VWAP 이탈·매수비율<52% 중 하나만 걸리면
+    #     유예 없이 한 틱에 전량매도(래치)했다.
+    #   실전 증거: 7/31 09:20:04 씨젠 "EARLY_TREND_EXIT VWAP,FLOW" 실제 체결(mfe=0.000%).
+    #   재현(실제 매도엔진 호출·분당기록·밀림 -3.0% 매수·비용 0.35% 차감):
+    #       8/3  10종목  현행 +0.70%(5승5패)  ->  조기추세 삭제 +3.47%(8승2패)
+    #       7/31  3종목  현행 +0.96%          ->  조기추세 삭제 +2.27%
+    #     8/3 는 10건 중 8건이 이 사유였고 7건이 09:20~09:24 에 몰렸다.
+    #     최악은 로보티즈 — 09:20 +5.30% 로 잘렸고 그 종목은 13:10 +18.85% 까지 갔다.
+    #   ⚠️정직 고지: rider_before_trail 은 재현상 효과가 0 이었다(6가지 조합 전부
+    #     동일 결과). 상승보유가 성립하는 시점과 트레일이 자르는 시점이 어긋난다 —
+    #     트레일은 고점 대비 -3% 되돌린 뒤에 발동하고, 그때는 선 지지·매수세도
+    #     이미 꺾여 있어 상승보유가 참이 되지 않는다. 지시대로 배선만 해 두고,
+    #     실효는 실전 로그로 확인한다.
+    #   롤백: backup\strategy_common_hold_sell_v1_20260803_s01noearly.py 복원
+    # ★[STOP-FLOW-SPLIT 2026-08-04 친구님 지시] 1번만 수급에 따라 손절선을 가른다.
+    #   stop_pct() 의 갈래를 실제로 쓰는 첫 전략이다(종전엔 두 값이 같아 죽어 있었다).
+    #     매도세 우위(매수비율 <= 0.50) -> stop        -2.0%   빨리 자른다
+    #     매수 우위  (매수비율 >  0.50) -> strong_stop -3.0%   더 버틴다
+    #   왜 이 방향인가 — 8/4 S01 실거래가 근거다:
+    #     · 지엔씨 119850  보유 중 최저 -0.897% -> 당일 +22.42%
+    #       에스피지 058610 보유 중 최저 -1.059% -> 당일  +8.28%
+    #       => 1% 남짓 밀렸다가 크게 가는 종목이 있다. 손절을 조이면 이들을 잃는다.
+    #         (그래서 -1% 안은 같은 날 폐기했다. 다시 시도하지 말 것.)
+    #     · 기가비스 420770 -2.50% 손절 후 -5.68% 까지 더 빠짐
+    #       티엘비 356860  -2.09% 손절 후 -4.36% 까지 더 빠짐
+    #       => 진짜 무너지는 종목은 손절이 있어야 한다. 매도세 우위 -2% 가 그 자리다.
+    #   ⚠️조기청산의 진짜 원인은 손절이 아니라 트레일이었다(고점 대비 -3% 를 기다리다
+    #     지엔씨 5.38%p·에스피지 3.85%p 반납). 트레일은 8/4 에 껐다.
+    #   ⚠️1번에만 적용한다. 맞으면 그때 전 전략 공통으로 옮긴다(친구님 지시).
+    #   되돌리기: 두 값을 -2.0/-2.0 으로. 또는
+    #     backup/strategy_common_hold_sell_v1_20260804_before_s01_stop1pct.py 복원.
     StrategyId.S01_OPEN_SURGE: _profile(
         StrategyId.S01_OPEN_SURGE,
-        early=time(9, 20),          # 진입창 09:00~09:20 이 닫히는 시점
-        trail_steps=((Decimal("5"), Decimal("3")), (Decimal("10"), Decimal("5"))),
+        stop="-2.0",
+        strong_stop="-3.0",
+        early=None,                 # 조기추세 삭제(종전 time(9, 20))
+        rider_before_trail=True,    # 공통 규칙의 상승보유 우선 순서 유지
+        # S01 exits through peak-flow, flow reversal, risk, and time only.
+        profit_trail=False,
+        trail_needs_sell_pressure=True,
+        # S01 must not convert a new high into a moving sell line.  Keep only
+        # the fixed loss stop plus the common flow/MA/peak-flow exits.
+        stop_ladder=None,
+        trail_steps=None,
     ),
     StrategyId.S02_LOW_BUY_SELL_EXHAUSTION: _profile(
         StrategyId.S02_LOW_BUY_SELL_EXHAUSTION,
@@ -230,13 +306,23 @@ STRATEGY_PROFILES = {
         early=None,
         stop="-2.0",
         strong_stop="-2.0",
-        flow_reversal_exit=True,
         # ★[RIDER-ORDER 2026-08-03] 2번만 상승보유를 트레일 앞에 둔다(위 필드 주석 참조).
         rider_before_trail=True,
         # ★[TRAIL-FLOW 2026-08-03 친구님 지시] 트레일에 수급 방향 확인을 붙이고
         #   판정 주기를 180초 -> 50초로 조인다("3분이면 그 사이 끝없이 추락한다").
         trail_needs_sell_pressure=True,
         trail_eval_interval_sec=50,
+        # One-process owner canary.  The launcher injects the approved trading
+        # date from a consumed one-shot flag; no date means production off.
+        supported_weak_peak_confirm_sec=(
+            6 if os.environ.get("S02_PEAK_5_DROP_1P5_FLOW_3OF4_6S_DATE") else None
+        ),
+        supported_weak_peak_active_date=(
+            os.environ.get("S02_PEAK_5_DROP_1P5_FLOW_3OF4_6S_DATE") or None
+        ),
+        supported_weak_peak_arm_return_pct="5",
+        supported_weak_peak_drop_pct="1.5",
+        supported_weak_peak_score=3,
         # ★[STOP-LADDER 2026-08-03 철회] 손절선 끌어올리기는 넣었다가 지웠다.
         #   친구님 지적: "+2% 갔다가 본전만 찍어도 다 매도된다" — 장중 2% 오르내림은
         #   정상 호흡이라 승자를 본전에서 잘라낸다. 상승보유로 오래 들고 가자는
@@ -244,10 +330,14 @@ STRATEGY_PROFILES = {
     ),
     StrategyId.S04_PULLBACK: _profile(
         StrategyId.S04_PULLBACK,
+        stop="-2.0",
+        strong_stop="-2.0",
         early=time(10, 0),          # 진입창 10:00~ 시작
     ),
     StrategyId.S05_BASE_BREAKOUT: _profile(
         StrategyId.S05_BASE_BREAKOUT,
+        stop="-2.0",
+        strong_stop="-2.0",
         ma3=MA3Mode.SELL_OVERRIDE,
         early=None,          # 진입창 09:30~14:30 시작
     ),
@@ -266,6 +356,7 @@ STRATEGY_PROFILES = {
         stop="-2.5",
         exit_policy=ExitPolicy.VALLEY,
         peak_insure="-1.5",
+        profit_trail=True,
     ),
     # ★[2026-07-29 친구님 지시] S03 하드손절 -2.0% → -1.0%.
     #   "골짜기 급반등은 한번에 치솟아 오르고 짧은 시간에 끝난다.
@@ -277,14 +368,79 @@ STRATEGY_PROFILES = {
         stop="-1.0",
         force=time(9, 30),
         exit_policy=ExitPolicy.VALLEY_MORNING_CRASH,
+        profit_trail=True,
     ),
     StrategyId.VALLEY_BASE_BREAKOUT: _profile(
         StrategyId.VALLEY_BASE_BREAKOUT,
         stop="-1.5",
         exit_policy=ExitPolicy.VALLEY_BASE_BREAKOUT,
         target_profit="2.0",
+        profit_trail=True,
     ),
 }
+
+
+RUNTIME_PROFILE_SCHEMA = "strategy_exit_profile_runtime_v1"
+
+
+def strategy_profile_runtime_snapshot(strategy_id: StrategyId) -> dict[str, Any]:
+    """Return the runtime-only profile values required for exact replay."""
+    profile = STRATEGY_PROFILES[strategy_id]
+    return {
+        "schema": RUNTIME_PROFILE_SCHEMA,
+        "strategy_id": strategy_id.value,
+        "supported_weak_peak_confirm_sec": profile.supported_weak_peak_confirm_sec,
+        "supported_weak_peak_active_date": profile.supported_weak_peak_active_date,
+        "supported_weak_peak_arm_return_pct": (
+            str(profile.supported_weak_peak_arm_return_pct)
+            if profile.supported_weak_peak_arm_return_pct is not None else None
+        ),
+        "supported_weak_peak_drop_pct": (
+            str(profile.supported_weak_peak_drop_pct)
+            if profile.supported_weak_peak_drop_pct is not None else None
+        ),
+        "supported_weak_peak_score": profile.supported_weak_peak_score,
+    }
+
+
+def strategy_profiles_from_runtime_snapshot(
+    payload: Mapping[str, Any],
+) -> Mapping[StrategyId, StrategyExitProfile]:
+    """Rebuild the captured runtime profile without consulting environment."""
+    if str(payload.get("schema") or "") != RUNTIME_PROFILE_SCHEMA:
+        raise ContractError("unsupported strategy runtime profile schema")
+    strategy_id = StrategyId(str(payload.get("strategy_id") or ""))
+    profile = STRATEGY_PROFILES[strategy_id]
+
+    def optional_decimal(name: str) -> Optional[Decimal]:
+        value = payload.get(name)
+        return None if value is None else Decimal(str(value))
+
+    rebuilt = replace(
+        profile,
+        supported_weak_peak_confirm_sec=(
+            None
+            if payload.get("supported_weak_peak_confirm_sec") is None
+            else int(payload["supported_weak_peak_confirm_sec"])
+        ),
+        supported_weak_peak_active_date=(
+            None
+            if payload.get("supported_weak_peak_active_date") is None
+            else str(payload["supported_weak_peak_active_date"])
+        ),
+        supported_weak_peak_arm_return_pct=optional_decimal(
+            "supported_weak_peak_arm_return_pct"
+        ),
+        supported_weak_peak_drop_pct=optional_decimal(
+            "supported_weak_peak_drop_pct"
+        ),
+        supported_weak_peak_score=(
+            None
+            if payload.get("supported_weak_peak_score") is None
+            else int(payload["supported_weak_peak_score"])
+        ),
+    )
+    return {**STRATEGY_PROFILES, strategy_id: rebuilt}
 
 STANDARD_STRATEGIES = frozenset(set(StrategyId) - {
     StrategyId.VALLEY,
@@ -347,6 +503,47 @@ class HoldSellConfig:
     flow_reversal_volume_accel_mult: Decimal = Decimal("1.5")
     flow_reversal_max_che_str: Decimal = Decimal("95")
     flow_reversal_min_che_drop: Decimal = Decimal("5")
+    # Dormant until an exact production replay and explicit live enablement.
+    s02_afternoon_soft_loss_enabled: bool = (
+        os.environ.get("S02_AFTERNOON_SOFT_LOSS_EXIT", "NO").strip().upper()
+        == "YES"
+    )
+    s02_afternoon_soft_loss_start_at: time = time(12, 0)
+    s02_afternoon_soft_loss_pct: Decimal = Decimal("-1.0")
+    s02_afternoon_soft_loss_sell_money_mult: Decimal = Decimal("2.0")
+    s02_afternoon_soft_loss_confirm_sec: int = 3
+    # ★[PEAK-ARM 2026-08-07 친구님 합의 "마감 후 오늘: 꼭지무장 4.0 → 2.0 하나만"]
+    #   4% 는 4일 백테 31건 중 진입가+4% 에 먼저 닿은 게 2건(6.5%)뿐 = 사실상 꺼진 장치.
+    #   정책 E 실측: 중앙 -0.621% → +0.368% · 승률 29.0% → 54.8%.
+    #   8/7 090360(+2.375% 갔다가 -2.00% 하드손절)도 이 값이면 살았다.
+    #   되돌리기: Decimal("2") → Decimal("4") + sellhold_contract_v1.json 꼭지무장수익 함께.
+    common_peak_arm_return_pct: Decimal = Decimal("2")
+    common_peak_relaxed_return_pct: Decimal = Decimal("8")
+    common_peak_watch_drop_pct: Decimal = Decimal("0.8")
+    # ★[DEFENSE-DROP 2026-08-05 친구님 승인] 손실방어에도 '꺾인 깊이'를 요구한다.
+    #   종전 손실방어는 가격 조건이 return_pct < 0 하나뿐이라, 한 번도 안 오른 종목이
+    #   진입가 밑으로 조금만 내려가도 팔 자격이 생겼다(8/5 원익IPS: 되돌림 0.92%에
+    #   매도, 그 뒤 2시간 반 동안 매도가 아래로 한 번도 안 감).
+    #   1분봉 37일 실측: 정상 호흡 되돌림 중앙값 0.90~1.25%, 그 아래는 다시 신고점을
+    #   갱신한다. 분할검증(전반/후반)에서 1.0%가 두 기간 모두 방어 유리로 최대였고,
+    #   현행 0.0%는 부호가 뒤집혀 탈락했다. 발동 수는 9%만 줄어든다.
+    #   되돌리기: 이 값을 Decimal("0") 로 두면 종전과 100% 동일하다.
+    common_peak_defense_drop_pct: Decimal = Decimal("1.0")
+    common_peak_lock_hard_drop_pct: Decimal = Decimal("1.3")
+    common_peak_lock_confirm_sec: int = 2
+    common_defense_confirm_sec: int = 5
+    common_peak_full_drop_pct: Decimal = Decimal("2.2")
+    common_peak_sell_money_mult: Decimal = Decimal("1.3")
+    common_peak_sell_volume_mult: Decimal = Decimal("1.3")
+    common_peak_sell_volume_accel_mult: Decimal = Decimal("1.2")
+    common_peak_buy_fade_mult: Decimal = Decimal("0.8")
+    common_peak_che_drop: Decimal = Decimal("2")
+    common_peak_score: int = 2
+    common_peak_strict_score: int = 4
+    common_peak_runner_score: int = 2
+    common_peak_partial_confirm_sec: int = 2
+    common_peak_full_confirm_sec: int = 20
+    common_peak_recovery_confirm_sec: int = 6
     persistence_speed_fraction: Decimal = Decimal("0.50")
     dryup_fraction: Decimal = Decimal("0.20")
     dryup_confirm_sec: int = 60
@@ -383,11 +580,30 @@ class HoldSellConfig:
             raise ContractError("at least one trail step is required")
         if self.trail_eval_interval_sec < 0:
             raise ContractError("trail_eval_interval_sec must not be negative")
+        if self.s02_afternoon_soft_loss_confirm_sec <= 0:
+            raise ContractError("S02 soft-loss confirmation seconds must be positive")
+        if self.s02_afternoon_soft_loss_pct >= 0:
+            raise ContractError("S02 soft-loss threshold must be negative")
+        if self.s02_afternoon_soft_loss_sell_money_mult < 1:
+            raise ContractError("S02 soft-loss sell-money multiple must be at least one")
 
         if self.valley_watch_sec <= 0 or self.valley_morning_confirm_sec <= 0:
             raise ContractError("Valley confirmation seconds must be positive")
         if not 1 <= self.valley_weak_ma_score_threshold <= self.valley_sell_score_threshold <= 4:
             raise ContractError("Valley sell score thresholds must be in [1, 4]")
+        if not (
+            1 <= self.common_peak_runner_score
+            <= self.common_peak_score
+            <= self.common_peak_strict_score
+            <= 5
+        ):
+            raise ContractError("common peak scores must be ordered in [1, 5]")
+        if min(
+            self.common_peak_partial_confirm_sec,
+            self.common_peak_full_confirm_sec,
+            self.common_peak_recovery_confirm_sec,
+        ) <= 0:
+            raise ContractError("common peak confirmation seconds must be positive")
 
 @dataclass(frozen=True)
 class HoldSellObservation:
@@ -406,6 +622,10 @@ class HoldSellObservation:
     money_accelerating: bool = False
     ma3_permit: bool = False
     daily_ma_permit: bool = False
+    # ★[MA20-DEFENSE 2026-08-05] 20선 단계까지 인정한 상승보유(allow_ma20=True).
+    #   손실방어 국면에서만 쓴다. 꼭지(이익실현)에는 쓰지 않는다 — 아래 규칙 참조.
+    #   안 채우는 전략(S03·시험 등)은 False 라 종전과 완전히 같다.
+    ma20_defense_permit: bool = False
     daily_ma5_broken: bool = False
     recent_buy_money_rising: bool = False
     buy_volume_per_sec_5s: Decimal = Decimal("0")
@@ -419,7 +639,12 @@ class HoldSellObservation:
     #   연속 음봉으로 계속 흘러내릴 때 신호가 꺼진다(= 떨어지는데 못 판다).
     #   꼭지 판정에는 전환이 아니라 "지금 음봉인가"가 필요하다.
     one_minute_bearish: bool = False
+    # Exact cumulative flow windows are ready for the common exit state machine.
+    common_peak_flow_ready: bool = False
     ma10_support: bool = False
+    # Audit the exact third leg of the S02 3-minute 5/10/20 trend lock.
+    # Default False keeps older saved observations replay-compatible.
+    ma20_support: bool = False
     ma20_rising: bool = False
 
     valley_completed_bearish_1m: bool = False
@@ -488,6 +713,13 @@ class HoldSellState:
     dryup_since: Optional[datetime] = None
     score_sell_since: Optional[datetime] = None
     flow_reversal_since: Optional[datetime] = None
+    peak_flow_since: Optional[datetime] = None
+    peak_lock_since: Optional[datetime] = None
+    supported_peak_since: Optional[datetime] = None
+    # S02 오후 약손실 확인은 꼭지 이익보호 타이머와 완전히 분리한다.
+    soft_loss_since: Optional[datetime] = None
+    peak_recovery_since: Optional[datetime] = None
+    peak_partial_taken: bool = False
     hold_peak_money_per_sec: Decimal = Decimal("0")
     valley_watch_since: Optional[datetime] = None
     valley_morning_break_since: Optional[datetime] = None
@@ -536,6 +768,12 @@ class HoldSellState:
             "dryup_since": _dt_text(self.dryup_since),
             "score_sell_since": _dt_text(self.score_sell_since),
             "flow_reversal_since": _dt_text(self.flow_reversal_since),
+            "peak_flow_since": _dt_text(self.peak_flow_since),
+            "peak_lock_since": _dt_text(self.peak_lock_since),
+            "supported_peak_since": _dt_text(self.supported_peak_since),
+            "soft_loss_since": _dt_text(self.soft_loss_since),
+            "peak_recovery_since": _dt_text(self.peak_recovery_since),
+            "peak_partial_taken": self.peak_partial_taken,
             "hold_peak_money_per_sec": str(self.hold_peak_money_per_sec),
             "valley_watch_since": _dt_text(self.valley_watch_since),
             "valley_morning_break_since": _dt_text(self.valley_morning_break_since),
@@ -570,6 +808,11 @@ class HoldSellState:
             "dryup_since",
             "score_sell_since",
             "flow_reversal_since",
+            "peak_flow_since",
+            "peak_lock_since",
+            "supported_peak_since",
+            "soft_loss_since",
+            "peak_recovery_since",
             "sell_latched_at",
             "valley_watch_since",
             "valley_morning_break_since",
@@ -580,6 +823,10 @@ class HoldSellState:
             payload.get("hold_peak_money_per_sec") or "0"
         )
         state.hold_peak_speed_5s = as_decimal(payload.get("hold_peak_speed_5s") or "0")
+        state.peak_flow_since = state.peak_flow_since or _parse_dt(
+            payload.get("s01_peak_sell_since"))
+        state.peak_partial_taken = bool(
+            payload.get("peak_partial_taken", payload.get("s01_partial_taken")))
         state.sell_latched = bool(payload.get("sell_latched"))
         state.sell_action = HoldSellAction(str(payload.get("sell_action") or "SELL"))
         state.sell_reason = str(payload.get("sell_reason") or "")
@@ -601,6 +848,7 @@ class HoldSellDecision:
     @property
     def should_sell(self) -> bool:
         return self.action in {
+            HoldSellAction.PARTIAL_SELL,
             HoldSellAction.SELL,
             HoldSellAction.EMERGENCY_SELL,
         }
@@ -618,10 +866,33 @@ def _parse_dt(value: Any) -> Optional[datetime]:
 class UnifiedHoldSellEngine:
     """One ordered hold/sell coordinator with strategy-specific profiles."""
 
-    def __init__(self, config: Optional[HoldSellConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[HoldSellConfig] = None,
+        *,
+        audit_recorder: Optional[HoldSellAuditRecorder] = None,
+        profiles: Optional[Mapping[StrategyId, StrategyExitProfile]] = None,
+    ) -> None:
         self.config = config or HoldSellConfig()
+        self.audit_recorder = audit_recorder or HoldSellAuditRecorder.disabled()
+        self.profiles = profiles if profiles is not None else STRATEGY_PROFILES
 
     def evaluate(
+        self,
+        state: HoldSellState,
+        observation: HoldSellObservation,
+    ) -> HoldSellDecision:
+        state_before = state.to_dict()
+        decision = self._evaluate_once(state, observation)
+        self.audit_recorder.record(
+            state_before=state_before,
+            observation=observation,
+            decision=decision,
+            state_after=state.to_dict(),
+        )
+        return decision
+
+    def _evaluate_once(
         self,
         state: HoldSellState,
         observation: HoldSellObservation,
@@ -630,7 +901,7 @@ class UnifiedHoldSellEngine:
         if state.sell_latched:
             return self._latched_decision(state)
         self._update_state_metrics(state, observation)
-        profile = STRATEGY_PROFILES[state.strategy_id]
+        profile = self.profiles[state.strategy_id]
         if profile.exit_policy is not ExitPolicy.STANDARD:
             return self._evaluate_valley(state, observation, profile)
         # ★[2026-07-27 친구님 지시] 돈마름·점수매도·구조붕괴 매도는 끈다(조기매도 원인).
@@ -647,8 +918,7 @@ class UnifiedHoldSellEngine:
         rules_default = (
             self._hard_stop_rule,
             self._time_exit_rule,
-            self._profit_trail_rule,
-            self._flow_reversal_exit_rule,
+            self._common_peak_flow_exit_rule,
             self._early_trend_rule,
             self._daily_ma_hold_rule,
             self._ma3_rule,
@@ -656,20 +926,349 @@ class UnifiedHoldSellEngine:
         rules_rider_first = (
             self._hard_stop_rule,
             self._time_exit_rule,
-            self._flow_reversal_exit_rule,   # 속도 역전 = 진짜 꼭지 -> 먼저 판다
-            self._daily_ma_hold_rule,        # 추세 살아 있으면 트레일 보류
+            self._common_peak_flow_exit_rule,
+            self._daily_ma_hold_rule,        # 3분봉 10/20선 지지 = 상승보유 최우선
+            self._flow_reversal_exit_rule,   # 이평 지지가 풀린 뒤 수급역전 확인
             self._profit_trail_rule,
             self._early_trend_rule,
             self._ma3_rule,
         )
-        for rule in (
-            rules_rider_first if profile.rider_before_trail else rules_default
-        ):
+        # ★[RIDER-FIRST-ALL 2026-08-03 친구님 지시 "5 10 20 이게 앞으로 가란 말야"]
+        #   종전에는 rider_before_trail 인 전략(S01·S02)만 상승보유가 트레일 앞이었고
+        #   나머지(S04·S05 등)는 트레일이 먼저 팔아버려 3분봉 5/10/20선이 무력했다.
+        #   이제 전 전략이 상승보유를 먼저 본다. rules_default 는 참고용으로 남긴다.
+        #   되돌리기: backup\strategy_common_hold_sell_v1_20260803_riderfirstall.py
+        for rule in rules_rider_first:
             decision = rule(state, observation, profile)
             if decision is not None:
                 return decision
         return self._decision(
             state, observation, HoldSellAction.HOLD, "HOLD_RIDING")
+
+    def _common_peak_flow_exit_rule(
+        self,
+        state: HoldSellState,
+        observation: HoldSellObservation,
+        profile: StrategyExitProfile,
+    ) -> Optional[HoldSellDecision]:
+        """Shared new-high reset and confirmed buy/sell-speed reversal exit."""
+        if self.config.s02_afternoon_soft_loss_enabled:
+            soft_loss = self._s02_afternoon_soft_loss_rule(
+                state, observation,
+            )
+            if soft_loss is not None:
+                return soft_loss
+        if (
+            not profile.common_peak_flow_exit_enabled
+            or not observation.common_peak_flow_ready
+        ):
+            return None
+
+        peak_return = self._return_pct(state, state.peak_price)
+        return_pct = self._return_pct(state, observation.price)
+        peak_drop = (
+            (state.peak_price - observation.price)
+            / state.peak_price
+            * Decimal("100")
+        )
+        sell_money_break = (
+            observation.buy_money_per_sec_10s > 0
+            and observation.sell_money_per_sec_10s
+            >= observation.buy_money_per_sec_10s
+            * self.config.common_peak_sell_money_mult
+        )
+        sell_volume_break = (
+            observation.buy_volume_per_sec_5s > 0
+            and observation.sell_volume_per_sec_previous_10s > 0
+            and observation.sell_volume_per_sec_5s
+            >= observation.buy_volume_per_sec_5s
+            * self.config.common_peak_sell_volume_mult
+            and observation.sell_volume_per_sec_5s
+            >= observation.sell_volume_per_sec_previous_10s
+            * self.config.common_peak_sell_volume_accel_mult
+        )
+        buy_fading = (
+            observation.buy_money_per_sec_30s > 0
+            and observation.buy_money_per_sec_10s
+            <= observation.buy_money_per_sec_30s
+            * self.config.common_peak_buy_fade_mult
+        )
+        che_falling = (
+            observation.che_str_change_5s
+            <= -self.config.common_peak_che_drop
+        )
+        structure_weak = bool(
+            observation.one_minute_bull_to_bear
+            or observation.one_minute_bearish
+            or observation.daily_ma5_broken
+        )
+        flow_break_score = sum((
+            sell_money_break,
+            sell_volume_break,
+            buy_fading,
+            che_falling,
+        ))
+        break_score = flow_break_score + int(structure_weak)
+        required_score = (
+            self.config.common_peak_runner_score
+            if state.peak_partial_taken
+            else self.config.common_peak_score
+        )
+        profit_setup = (
+            peak_return >= self.config.common_peak_arm_return_pct
+            and peak_drop >= self.config.common_peak_watch_drop_pct
+            and flow_break_score >= required_score
+        )
+
+        active_date = profile.supported_weak_peak_active_date
+        supported_weak_reversal = bool(
+            profile.supported_weak_peak_confirm_sec is not None
+            and active_date is not None
+            and (
+                active_date == "*"
+                or observation.observed_at.strftime("%Y%m%d") == active_date
+            )
+            and profile.supported_weak_peak_arm_return_pct is not None
+            and peak_return >= profile.supported_weak_peak_arm_return_pct
+            and profile.supported_weak_peak_drop_pct is not None
+            and peak_drop >= profile.supported_weak_peak_drop_pct
+            and profile.supported_weak_peak_score is not None
+            and flow_break_score >= profile.supported_weak_peak_score
+            and not observation.daily_ma5_broken
+            and observation.ma10_support
+            and observation.ma20_rising
+        )
+        if supported_weak_reversal:
+            if state.supported_peak_since is None:
+                state.supported_peak_since = observation.observed_at
+            supported_age = (
+                observation.observed_at - state.supported_peak_since
+            ).total_seconds()
+            if supported_age < profile.supported_weak_peak_confirm_sec:
+                return self._decision(
+                    state,
+                    observation,
+                    HoldSellAction.WATCH,
+                    f"S02_PEAK_5_DROP_1P5_FLOW_3OF4_WATCH "
+                    f"{supported_age:.0f}/{profile.supported_weak_peak_confirm_sec}s "
+                    f"score={flow_break_score}/4 peak={peak_return:.2f}% "
+                    f"drop={peak_drop:.2f}%",
+                )
+            return self._latch(
+                state,
+                observation,
+                HoldSellAction.SELL,
+                f"S02_PEAK_5_DROP_1P5_FLOW_3OF4_EXIT "
+                f"score={flow_break_score}/4 peak={peak_return:.2f}% "
+                f"drop={peak_drop:.2f}% age={supported_age:.0f}s",
+            )
+        state.supported_peak_since = None
+
+        # Rising-hold and peak exit are one state machine: while the shared
+        # 3-minute MA rider says the trend is supported, no profit exit may
+        # start or retain a confirmation timer.  Risk/time exits are evaluated
+        # before this rule and therefore remain unaffected.
+        # ★[RISING-HOLD 단일화 2026-08-05 친구님 승인 "ⓐ로 해"] 종전에는 위 조건에
+        #   `or (ma10_support and ma20_rising)` 가지가 하나 더 있었다. 그 가지는
+        #   선 조건만 보고 매수세를 안 봐서, 8/3 에 만든 2단 판정(선 지지 AND
+        #   매수세 우위 = daily_ma_permit)을 통째로 우회했다.
+        #   8/5 실전 감사기록 실측 —
+        #     S02 240810: 상승보유 434회 중 196회(45.2%)가 그 가지였고,
+        #                 그중 192회(98.0%)가 매도세>매수세인 순간이었다.
+        #     S05 403870: 133회 중 73회(54.9%), 그중 72회(98.6%)가 매도세 우위.
+        #     두 건 다 고점에서 되돌아 손실 마감(-0.61% / -1.21%).
+        #   ma10 지지는 daily_ma_permit 의 선 판정(ma3_common_v1.line_support_stage)에
+        #   이미 포함된다 → 매수세 조건을 붙이면 ①과 중복이므로 가지를 지운다.
+        #   ⚠️S05 자기 규칙(strategy_05_rotation_engine_v1.py 의 ma10_support and
+        #     ma20_rising)은 S05 소유라 손대지 않았다.
+        #   되돌리기: backup\strategy_common_hold_sell_v1_20260805_before_rising_hold_unify.py
+        if observation.daily_ma_permit:
+            state.peak_flow_since = None
+            state.peak_lock_since = None
+            state.peak_recovery_since = None
+            return self._decision(
+                state, observation, HoldSellAction.HOLD,
+                "COMMON_RISING_HOLD",
+            )
+
+        buy_recovered = (
+            observation.buy_money_per_sec_10s > 0
+            and observation.buy_money_per_sec_10s
+            >= observation.sell_money_per_sec_10s
+        )
+        if buy_recovered and state.peak_flow_since is not None:
+            if state.peak_recovery_since is None:
+                state.peak_recovery_since = observation.observed_at
+            recovery_age = (
+                observation.observed_at - state.peak_recovery_since
+            ).total_seconds()
+            if recovery_age < self.config.common_peak_recovery_confirm_sec:
+                return self._decision(
+                    state, observation, HoldSellAction.WATCH,
+                    f"COMMON_PEAK_RECOVERY_WATCH {recovery_age:.0f}/"
+                    f"{self.config.common_peak_recovery_confirm_sec}s",
+                )
+            state.peak_flow_since = None
+            state.peak_recovery_since = None
+            return self._decision(
+                state, observation, HoldSellAction.HOLD,
+                "COMMON_PEAK_RESET_BUY_SPEED_RECOVERED",
+            )
+        state.peak_recovery_since = None
+
+        defensive_loss_setup = (
+            peak_return < self.config.common_peak_arm_return_pct
+            and return_pct < 0
+            # ★[DEFENSE-DROP 2026-08-05] 정상 호흡(중앙값 1%)보다 얕게 꺾인 것은 안 판다.
+            and peak_drop >= self.config.common_peak_defense_drop_pct
+            and structure_weak
+            and break_score >= self.config.common_peak_strict_score
+        )
+        defensive_profit_setup = (
+            peak_return < self.config.common_peak_arm_return_pct
+            and return_pct >= Decimal("2")
+            and observation.structure_broken
+            and break_score >= self.config.common_peak_strict_score
+        )
+        defensive_setup = defensive_loss_setup or defensive_profit_setup
+        confirmed_setup = profit_setup or defensive_setup
+        if not confirmed_setup:
+            state.peak_flow_since = None
+            return None
+
+        if state.peak_flow_since is None:
+            state.peak_flow_since = observation.observed_at
+        age = (observation.observed_at - state.peak_flow_since).total_seconds()
+
+        if defensive_setup:
+            # ★[MA20-DEFENSE 2026-08-05 친구님 지시 "다 해"] 20선 지지를 손실방어
+            #   국면에서만 상승보유로 인정한다.
+            #   왜 — 8/4 에 "20선만 걸친 단계는 상승보유를 주지 말자"고 정한 것은
+            #   꼭지에서 못 파는 걸 막으려던 것이었다. 그런데 8/5 에 친구님이
+            #   정정하셨다: "이 해제는 매도(꼭지) 상황에서만 적용하는 것이지
+            #   손실방어 국면엔 적용 안 한다." 계약서 상승보유._20선이유 에도
+            #   그 문장이 적혀 있었는데 코드만 안 따라가 있었다
+            #   (daily_ma_permit 이 틱마다 참/거짓 하나라서 꼭지·방어가 같은 값을 썼다).
+            #   뜻 — 이익 구간에서 20선만 걸친 걸로 붙잡고 있으면 이익을 반납한다.
+            #   반면 손실 국면에서 20선이 우상향하며 현재가를 받쳐주면 그건 버틸
+            #   이유가 되고, 여기서 파는 것이 조기손절이다.
+            #   범위 — defensive_loss_setup(현재수익 < 0) 일 때만이다.
+            #   defensive_profit_setup(수익 +2% 이상)은 이익 국면이라 손대지 않았다.
+            #   ⚠️S01 은 daily_ma_permit 자체가 이미 allow_ma20=True 라 902 행에서
+            #     걸러지므로 여기까지 오지 않는다 = S01 동작은 변하지 않는다.
+            #   되돌리기: backup\strategy_common_hold_sell_v1_20260805_before_ma20_defense.py
+            if defensive_loss_setup and observation.ma20_defense_permit:
+                state.peak_flow_since = None
+                state.peak_lock_since = None
+                state.peak_recovery_since = None
+                return self._decision(
+                    state, observation, HoldSellAction.HOLD,
+                    "COMMON_MA20_DEFENSE_HOLD",
+                )
+            defense_confirm_sec = (
+                self.config.flow_reversal_confirm_sec
+                if defensive_loss_setup
+                else self.config.common_defense_confirm_sec
+            )
+            if age >= defense_confirm_sec:
+                return self._latch(
+                    state, observation, HoldSellAction.SELL,
+                    f"COMMON_FLOW_DEFENSE_EXIT score={break_score}/5 "
+                    f"age={age:.0f}s",
+                )
+            return self._decision(
+                state, observation, HoldSellAction.WATCH,
+                f"COMMON_FLOW_DEFENSE_WATCH {age:.0f}/"
+                f"{defense_confirm_sec}s "
+                f"score={break_score}/5",
+            )
+
+        if state.peak_partial_taken:
+            full_confirmed = (
+                (
+                    age >= self.config.common_peak_full_confirm_sec
+                    and peak_drop >= self.config.common_peak_full_drop_pct
+                )
+                or (
+                    observation.structure_broken
+                    and age >= self.config.common_peak_partial_confirm_sec
+                )
+            )
+            if full_confirmed:
+                return self._latch(
+                    state, observation, HoldSellAction.SELL,
+                    f"COMMON_PEAK_FLOW_RUNNER_EXIT score={break_score}/5 "
+                    f"peak={peak_return:.2f}% drop={peak_drop:.2f}% age={age:.0f}s",
+                )
+        else:
+            if age < self.config.common_peak_partial_confirm_sec:
+                return self._decision(
+                    state,
+                    observation,
+                    HoldSellAction.WATCH,
+                    f"COMMON_PEAK_FLOW_WATCH {age:.0f}s "
+                    f"score={flow_break_score}/4 required={required_score} "
+                    f"peak={peak_return:.2f}% drop={peak_drop:.2f}%",
+                )
+            return self._latch(
+                state,
+                observation,
+                HoldSellAction.SELL,
+                "COMMON_PEAK_FLOW_EXIT "
+                f"score={flow_break_score}/4 peak={peak_return:.2f}% "
+                f"drop={peak_drop:.2f}% age={age:.0f}s",
+            )
+        return self._decision(
+            state,
+            observation,
+            HoldSellAction.WATCH,
+            f"COMMON_PEAK_FLOW_WATCH {age:.0f}s "
+            f"score={flow_break_score}/4 required={required_score} "
+            f"peak={peak_return:.2f}% drop={peak_drop:.2f}%",
+        )
+
+    def _s02_afternoon_soft_loss_rule(
+        self,
+        state: HoldSellState,
+        observation: HoldSellObservation,
+    ) -> Optional[HoldSellDecision]:
+        return_pct = self._return_pct(state, observation.price)
+        setup = bool(
+            state.strategy_id is StrategyId.S02_LOW_BUY_SELL_EXHAUSTION
+            and observation.observed_at.time()
+            >= self.config.s02_afternoon_soft_loss_start_at
+            and return_pct <= self.config.s02_afternoon_soft_loss_pct
+            and observation.daily_ma5_broken
+            and observation.structure_broken
+            and observation.one_minute_bearish
+            and not observation.ma20_defense_permit
+            and observation.buy_money_per_sec_10s > 0
+            and observation.sell_money_per_sec_10s
+            >= observation.buy_money_per_sec_10s
+            * self.config.s02_afternoon_soft_loss_sell_money_mult
+        )
+        if not setup:
+            state.soft_loss_since = None
+            return None
+        if state.soft_loss_since is None:
+            state.soft_loss_since = observation.observed_at
+        age = (observation.observed_at - state.soft_loss_since).total_seconds()
+        if age < self.config.s02_afternoon_soft_loss_confirm_sec:
+            return self._decision(
+                state,
+                observation,
+                HoldSellAction.WATCH,
+                f"S02_SOFT_LOSS_FLOW_WATCH {age:.0f}/"
+                f"{self.config.s02_afternoon_soft_loss_confirm_sec}s "
+                f"return={return_pct:.2f}%",
+            )
+        return self._latch(
+            state,
+            observation,
+            HoldSellAction.SELL,
+            "S02_SOFT_LOSS_FLOW_EXIT "
+            f"return={return_pct:.2f}% age={age:.0f}s",
+        )
 
     def _flow_reversal_exit_rule(
         self,
@@ -677,7 +1276,7 @@ class UnifiedHoldSellEngine:
         observation: HoldSellObservation,
         profile: StrategyExitProfile,
     ) -> Optional[HoldSellDecision]:
-        """S02 only: confirmed sell-flow reversal before the final -2% insurance."""
+        """S01/S02: confirmed sell-flow reversal before final insurance."""
         if not profile.flow_reversal_exit_enabled:
             return None
         has_exact_data = (
@@ -761,24 +1360,36 @@ class UnifiedHoldSellEngine:
         observation: HoldSellObservation,
         profile: StrategyExitProfile,
     ) -> HoldSellDecision:
-        """Shared rebound exit: time/profit/risk, MA5 break, then rider."""
+        """Shared rebound exit: time/risk, rider(5/10/20), trail, MA5 break."""
+        # ★[RIDER-FIRST-ALL 2026-08-03 친구님 지시 "5 10 20 이게 앞으로 가란 말야"]
+        #   종전 순서: 시간 -> 트레일 -> 하드손절 -> 5선이탈 -> 상승보유.
+        #   트레일과 5선이탈이 상승보유보다 앞이라, 3분봉 5/10/20선이 받쳐주는데도
+        #   먼저 팔려나갔다. 이제 하드손절·시간청산 바로 뒤에 상승보유를 둔다.
+        #   ⚠️하드손절은 계속 맨 앞이다(보험은 무엇보다 앞선다).
         decision = self._profile_time_exit(state, observation, profile)
-        decision = decision or self._profit_trail_rule(state, observation, profile)
         decision = decision or self._hard_stop_rule(state, observation, profile)
         if decision is not None:
             return decision
 
-        if observation.daily_ma5_broken:
-            return self._latch(
-                state,
-                observation,
-                HoldSellAction.SELL,
-                "DAILY_MA5_BREAK",
-            )
+        decision = self._common_peak_flow_exit_rule(state, observation, profile)
+        if decision is not None:
+            return decision
+
         decision = self._daily_ma_hold_rule(state, observation, profile)
         if decision is not None:
             state.valley_morning_break_since = None
             return decision
+
+        decision = self._profit_trail_rule(state, observation, profile)
+        if decision is not None:
+            return decision
+
+        # ★[MA-AUX-ONLY 2026-08-03 친구님 지시]
+        #   "원래 5 10 20은 보조적 수단으로 쓰는 거야. 매매 수단이 아냐."
+        #   종전에는 여기서 5선을 깨면 곧바로 매도(DAILY_MA5_BREAK)했다 = 선을
+        #   매매 수단으로 쓴 것. 제거한다. 5선은 흐름역전 민감도 조절
+        #   (_flow_reversal_exit_rule 의 daily_ma5_broken)로만 남는다.
+        #   매도 방아쇠는 하드손절·시간청산·수급(속도)·구조붕괴가 맡는다.
 
         if observation.structure_broken:
             if state.valley_morning_break_since is None:
@@ -811,6 +1422,9 @@ class UnifiedHoldSellEngine:
     ) -> HoldSellDecision:
         decision = self._profile_time_exit(state, observation, profile)
         decision = decision or self._hard_stop_rule(state, observation, profile)
+        if decision is not None:
+            return decision
+        decision = self._common_peak_flow_exit_rule(state, observation, profile)
         if decision is not None:
             return decision
         peak_drop = (
@@ -901,6 +1515,19 @@ class UnifiedHoldSellEngine:
         decision = decision or self._hard_stop_rule(state, observation, profile)
         if decision is not None:
             return decision
+        decision = self._common_peak_flow_exit_rule(state, observation, profile)
+        if decision is not None:
+            return decision
+        # ★[RIDER-FIRST-ALL 2026-08-03 친구님 지시 "골짜기 이거 넣어 연결해"]
+        #   S03(VALLEY_MORNING_CRASH)은 경로가 달라 상승보유가 아예 없었다.
+        #   3분봉 5/10/20선을 계산만 하고 버리던 상태 → 하드손절 바로 뒤에 연결한다.
+        #   ★5/10/20은 '보조 수단'이다 — 파는 근거가 아니라 안 팔게 잡아주는 것.
+        #     그래서 여기서 하는 일은 HOLD 뿐이고, 매도는 아래 구조붕괴가 맡는다.
+        #   하드손절·시간청산은 앞순위 그대로(보험은 무엇보다 앞선다).
+        decision = self._daily_ma_hold_rule(state, observation, profile)
+        if decision is not None:
+            state.valley_morning_break_since = None
+            return decision
         if not observation.structure_broken:
             state.valley_morning_break_since = None
             return self._decision(
@@ -951,6 +1578,9 @@ class UnifiedHoldSellEngine:
         decision = decision or self._hard_stop_rule(state, observation, profile)
         if decision is not None:
             return decision
+        decision = self._common_peak_flow_exit_rule(state, observation, profile)
+        if decision is not None:
+            return decision
         return_pct = self._return_pct(state, observation.price)
         if profile.target_profit_pct is not None and return_pct >= profile.target_profit_pct:
             return self._latch(
@@ -996,6 +1626,10 @@ class UnifiedHoldSellEngine:
         observation: HoldSellObservation,
     ) -> None:
         state.last_observed_at = observation.observed_at
+        if observation.price > state.peak_price:
+            state.peak_flow_since = None
+            state.peak_lock_since = None
+            state.peak_recovery_since = None
         state.peak_price = max(state.peak_price, observation.price)
         state.hold_peak_money_per_sec = max(
             state.hold_peak_money_per_sec,
@@ -1178,6 +1812,8 @@ class UnifiedHoldSellEngine:
         observation: HoldSellObservation,
         _profile: StrategyExitProfile,
     ) -> Optional[HoldSellDecision]:
+        if not _profile.profit_trail_enabled:
+            return None
         # ★[TRAIL-FLOW 2026-08-03 친구님 지시] 판정 주기를 전략별로 덮어쓴다.
         #   공용 180초는 "그 3분 사이에 끝없이 추락할 수 있어" 위험하다 → S02 는 50초.
         interval = int(

@@ -32,12 +32,17 @@ import 예:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+
+from ipc_order_auth_v1 import PROTECTED_TYPES, OrderAuthError, sign_order_request
+
+logger = logging.getLogger(__name__)
 
 
 _DEFAULT_IPC_BASE = Path(r"C:\stock_bot\IPC")
@@ -48,6 +53,11 @@ _DEFAULT_HB_STALE_SEC = 15.0
 #   게이트웨이가 15초까지 실행하는 5초 유령 창. 실주문만 timeout-2초로 조여 창을 없앤다.
 #   TR·BATCH_TR 은 종전대로(낡은 조회는 무해하지만 낡은 주문은 위험).
 _GHOST_MARGIN_SEC = 2
+
+
+def _mask_account(value: Any) -> str:
+    raw = str(value or "").replace("-", "")
+    return (raw[:4] + "**") if len(raw) >= 4 else "**"
 
 
 # ─────────────────────────────────────────────────────────
@@ -103,8 +113,10 @@ def _is_pid_alive(pid: int) -> bool:
         finally:
             try:
                 ctypes.windll.kernel32.CloseHandle(h)
-            except Exception:
-                pass
+            except Exception as exc:
+                return {"status": "ERROR",
+                        "error": f"manual_buy_block check unavailable: {exc}",
+                        "data": None}
     except Exception:
         return False
 
@@ -213,6 +225,18 @@ class BrokerClient:
         req.setdefault("ttl_sec", int(timeout_sec) + 5)
         # [TR-CALLER 2026-07-11] 호출자 서명 — 게이트웨이는 모르는 키 무시(하위호환)
         req.setdefault("caller", _CALLER)
+        # ★[IPC-AUTH-SCOPE 2026-08-04] SENDORDER_REAL 단독 -> PROTECTED_TYPES.
+        #   SET_REAL_REMOVE_ALL(전 종목 실시간 해제)도 서명 대상에 들어갔다.
+        request_type = str(req.get("type") or "")
+        if request_type in PROTECTED_TYPES:
+            try:
+                req = sign_order_request(req)
+            except OrderAuthError as exc:
+                return {
+                    "status": "ERROR",
+                    "error": f"{request_type} authentication blocked: {exc}",
+                    "data": None,
+                }
 
         self._req_dir.mkdir(parents=True, exist_ok=True)
         self._res_dir.mkdir(parents=True, exist_ok=True)
@@ -388,6 +412,19 @@ class BrokerClient:
             "fid":  int(fid),
         }, timeout_sec=timeout_sec)
 
+    def batch_get_comm_real_data(self, codes: List[str], fids: List[int],
+                                 timeout_sec: float = 5.0) -> Dict[str, Any]:
+        """등록 종목의 최신 실시간 FID를 한 번의 IPC로 읽는다.
+
+        읽기 전용이며 SetRealReg·주문을 수행하지 않는다. 대량 종목 그림자가
+        종목마다 IPC 파일을 만들지 않도록 broker 쪽에서 묶어 반환한다.
+        """
+        return self.request({
+            "type": "BATCH_GET_COMM_REAL_DATA",
+            "codes": [str(code) for code in codes],
+            "fids": [int(fid) for fid in fids],
+        }, timeout_sec=timeout_sec)
+
     # 화면번호 해제
     def disconnect_scr(self, screen_no: str,
                        timeout_sec: float = 2.0) -> Dict[str, Any]:
@@ -474,20 +511,22 @@ class BrokerClient:
         # [매수 차단기 2026-06-29] manual_buy_block.flag 존재 시 매수(order_type=1) 거부.
         #   ★기존 구멍 메움: 라이브 실행기(deep_v/돌파/눌림/MBB/종가)가 이 메서드를 직접 호출 →
         #   kiwoom_buy_order_sender의 flag체크를 안 거쳐 차단기가 무력했음. 여기서 공통 차단(매도/정정/취소 무관·fail-open).
-        if order_type == 1:
+        if order_type in (1, 5):
             try:
                 import os as _os
                 if _os.path.exists(r"C:\stock_bot\config\manual_buy_block.flag"):
                     return {"status": "ERROR",
                             "error": "manual_buy_block(flag) — 수동 매수차단 활성",
                             "data": None}
-            except Exception:
-                pass
+            except Exception as exc:
+                return {"status": "ERROR",
+                        "error": f"manual_buy_block check unavailable: {exc}",
+                        "data": None}
         # [돈흐름 단독실험 격리 2026-07-06 친구님 "전략 프로그램들 계좌 사용 차단·돈흐름만 실험"]
         #   only_moneyflow.flag 존재 시 → 매수(order_type=1)는 rqname이 "MFLOW"로 시작하는 돈흐름 매매기만 허용.
         #   나머지 전 전략 매수 전부 거부(★단일 관문이라 전략 하나도 못 빠져나감). 매도/정정/취소는 통과=기존 포지션 청산 가능.
         #   해제: config\only_moneyflow.flag 삭제. fail-open(flag 못읽으면 통과). manual_buy_block(전면 킬스위치)가 우선.
-        if order_type == 1:
+        if order_type in (1, 5):
             try:
                 import os as _osmf
                 if _osmf.path.exists(r"C:\stock_bot\config\only_moneyflow.flag"):
@@ -498,8 +537,10 @@ class BrokerClient:
                         return {"status": "ERROR",
                                 "error": f"only_moneyflow(flag) — 격리·전략매수 차단(rqname={rqname}·허용={_allow})",
                                 "data": None}
-            except Exception:
-                pass
+            except Exception as exc:
+                return {"status": "ERROR",
+                        "error": f"only_moneyflow check unavailable: {exc}",
+                        "data": None}
         # [시장 regime 금액축소 2026-07-03 친구님 "차단말고 금액축소·눌림만말고 공통"] 급락장/장전US위험이면
         #   주문수량 축소(전 엔진 공통 단일지점·fail-open). 차단 아님 = 나쁜날도 소액으로 계속 매수.
         #   근거 백테16일: 매수시점 코스닥 ≤0%면 스파이크대장 -0.77%→-5% → 나쁜날은 작게.
@@ -512,7 +553,7 @@ class BrokerClient:
         #   지수 배관 검증(7/12): 지수 +5.47%(7/10) vs 우리 일봉 1,663종목 중앙 +4.07% = 일치·신뢰 가능.
         #   ⚠️전 엔진 공통 관문(깊은바닥·눌림·통합대장·종가매수 전부 적용). 지수 파일 없음/낡음 = fail-open(무개입).
         #   롤백: setx MARKET_REGIME_GATE NO  ·  문턱: MARKET_DROP_REDUCE / MARKET_DROP_STOP
-        if order_type == 1:
+        if order_type in (1, 5):
             try:
                 import os as _osr, json as _jr
                 from datetime import datetime as _dtr
@@ -554,13 +595,15 @@ class BrokerClient:
                                 _bad = True
                         except Exception:
                             pass
-                    if _bad and 0 < _cut < 1:
-                        qty = max(1, int(round(int(qty) * _cut)))
-            except Exception:
-                pass
+                    # 수량 축소는 최종 주문 관문인 gateway에서 한 번만 적용한다.
+                    # 여기서는 극단 하락 차단만 조기 반환한다.
+            except Exception as exc:
+                return {"status": "ERROR",
+                        "error": f"market_regime_gate unavailable: {exc}",
+                        "data": None}
         # [잡주 차단 2026-06-30 친구님 "1000원 이하 잡주 매수금지"] ★전 엔진 통일 단일점(돌파·실시간돌파·골든·딥·갭 전부 여기 거침).
         #   실시간 스냅샷 현재가가 SAFEPLUS_MIN_PRICE(기본1000) 미만이면 매수 거부. 가격 모르면 통과(fail-open).
-        if order_type == 1:
+        if order_type in (1, 5):
             try:
                 import os as _os3, json as _json3
                 # [2026-07-07 친구님] 돈흐름(rqname MFLOW…)은 큰손추종이라 저가주도 담게 별도 하한(MF_MIN_PRICE).
@@ -606,15 +649,16 @@ class BrokerClient:
                             return {"status": "ERROR",
                                     "error": f"mcap_floor: {_mc/1e8:.0f}억<{_minmc/1e8:.0f}억 — 소형 잡주 매수금지(MIN_MARKETCAP)",
                                     "data": None}
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("[ORDER-SAFETY] price/mcap check unavailable: %s", exc)
         if not idempotency_key:
             return {"status": "ERROR",
                     "error": "send_order_real: idempotency_key required (중복 주문 차단)",
                     "data": None}
         if not account or not code or qty <= 0:
             return {"status": "ERROR",
-                    "error": f"send_order_real: account/code/qty required (got account={account!r} code={code!r} qty={qty})",
+                    "error": ("send_order_real: account/code/qty required "
+                              f"(got account={_mask_account(account)} code={code!r} qty={qty})"),
                     "data": None}
         if order_type not in {1, 2, 3, 4, 5, 6}:
             return {"status": "ERROR",

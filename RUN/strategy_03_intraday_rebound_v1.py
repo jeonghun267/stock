@@ -18,6 +18,9 @@ FLOW_GATES_OFF = os.environ.get("S03_FLOW_GATES_OFF", "YES").strip().upper() == 
 from strategy_03_signal_contract_v1 import (
     INTRADAY_CRASH_ALGORITHM,
     INTRADAY_CRASH_LANE,
+    INTRADAY_MAX_REBOUND_PCT,
+    INTRADAY_MIN_DRAWDOWN_PCT,
+    INTRADAY_MIN_REBOUND_PCT,
     SIGNAL_MODE,
 )
 
@@ -25,6 +28,12 @@ from strategy_03_signal_contract_v1 import (
 class IntradayPoint(Protocol):
     ts: datetime
     price: float
+    # ★[S03-OPENPRICE-FIX 2026-08-06 친구님 지시 "셋 다 고쳐"] 당일 시가.
+    #   실제로 넘어오는 객체(골짜기_급반등.py MicroPoint)에는 원래 있었는데
+    #   여기 규약에 없어서 신호 행에 안 실렸다. 그 결과 회전엔진 선별기가
+    #   (strategy_03_rotation_engine_v1.py:141 `open_price <= 0` → continue)
+    #   INTRADAY 레인 신호를 **전부** 버렸다 — S03 역대 매수 0건의 원인.
+    open_price: float
     buy_volume_cum: float
     sell_volume_cum: float
     buy_money_cum: float
@@ -65,11 +74,20 @@ class IntradayReboundConfig:
     #   ⚠️하루 표본이고 3분봉을 분당 현재가로 근사해 잰 값이다.
     #   되돌리기: RUN\backup\strategy_03_intraday_rebound_v1_20260731_firstbull.py 복원
     high_window_sec: float = 10 * 60
-    min_drawdown_pct: float = 1.5
-    min_rebound_pct: float = 0.5
-    max_rebound_pct: float = 1.0
-    low_stable_sec: float = 3.0
-    max_confirm_sec: float = 180.0
+    min_drawdown_pct: float = INTRADAY_MIN_DRAWDOWN_PCT
+    min_rebound_pct: float = INTRADAY_MIN_REBOUND_PCT
+    max_rebound_pct: float = INTRADAY_MAX_REBOUND_PCT
+    # ★[S03-LANE2 2026-08-06 친구님 지시 "2초 관찰, 바로 상승해야 되고, 1분 안에 바로
+    #   상승하지 않으면 매수 금지야. 급락 후 바로 급상승하는 거 잡기 위함이야"]
+    #   관찰 3초 → 2초, 확인창 180초 → 60초. 저점이 생기고 1분 안에 반등(+0.5~1.0%)과
+    #   매수 방법 확인(1레인 급행과 같은 감속+가속+우위)이 안 오면 그 저점은 폐기 —
+    #   더 낮은 새 저점이 나와야 다시 자격을 얻는다(바닥에 닿자마자 튀는 것만 잡는다).
+    #   닷새 캡처 전수(A안): 고저폭30 실전 우주 43건 · 손절 60.5% · 평균 +1.43%
+    #   (8/4 +1.69% · 8/6 +1.31% — 1레인이 진 날에도 플러스). 우위 제외(B안)와 차이 없음
+    #   (645건 vs 637건 · 평균 동일)이라 친구님 원설계("역매수세")대로 우위 포함.
+    #   되돌리기: backup\s03_lane2_20260806\ 복원.
+    low_stable_sec: float = 2.0
+    max_confirm_sec: float = 60.0
     min_entry_money_krw: float = 10_000_000.0
     # ★[2026-07-31] 매수세 확인 문턱 0.58 → 0.50(사실상 해제).
     #   친구님 물음 "매도세가 급격히 떨어지고 매수세가 보이면 진입하나?" 에 대한 실측 답 —
@@ -146,6 +164,24 @@ class IntradayReboundState:
     emission_count: int = 0
     last_emitted_low: float = 0.0
     low_reset_steps: int = 0        # ★[2026-07-31] 계단 수 = 저점이 더 낮게 갱신된 횟수
+    # ★[S03-DAYHIGH-FIX 2026-08-06 친구님 지시 "장중 고점은 당일 고점으로"]
+    #   종전 고점은 10분 창(points 덱) 안의 최대값이라 '당일 고점'이 아니었다.
+    #   그래서 낙폭이 실제보다 얕게 나왔다(8/6 코스텍시스 -2.008% 로 신호).
+    #   이 둘은 창과 무관하게 그날 내내 갱신만 하고 절대 줄지 않는다.
+    #   자료 공백 리셋(_reset_history)에도 살아남는다 - 공백이 있었다고 그날 고점이
+    #   사라지는 것은 아니다.
+    day_high_price: float = 0.0
+    day_high_ts: datetime | None = None
+    # ★[2026-08-06 친구님 지시 "계기판 3종 그림자 기록 … 테스트 한번 해보고 배선하자"]
+    #   판정에는 절대 안 쓰고 기록만 하는 저점 순간 계기판. 저점이 정해지는 순간
+    #   (무장·계단 갱신) 한 번만 계산해 그 사이클의 모든 행에 실린다.
+    #   출처: 헤지펀드 급락 저점 탐지 조사(8/6) — ①항복매도 클라이맥스 ②호가 대기열
+    #   불균형(Gould·Bonart) ③매도 감속(호크스 연쇄 소진의 실전 근사).
+    #   ⚠️조건 승격은 며칠 쌓아 "먹힌 저점 vs 가짜 저점"이 갈리는지 본 뒤에만(7/31 교훈).
+    low_gauges: dict[str, Any] = field(default_factory=dict)
+    # ★[S03-LANE2 2026-08-06] 폐기된 저점(확인창 60초 초과·추격상한 초과) — 이보다
+    #   낮은 새 저점이 나와야 다시 무장한다. "1분 안에 안 튀면 그 저점은 매수 금지".
+    dead_low: float = 0.0
 
 
 class IntradayReboundDetector:
@@ -162,13 +198,28 @@ class IntradayReboundDetector:
     def _reset_history(self) -> None:
         count = self.state.emission_count
         last_low = self.state.last_emitted_low
+        # ★[S03-DAYHIGH-FIX 2026-08-06] 당일 고점은 리셋에서 살린다.
+        #   자료 공백이 있었다고 그날 찍은 고점이 없던 일이 되지 않는다.
+        day_high = self.state.day_high_price
+        day_high_ts = self.state.day_high_ts
+        # ★[S03-LANE2 2026-08-06] 죽은 저점도 리셋에서 살린다 — 자료 공백이 있었다고
+        #   "1분 안에 못 튄 저점"이 되살아나는 것은 아니다.
+        dead = self.state.dead_low
         self.state = IntradayReboundState(
             emission_count=count,
             last_emitted_low=last_low,
+            day_high_price=day_high,
+            day_high_ts=day_high_ts,
+            dead_low=dead,
         )
 
     def _append(self, point: IntradayPoint) -> str | None:
         state = self.state
+        # ★[S03-DAYHIGH-FIX 2026-08-06] 당일 고점 갱신은 무조건 먼저 한다.
+        #   아래 어느 갈래로 빠지든(중복·자료공백 리셋) 그날 찍힌 값은 기록으로 남긴다.
+        if point.price > state.day_high_price:
+            state.day_high_price = point.price
+            state.day_high_ts = point.ts
         previous = state.points[-1] if state.points else None
         if previous is not None:
             if point.ts <= previous.ts:
@@ -202,6 +253,46 @@ class IntradayReboundDetector:
         delta = point.buy_money_cum - base.buy_money_cum
         return max(0.0, delta) / elapsed if elapsed > 0 else 0.0
 
+    def _sell_decel_buy_flip(self, point: IntradayPoint) -> bool:
+        # ★[S03-LANE2 2026-08-06 친구님 지시 "레인 1번 저점 매수방법을 똑같이 공유"]
+        #   1레인 급행과 같은 판정식(flow_accel: 10초 두 구간 — 매도 감속 + 매수 가속 +
+        #   매수 우위)을 2레인 자료(points 덱)로 계산한다. 자료가 성겨 창이 안 채워지면
+        #   False = 안 산다(fail-closed) — "바로 상승"만 잡는 창구라 침묵이 안전한 쪽.
+        rows = self.state.points
+        if len(rows) < 3:
+            return False
+        window = 10.0
+        tolerance = max(3.0, window * 0.4)
+        end = rows[-1]
+        end_epoch = end.ts.timestamp()
+        mid = nxt = None
+        for row in reversed(rows):
+            epoch = row.ts.timestamp()
+            if mid is None and epoch <= end_epoch - window:
+                mid = row
+            if epoch <= end_epoch - 2.0 * window:
+                nxt = row
+                break
+        if mid is None or nxt is None:
+            return False
+        if (end_epoch - window) - mid.ts.timestamp() > tolerance:
+            return False
+        if (end_epoch - 2.0 * window) - nxt.ts.timestamp() > tolerance:
+            return False
+        prev_span = (mid.ts - nxt.ts).total_seconds()
+        recent_span = (end.ts - mid.ts).total_seconds()
+        if min(prev_span, recent_span) < window * 0.6:
+            return False
+        prev_buy = max(0.0, mid.buy_money_cum - nxt.buy_money_cum) / prev_span
+        prev_sell = max(0.0, mid.sell_money_cum - nxt.sell_money_cum) / prev_span
+        recent_buy = max(0.0, point.buy_money_cum - mid.buy_money_cum) / recent_span
+        recent_sell = max(0.0, point.sell_money_cum - mid.sell_money_cum) / recent_span
+        return (
+            recent_buy > prev_buy
+            and recent_buy > recent_sell
+            and recent_sell <= prev_sell
+        )
+
     @staticmethod
     def _book_metrics(point: IntradayPoint) -> tuple[float, float]:
         if not point.book_valid:
@@ -215,6 +306,52 @@ class IntradayReboundDetector:
             (point.best_ask_px - point.best_bid_px) / midpoint * 10_000.0,
             (microprice / midpoint - 1.0) * 10_000.0,
         )
+
+    def _lookback(self, low: IntradayPoint, seconds: float) -> IntradayPoint | None:
+        for row in reversed(self.state.points):
+            if (low.ts - row.ts).total_seconds() >= seconds:
+                return row
+        return None
+
+    def _compute_low_gauges(self, low: IntradayPoint) -> dict[str, Any]:
+        # ★[2026-08-06 친구님 지시 "계기판 3종 그림자 기록"] 판정에는 절대 안 쓴다.
+        #   저점 갱신 순간에만 계산(틱마다 아님 — _money_rate 처럼 매 행 계산하면 낭비).
+        #   못 재는 값은 None(CSV 빈칸) — 0 으로 꾸미면 "진짜 0"과 못 가른다.
+        #   ① dip_climax_mult: 저점 직전 1분 거래대금 ÷ 당일 분당 평균.
+        #      3~5배↑ = 항복매도 클라이맥스 후보. 중앙값 대신 평균인 이유: 누적대금
+        #      두 개만으로 계산돼 분당 이력 상태가 필요 없다(그림자 단계에선 이걸로 충분).
+        #   ② dip_book_imb: 저점 순간 최우선호가 대기열 불균형 = 매수잔량/(매수+매도).
+        #      0.5 = 균형, 1 에 가까울수록 매수벽 우세(Gould·Bonart 대기열 불균형).
+        #   ③ dip_sell_decel_10s: 저점 직전 10초 매도대금 증가분 ÷ 그 앞 10초.
+        #      1 미만 = 매도가 저점으로 오며 감속(연쇄 소진). 자료가 성기면 None.
+        base60 = self._lookback(low, 60.0)
+        climax = None
+        total_cum = low.buy_money_cum + low.sell_money_cum
+        opened = low.ts.replace(hour=9, minute=0, second=0, microsecond=0)
+        elapsed_min = (low.ts - opened).total_seconds() / 60.0
+        if base60 is not None and total_cum > 0 and elapsed_min >= 1.0:
+            minute_money = total_cum - (
+                base60.buy_money_cum + base60.sell_money_cum)
+            per_min_avg = total_cum / elapsed_min
+            if per_min_avg > 0:
+                climax = round(minute_money / per_min_avg, 3)
+        book_imb = None
+        if low.book_valid:
+            book_imb = round(
+                low.best_bid_qty / (low.best_bid_qty + low.best_ask_qty), 3)
+        sell_decel = None
+        p10 = self._lookback(low, 10.0)
+        p20 = self._lookback(low, 20.0)
+        if p10 is not None and p20 is not None and p20.ts < p10.ts:
+            recent = low.sell_money_cum - p10.sell_money_cum
+            prior = p10.sell_money_cum - p20.sell_money_cum
+            if prior > 0:
+                sell_decel = round(recent / prior, 3)
+        return {
+            "dip_climax_mult": climax,
+            "dip_book_imb": book_imb,
+            "dip_sell_decel_10s": sell_decel,
+        }
 
     def _row(
         self,
@@ -250,14 +387,25 @@ class IntradayReboundDetector:
                 "dip_low_reset_steps": state.low_reset_steps,
                 "dip_drop_pct": round(drawdown, 3),
             }
+            dip_meta.update(state.low_gauges)  # ★[2026-08-06] 계기판 3종(기록만)
         row: dict[str, Any] = {
             "ts": point.ts.isoformat(timespec="milliseconds"),
             "action": action,
             "reason": reason,
             "price": point.price,
+            # ★[S03-OPENPRICE-FIX 2026-08-06] 회전엔진 선별기가 이 값으로 진입 가격대를
+            #   다시 검산한다(OPEN_HANDOFF -8% ~ OPEN_ARM -4%). 없으면 신호가 통째로 버려진다.
+            #   1번 레인(OPEN_CRASH)은 원래 싣고 있었다(골짜기_급반등.py:371) - 2번만 빠져 있었다.
+            "open_price": getattr(point, "open_price", 0.0) or 0.0,
+            # ★[S03-OPENPRICE-FIX 2026-08-06] 회전엔진이 "신호 낼 때보다 지금 매수세가 더
+            #   붙었나"를 이 두 값과 스냅샷을 견줘 판정한다(rotation_engine:151~164).
+            #   없으면 -1.0 으로 읽혀 즉시 탈락한다. 1번 레인은 싣고 있었다(골짜기:376~377).
+            "current_buy_money_cum": point.buy_money_cum,
+            "current_sell_money_cum": point.sell_money_cum,
             "entry_lane": INTRADAY_CRASH_LANE,
             "algorithm": INTRADAY_CRASH_ALGORITHM,
             "mode": SIGNAL_MODE,
+            "long_flow_gates_enabled": not FLOW_GATES_OFF,
             "phase": state.phase,
             "intraday_high": state.high_price,
             "intraday_high_ts": (
@@ -323,8 +471,16 @@ class IntradayReboundDetector:
             return self._row(point, "DONE", "CODE_DAILY_ENTRY_LIMIT_2")
 
         if state.phase in {"SCAN", "EMITTED", "WAIT_NEW_LOW"}:
-            high = max(state.points, key=lambda row: row.price)
-            drawdown = (point.price / high.price - 1.0) * 100.0
+            # ★[S03-DAYHIGH-FIX 2026-08-06 친구님 "장중 고점 잘못된 거야 / 당일 고점으로"]
+            #   종전: max(state.points) = 10분 창 안의 최대값 → 당일 고점이 아니다.
+            #   지금: 그날 내내 갱신한 day_high_price.
+            #   자료가 아직 없으면(0) 예전처럼 창 최대값으로 물러선다.
+            if state.day_high_price > 0:
+                high_price, high_ts = state.day_high_price, state.day_high_ts
+            else:
+                fallback = max(state.points, key=lambda row: row.price)
+                high_price, high_ts = fallback.price, fallback.ts
+            drawdown = (point.price / high_price - 1.0) * 100.0
             new_cycle_low = (
                 state.last_emitted_low <= 0
                 or point.price < state.last_emitted_low
@@ -332,12 +488,19 @@ class IntradayReboundDetector:
             if drawdown > -self.config.min_drawdown_pct or not new_cycle_low:
                 state.phase = "SCAN"
                 return self._row(point, "WAIT", "INTRADAY_DRAWDOWN_LT_3PCT")
+            # ★[S03-LANE2 2026-08-06] 폐기된 저점보다 낮아져야만 새 사이클 —
+            #   "1분 안에 안 튄 저점은 매수 금지"를 지키는 빗장.
+            if state.dead_low > 0 and point.price >= state.dead_low:
+                state.phase = "SCAN"
+                return self._row(point, "WAIT", "DEAD_LOW_REQUIRES_LOWER_LOW")
+            state.dead_low = 0.0
             state.phase = "LOW_CONFIRM"
-            state.high_price = high.price
-            state.high_ts = high.ts
+            state.high_price = high_price
+            state.high_ts = high_ts
             state.low_point = point
             state.low_updated_at = point.ts
             state.low_reset_steps = 0        # ★새 급락 시작 = 계단 수 초기화
+            state.low_gauges = self._compute_low_gauges(point)  # ★계기판(기록만)
             return self._row(point, "ARMED", "INTRADAY_DROP_ARMED")
 
         low = state.low_point
@@ -348,15 +511,18 @@ class IntradayReboundDetector:
             state.low_point = point
             state.low_updated_at = point.ts
             state.low_reset_steps += 1       # ★저점이 한 계단 더 내려감
+            state.low_gauges = self._compute_low_gauges(point)  # ★계단마다 다시 잰다
             return self._row(point, "RESET", "INTRADAY_NEW_LOW_RESET")
 
         elapsed = (point.ts - low.ts).total_seconds()
         rebound = (point.price / low.price - 1.0) * 100.0
         if elapsed > self.config.max_confirm_sec:
             state.phase = "WAIT_NEW_LOW"
+            state.dead_low = low.price      # ★[S03-LANE2] 1분 안에 못 튄 저점 = 폐기
             return self._row(point, "WAIT", "INTRADAY_CONFIRM_TIMEOUT")
         if rebound > self.config.max_rebound_pct:
             state.phase = "WAIT_NEW_LOW"
+            state.dead_low = low.price      # ★[S03-LANE2] 우리 없이 튄 저점도 폐기
             return self._row(point, "WAIT", "REBOUND_CHASE_LIMIT")
         stable = (point.ts - (state.low_updated_at or point.ts)).total_seconds()
         row = self._row(point, "WAIT", "LOW_OR_REBOUND_CONFIRMING")
@@ -377,6 +543,10 @@ class IntradayReboundDetector:
         buy_rate10 = self._money_rate(point, 10.0)
         buy_rate30 = self._money_rate(point, 30.0)
         spread_bps, microprice_edge_bps = self._book_metrics(point)
+        # ★[S03-LANE2 2026-08-06] 매수 방법 공유 관문 — 매도 감속 + 매수 가속 + 매수 우위
+        #   (1레인 급행과 동일)가 이 순간 확인돼야만 산다. 닷새 전수 근거는 config 주석 참조.
+        if not self._sell_decel_buy_flip(point):
+            return self._row(point, "WAIT", "NO_SELL_DECEL_BUY_FLIP")
         # ★[2026-07-31 친구님 지시 "먼저 있던 것은 폐기해야 돼"] 8겹 관문 중
         #   '확인 조건' 5개를 폐기한다(FLOW_GATES_OFF=YES 가 기본).
         #   폐기 대상: 진입대금 1천만원 · 매수체결비중 · 매수대금비중 · 30초 매수흐름 ·
@@ -435,7 +605,7 @@ class IntradayReboundDetector:
         row = self._row(
             point,
             "BUY_READY",
-            "INTRADAY_CRASH+LOW_STABLE+EXACT_BUY_DOMINANCE+BOOK_CONFIRM",
+            "INTRADAY_CRASH+LOW_STABLE+EXACT_SHORT_BUY_DOMINANCE+BOOK_CONFIRM",
         )
         row["anchor_id"] = (
             f"{state.high_ts.isoformat(timespec='seconds') if state.high_ts else ''}:"

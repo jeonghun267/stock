@@ -7,7 +7,7 @@ import os
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -94,6 +94,8 @@ class Strategy02Tests(unittest.TestCase):
         sell_money_cum: float = 300_000_000,
         cum_vol: float = 1_000,
         che_str: float = 110,
+        buy_vol_cum: float = 700_000,
+        sell_vol_cum: float = 300_000,
     ) -> MarketPoint:
         return MarketPoint(
             ts=ts.replace(tzinfo=None),
@@ -104,6 +106,8 @@ class Strategy02Tests(unittest.TestCase):
             bid_tot=2_000,
             buy_money_cum=buy_money_cum,
             sell_money_cum=sell_money_cum,
+            buy_vol_cum=buy_vol_cum,
+            sell_vol_cum=sell_vol_cum,
             best_ask_px=best_ask_px,
             best_bid_px=best_bid_px,
             best_ask_qty=best_ask_qty,
@@ -140,6 +144,46 @@ class Strategy02Tests(unittest.TestCase):
         stale["updated_at"] = (self.now - timedelta(seconds=20)).isoformat()
         self.assertEqual(
             select_fresh_signals(stale, now=self.now, max_age_sec=5), [])
+
+    def test_flow_book_shadow_never_enters_live_signal_list(self) -> None:
+        monitor = LowBuySignalMonitor()
+        anchor_ts = self.now.replace(tzinfo=None) - timedelta(seconds=10)
+
+        def detected(points):
+            point = points[-1]
+            return BottomSignal(
+                algorithm="PRO_FLOW_BOOK_EXHAUSTION",
+                signal_ts=point.ts,
+                signal_price=point.price,
+                anchor_low_ts=anchor_ts,
+                anchor_low_price=10_000,
+                wave_count=2,
+                reason="FLOW_BOOK_RECOVERED",
+            )
+
+        with patch(
+            "strategy_02_low_buy_signal_v1.detect_flow_book_exhaustion",
+            side_effect=detected,
+        ), patch.object(
+            LowBuySignalMonitor, "_detect_dip_rebound", return_value=None,
+        ):
+            shadow_rows = []
+            for sec in range(3):
+                _, fired = monitor.process_point(
+                    "123456",
+                    "TEST",
+                    self.point(self.now + timedelta(seconds=sec)),
+                    open_price=10_500,
+                    session_high=10_500,
+                )
+                self.assertFalse(fired)
+                shadow_rows.extend(monitor.drain_flow_book_shadow_signals())
+
+        self.assertEqual(monitor.signals, [])
+        self.assertEqual(len(shadow_rows), 1)
+        self.assertEqual(shadow_rows[0]["action"], "SHADOW_READY")
+        self.assertEqual(shadow_rows[0]["mode"], "SHADOW_ORDER_ZERO")
+        self.assertEqual(shadow_rows[0]["provenance"], "[HYPOTHETICAL]")
 
     @patch("strategy_02_low_buy_signal_v1.SIX_STYLE", False)
     def test_signal_monitor_latches_same_anchor(self) -> None:
@@ -235,7 +279,7 @@ class Strategy02Tests(unittest.TestCase):
             row, fired = monitor.process_point("123456", "TEST", point)
         self.assertFalse(fired)
         self.assertEqual(row["reason"], "EXACT_TOPBOOK_REQUIRED")
-    def test_s02_uses_open_before_0920_and_intraday_high_afterward(self) -> None:
+    def test_s02_uses_open_before_0930_and_intraday_high_afterward(self) -> None:
         morning = LowBuySignalMonitor()
         morning_start = self.now.replace(hour=9, minute=10)
         morning.process_point(
@@ -265,7 +309,7 @@ class Strategy02Tests(unittest.TestCase):
         )
         intraday.process_point(
             "123456", "TEST",
-            self.point(intraday_start + timedelta(seconds=30), price=10_670),
+            self.point(intraday_start + timedelta(seconds=30), price=10_450),
             open_price=10_000,
             session_high=11_000,
         )
@@ -274,7 +318,7 @@ class Strategy02Tests(unittest.TestCase):
         self.assertEqual(intraday_state.six_episode_high, 11_000)
         self.assertEqual(intraday_state.six_phase, "CHASE")
 
-    def test_open_drop_at_4pct_permanently_hands_off_to_s03_s06(self) -> None:
+    def test_morning_open_drop_at_4pct_stays_in_strategy_02(self) -> None:
         monitor = LowBuySignalMonitor()
         observed_at = self.now.replace(hour=9, minute=10)
         row, fired = monitor.process_point(
@@ -284,10 +328,10 @@ class Strategy02Tests(unittest.TestCase):
             session_high=10_000,
         )
         self.assertFalse(fired)
-        self.assertEqual(row["reason"], "OPEN_DROP_LE_4PCT_HANDOFF_S03_S06")
+        self.assertEqual(row["reason"], "S02_MONEY_SURGE_OR_STAIRCASE_WAIT")
         state = monitor.states["123456"]
-        self.assertTrue(state.handoff_to_s03_s06)
-        self.assertEqual(state.six_phase, "DONE")
+        self.assertFalse(state.handoff_to_s03_s06)
+        self.assertEqual(state.six_phase, "CHASE")
         recovered, recovered_fired = monitor.process_point(
             "123456", "TEST",
             self.point(observed_at + timedelta(seconds=30), price=9_800),
@@ -296,9 +340,12 @@ class Strategy02Tests(unittest.TestCase):
         )
         self.assertFalse(recovered_fired)
         self.assertEqual(
-            recovered["reason"], "OPEN_DROP_LE_4PCT_HANDOFF_S03_S06")
+            recovered["reason"], "S02_MONEY_SURGE_OR_STAIRCASE_WAIT")
     def test_s06_staircase_resets_new_low_during_observe(self) -> None:
         monitor = LowBuySignalMonitor()
+        # 09:30 이후에는 확정된 강화값(-5%)이 적용되므로, 이 시험은
+        # 아침 -3% 계단 경로에서 "관찰 중 새 저점 리셋"만 검증한다.
+        base = self.now.replace(hour=9, minute=0)
         sequence = [
             (0, 10_000, 1_000, 1_000),
             (20, 9_900, 1_100, 2_000),
@@ -311,11 +358,12 @@ class Strategy02Tests(unittest.TestCase):
             _, fired = monitor.process_point(
                 "123456", "TEST",
                 self.point(
-                    self.now + timedelta(seconds=sec),
+                    base + timedelta(seconds=sec),
                     price=price,
                     buy_money_cum=buy_cum,
                     sell_money_cum=sell_cum,
                 ),
+                open_price=10_000,
             )
             self.assertFalse(fired)
         state = monitor.states["123456"]
@@ -324,22 +372,30 @@ class Strategy02Tests(unittest.TestCase):
         self.assertEqual(state.six_reset_steps, 2)
         self.assertIsNone(state.six_observe_since)
 
+    # ★[2026-08-07] 이 시험이 잠그는 것은 '흐름 가속이 있어야 신호가 나간다' 하나다.
+    #   여기 표본은 저점을 한 번도 갈아치우지 않아(dip_low_reset_steps=0) 8/7 에 생긴
+    #   저점리셋 관문에 걸린다. 시험의 뜻을 지키려고 그 관문만 국소로 끈다.
+    #   저점리셋 관문 자체는 바로 아래 test_low_reset_gate_* 두 건이 잠근다.
+    @patch("strategy_02_low_buy_signal_v1.MIN_LOW_RESET_STEPS", 0)
     def test_s06_staircase_full_retest_emits_only_after_flow_acceleration(self) -> None:
         monitor = LowBuySignalMonitor()
         sequence = [
-            (0, 10_000, 1_000, 1_000),
-            (20, 9_900, 1_100, 2_000),
-            (40, 9_700, 1_200, 3_000),
-            (50, 9_600, 1_300, 4_000),
-            (60, 9_500, 1_400, 5_000),
-            (65, 9_643, 1_600, 5_100),
-            (85, 9_595, 1_900, 5_200),
-            (105, 9_600, 2_200, 5_300),
-            (115, 9_610, 2_400, 5_400),
-            (125, 9_643, 3_000, 5_450),
+            (0, 10_000, 0, 0, 1_000, 90, 0, 0),
+            (20, 9_900, 100_000, 1_000_000, 1_100, 85, 100, 1_000),
+            (40, 9_700, 200_000, 3_000_000, 1_200, 80, 200, 3_000),
+            (50, 9_600, 300_000, 4_500_000, 1_300, 75, 300, 4_500),
+            (60, 9_500, 400_000, 6_000_000, 1_400, 70, 400, 6_000),
+            (65, 9_643, 600_000, 6_100_000, 1_450, 72, 600, 6_100),
+            (85, 9_595, 800_000, 6_300_000, 1_470, 73, 800, 6_300),
+            (105, 9_600, 1_000_000, 8_000_000, 1_500, 74, 1_000, 8_000),
+            (110, 9_610, 1_500_000, 8_500_000, 1_550, 75, 1_200, 8_500),
+            (115, 9_615, 2_000_000, 9_000_000, 1_600, 76, 1_500, 9_000),
+            (120, 9_620, 3_000_000, 9_400_000, 1_700, 78, 2_500, 9_400),
+            (125, 9_643, 13_000_000, 9_800_000, 2_200, 80, 5_000, 9_800),
+            (126, 9_644, 16_000_000, 9_900_000, 2_400, 82, 5_500, 9_900),
         ]
         fired_rows = []
-        for sec, price, buy_cum, sell_cum in sequence:
+        for sec, price, buy_cum, sell_cum, cum_vol, che_str, buy_vol, sell_vol in sequence:
             row, fired = monitor.process_point(
                 "123456", "TEST",
                 self.point(
@@ -347,6 +403,10 @@ class Strategy02Tests(unittest.TestCase):
                     price=price,
                     buy_money_cum=buy_cum,
                     sell_money_cum=sell_cum,
+                    cum_vol=cum_vol,
+                    che_str=che_str,
+                    buy_vol_cum=buy_vol,
+                    sell_vol_cum=sell_vol,
                 ),
             )
             if fired:
@@ -356,22 +416,116 @@ class Strategy02Tests(unittest.TestCase):
         self.assertEqual(row["action"], "BUY_READY")
         self.assertEqual(row["algorithm"], "S02_S06_STAIRCASE_RETEST_V1")
         self.assertEqual(row["anchor_low"], 9_500)
-        self.assertEqual(row["dip_low_reset_steps"], 2)
+        self.assertEqual(row["dip_low_reset_steps"], 0)
         self.assertEqual(row["dip_flow_flip"], "O")
         self.assertEqual(row["flow_accel"], "O")
+        self.assertEqual(row["low_confirm_ticks"], 2)
+        self.assertLess(row["low_confirm_che_str"], 105)
+        self.assertGreater(
+            row["low_confirm_che_str"], row["low_confirm_low_che_str"])
+        self.assertEqual(row["low_confirm_flow_turn"], "O")
+        self.assertGreaterEqual(row["dip_drop_pct"], 5.0)
         self.assertGreaterEqual(row["observe_sec"], 60)
         self.assertGreaterEqual(row["entry_gap_pct"], 1.0)
         self.assertLessEqual(row["entry_gap_pct"], 2.0)
 
+    # ★[저점리셋 관문 잠금 2026-08-07 친구님 지시 "하락할 때 양봉 튀어나오는 거 걸러내기"]
+    #   저점이 한두 번밖에 안 깨졌는데 튀어 오른 양봉은 사지 않는다.
+    #   위 시험과 완전히 같은 표본(리셋 0회)을 쓴다 — 관문만 켜면 신호가 사라져야 한다.
+    #   이 두 건이 함께 있어야 '관문이 실제로 일한다'가 증명된다(하나는 켬/하나는 끔).
+    def _staircase_retest_sequence(self):
+        return [
+            (0, 10_000, 0, 0, 1_000, 90, 0, 0),
+            (20, 9_900, 100_000, 1_000_000, 1_100, 85, 100, 1_000),
+            (40, 9_700, 200_000, 3_000_000, 1_200, 80, 200, 3_000),
+            (50, 9_600, 300_000, 4_500_000, 1_300, 75, 300, 4_500),
+            (60, 9_500, 400_000, 6_000_000, 1_400, 70, 400, 6_000),
+            (65, 9_643, 600_000, 6_100_000, 1_450, 72, 600, 6_100),
+            (85, 9_595, 800_000, 6_300_000, 1_470, 73, 800, 6_300),
+            (105, 9_600, 1_000_000, 8_000_000, 1_500, 74, 1_000, 8_000),
+            (110, 9_610, 1_500_000, 8_500_000, 1_550, 75, 1_200, 8_500),
+            (115, 9_615, 2_000_000, 9_000_000, 1_600, 76, 1_500, 9_000),
+            (120, 9_620, 3_000_000, 9_400_000, 1_700, 78, 2_500, 9_400),
+            (125, 9_643, 13_000_000, 9_800_000, 2_200, 80, 5_000, 9_800),
+            (126, 9_644, 16_000_000, 9_900_000, 2_400, 82, 5_500, 9_900),
+        ]
+
+    def _run_staircase(self):
+        monitor = LowBuySignalMonitor()
+        fired = []
+        for sec, price, buy_cum, sell_cum, cum_vol, che, buy_v, sell_v in (
+                self._staircase_retest_sequence()):
+            row, hit = monitor.process_point(
+                "123456", "TEST",
+                self.point(self.now + timedelta(seconds=sec), price=price,
+                           buy_money_cum=buy_cum, sell_money_cum=sell_cum,
+                           cum_vol=cum_vol, che_str=che,
+                           buy_vol_cum=buy_v, sell_vol_cum=sell_v))
+            if hit:
+                fired.append(row)
+        return fired
+
+    @patch("strategy_02_low_buy_signal_v1.MIN_LOW_RESET_STEPS", 4)
+    def test_low_reset_gate_blocks_shallow_reset_bounce(self) -> None:
+        """리셋 0회짜리 반등은 관문이 막는다 = 하락 중 튀어 오른 양봉을 안 산다."""
+        self.assertEqual(self._run_staircase(), [])
+
+    @patch("strategy_02_low_buy_signal_v1.MIN_LOW_RESET_STEPS", 0)
+    def test_low_reset_gate_off_restores_signal(self) -> None:
+        """관문을 끄면(롤백 경로) 같은 표본이 다시 신호를 낸다 = 막은 주체가 이 관문이다."""
+        fired = self._run_staircase()
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(fired[0]["dip_low_reset_steps"], 0)
+
     def test_money_surge_onset_fires_at_first_bull_candle_start(self) -> None:
         monitor = LowBuySignalMonitor()
         sequence = [
+            (0, 10_000, 0, 0, 1_000, 90, 0, 0),
+            (5, 9_900, 500_000, 1_000_000, 1_100, 85, 100, 500),
+            (10, 9_700, 1_000_000, 3_000_000, 1_200, 78, 200, 1_200),
+            (15, 9_500, 1_500_000, 5_000_000, 1_300, 70, 300, 2_200),
+            (20, 9_550, 16_500_000, 6_000_000, 2_300, 80, 2_300, 2_300),
+            (21, 9_560, 20_000_000, 6_200_000, 2_500, 82, 2_600, 2_320),
+        ]
+        fired_rows = []
+        for sec, price, buy_cum, sell_cum, cum_vol, che_str, buy_vol, sell_vol in sequence:
+            row, fired = monitor.process_point(
+                "123456", "TEST",
+                self.point(
+                    self.now + timedelta(seconds=sec),
+                    price=price,
+                    best_ask_px=price + 1,
+                    best_bid_px=price,
+                    buy_money_cum=buy_cum,
+                    sell_money_cum=sell_cum,
+                    cum_vol=cum_vol,
+                    che_str=che_str,
+                    buy_vol_cum=buy_vol,
+                    sell_vol_cum=sell_vol,
+                ),
+            )
+            if fired:
+                fired_rows.append(row)
+        self.assertEqual(len(fired_rows), 1)
+        row = fired_rows[0]
+        self.assertEqual(row["algorithm"], "S02_MONEY_SURGE_ONSET_V1")
+        self.assertEqual(row["anchor_low"], 9_500)
+        self.assertGreaterEqual(row["dip_drop_pct"], 5.0)
+        self.assertEqual(row["surge_confirm_ticks"], 2)
+        self.assertLess(row["surge_che_str"], 105)
+        self.assertEqual(row["surge_flow_turn"], "O")
+        self.assertLessEqual(row["surge_turn_sec"], 10)
+        self.assertGreaterEqual(row["surge_recent_buy_rate_5s"], 1_666_667)
+
+    def test_entry_does_not_arm_above_minus_five_percent(self) -> None:
+        monitor = LowBuySignalMonitor()
+        sequence = [
             (0, 10_000, 0, 0, 1_000, 100),
-            (5, 9_950, 500_000, 1_000_000, 1_100, 95),
-            (10, 9_850, 1_000_000, 3_000_000, 1_200, 92),
-            (15, 9_700, 1_500_000, 5_000_000, 1_300, 90),
-            (20, 9_750, 16_500_000, 6_000_000, 2_300, 115),
-            (21, 9_760, 20_000_000, 6_200_000, 2_500, 118),
+            (5, 9_900, 500_000, 1_000_000, 1_100, 95),
+            (10, 9_700, 1_000_000, 3_000_000, 1_200, 92),
+            (15, 9_510, 1_500_000, 5_000_000, 1_300, 90),
+            (20, 9_560, 16_500_000, 6_000_000, 2_300, 115),
+            (21, 9_570, 20_000_000, 6_200_000, 2_500, 118),
         ]
         fired_rows = []
         for sec, price, buy_cum, sell_cum, cum_vol, che_str in sequence:
@@ -390,13 +544,8 @@ class Strategy02Tests(unittest.TestCase):
             )
             if fired:
                 fired_rows.append(row)
-        self.assertEqual(len(fired_rows), 1)
-        row = fired_rows[0]
-        self.assertEqual(row["algorithm"], "S02_MONEY_SURGE_ONSET_V1")
-        self.assertEqual(row["anchor_low"], 9_700)
-        self.assertEqual(row["surge_confirm_ticks"], 2)
-        self.assertLessEqual(row["surge_turn_sec"], 10)
-        self.assertGreaterEqual(row["surge_recent_buy_rate_5s"], 1_666_667)
+        self.assertEqual(fired_rows, [])
+        self.assertEqual(monitor.states["123456"].surge_phase, "IDLE")
 
     def test_money_surge_onset_rejects_slow_drop(self) -> None:
         monitor = LowBuySignalMonitor()
@@ -466,7 +615,7 @@ class Strategy02Tests(unittest.TestCase):
                 written = _write_json_atomic(path, {"status": "LIVE"})
 
             self.assertFalse(written)
-            self.assertEqual(replace_mock.call_count, 3)
+            self.assertEqual(replace_mock.call_count, 6)
 
     def test_s02_signal_routes_to_common_rotation_engine(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -533,7 +682,21 @@ class Strategy02Tests(unittest.TestCase):
             self.assertTrue(
                 broker.submissions[0]["idempotency_key"].startswith("strategy02:"))
 
-    def test_s02_flow_reversal_holds_when_ma10_and_ma20_support(self) -> None:
+    def test_s02_ma10_ma20_alone_no_longer_blocks_exit(self) -> None:
+        """★[RISING-HOLD 단일화 2026-08-05] 잠금 시험 — 지우기 전에 읽을 것.
+
+        종전 이름: test_s02_flow_reversal_holds_when_ma10_and_ma20_support.
+        그때는 `ma10_support and ma20_rising` 만으로 상승보유(HOLD)를 줬고 이
+        시험이 그 동작을 시험했다. 그 가지는 매수세를 안 봐서, 8/3 에 만든
+        2단 판정(선 지지 AND 매수세 우위 = daily_ma_permit)을 우회했다.
+        8/5 실전 감사기록 — S02 상승보유 434회 중 196회(45.2%)가 그 가지였고
+        그중 192회(98.0%)가 매도세>매수세인 순간이었다.
+        지금은 daily_ma_permit 하나만 상승보유를 준다.
+
+        아래 대본은 매도세 우위(매수 100 / 매도 180)에 흐름역전 신호까지 켜진
+        상태다. 이때 COMMON_RISING_HOLD 가 다시 나오면 그 가지가 되살아난
+        것이므로 이 시험이 터진다.
+        """
         engine = UnifiedHoldSellEngine()
         state = HoldSellState(
             position_id="s02-support",
@@ -559,12 +722,50 @@ class Strategy02Tests(unittest.TestCase):
                 daily_ma5_broken=True,
                 ma10_support=True,
                 ma20_rising=True,
+                common_peak_flow_ready=True,
             ),
         )
-        self.assertEqual(decision.action, HoldSellAction.HOLD)
-        self.assertEqual(decision.reason, "S02_MA10_MA20_SUPPORT_HOLD")
+        self.assertNotEqual(
+            decision.reason, "COMMON_RISING_HOLD",
+            "ma10/ma20 만으로 상승보유가 다시 켜졌다 — 우회 가지가 되살아났다",
+        )
 
-    def test_s02_shadow_round_trip_exits_before_hard_stop_on_flow_reversal(self) -> None:
+        # 반대쪽도 함께 잠근다: 매수세 우위까지 확인된 daily_ma_permit 이면
+        # 상승보유는 종전대로 나와야 한다(①을 실수로 같이 없애지 않았는지).
+        permitted = engine.evaluate(
+            HoldSellState(
+                position_id="s02-support-permit",
+                strategy_id=StrategyId.S02_LOW_BUY_SELL_EXHAUSTION,
+                code="123456",
+                quantity=1,
+                entry_price="100",
+                entry_at=self.now,
+            ),
+            HoldSellObservation(
+                observed_at=self.now + timedelta(seconds=20),
+                price="99.2",
+                buy_money_per_sec_10s="100",
+                sell_money_per_sec_10s="180",
+                buy_volume_per_sec_5s="100",
+                sell_volume_per_sec_5s="200",
+                sell_volume_per_sec_previous_10s="100",
+                che_str="90",
+                che_str_change_5s="-10",
+                one_minute_bull_to_bear=True,
+                daily_ma5_broken=True,
+                ma10_support=True,
+                ma20_rising=True,
+                common_peak_flow_ready=True,
+                daily_ma_permit=True,
+            ),
+        )
+        self.assertEqual(permitted.action, HoldSellAction.HOLD)
+        self.assertEqual(
+            permitted.reason, "COMMON_RISING_HOLD",
+            "daily_ma_permit(선 지지 AND 매수세 우위) 상승보유까지 사라졌다",
+        )
+
+    def test_s02_ma20_defense_holds_shallow_loss_but_not_hard_stop(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             base = build_config()
@@ -667,6 +868,8 @@ class Strategy02Tests(unittest.TestCase):
                 (21, 10_020, 36_500_000, 46_000_000, 2_700, 3_800, 92),
                 (22, 10_020, 37_000_000, 50_000_000, 2_750, 4_100, 91),
                 (23, 10_020, 37_500_000, 54_000_000, 2_800, 4_400, 90),
+                # MA10 지지 중 약한 역전은 확정값 6초를 채운 뒤 매도한다.
+                (24, 10_020, 38_000_000, 58_000_000, 2_850, 4_700, 89),
             ]
             for sec, price, buy_money, sell_money, buy_vol, sell_vol, strength in sequence:
                 observed_at = write_market(
@@ -674,11 +877,21 @@ class Strategy02Tests(unittest.TestCase):
                     buy_vol, sell_vol, strength, sec >= 15)
                 engine.tick(observed_at)
 
+            active = engine._active_positions()
+            self.assertIn("123456", active)
+            self.assertFalse(active["123456"]["hold_state"]["sell_latched"])
+
+            # 20선 방어는 얕은 손실만 보유한다. -2% 보험선은 항상 우선한다.
+            hard_stop_at = write_market(
+                25, 9_890, 38_500_000, 62_000_000,
+                2_900, 5_000, 88, True,
+            )
+            engine.tick(hard_stop_at)
             self.assertEqual(engine._active_positions(), {})
             trade = engine.state["history"][-1]
-            self.assertIn("S02_FLOW_REVERSAL_EXIT", trade["exit_reason"])
-            self.assertGreater(trade["gross_return_pct"], -2.0)
-            self.assertEqual(trade["exit_price"], 10_020)
+            self.assertIn("HARD_STOP", trade["exit_reason"])
+            self.assertLessEqual(trade["gross_return_pct"], -2.0)
+            self.assertEqual(trade["exit_price"], 9_890)
             self.assertTrue(all(
                 row.get("side") == "BUY" for row in broker.submissions))
             self.assertFalse(broker.real_session)
@@ -704,7 +917,9 @@ class Strategy02Tests(unittest.TestCase):
             self.assertEqual(broker.submit(
                 side="BUY", code="123456", quantity=1,
                 idempotency_key="test:no-approval"), "SHADOW")
-            approval.write_text("APPROVED", encoding="utf-8")
+            approval.write_text(
+                f"APPROVED_BY_OWNER {datetime.now():%Y%m%d %H:%M:%S}\n",
+                encoding="ascii")
             self.assertTrue(broker.real_session)
             self.assertFalse(broker.buy_allowed)
             self.assertEqual(broker.submit(
@@ -716,9 +931,11 @@ class Strategy02Tests(unittest.TestCase):
         config = build_config()
         self.assertEqual(config.strategy_id, StrategyId.S02_LOW_BUY_SELL_EXHAUSTION)
         self.assertEqual(config.strategy_slug, "strategy02")
-        # ★[2026-08-01] 09:30 → 09:06 — 신호기 창과 불일치 수리(8/1 점검 발견 1)에 맞춰 갱신.
-        self.assertEqual(config.entry_start.isoformat(), "09:06:00")
+        # 아침 시가 -3% 조건과 동일하게 주문기도 09:00부터 연다.
+        self.assertEqual(config.entry_start.isoformat(), "09:00:00")
         self.assertEqual(config.entry_end.isoformat(), "14:20:00")
+        # ★[2026-08-06 친구님 지시 "QTY 2주 원래대로 1주로 돌려줘"] 2 -> 1.
+        self.assertEqual(config.quantity, 1)
         self.assertEqual(config.max_daily_codes, 15)
         self.assertEqual(config.max_cycles_per_code, 2)
         self.assertEqual(config.rotation_capital_krw, 2_000_000)

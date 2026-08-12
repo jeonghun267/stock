@@ -5,15 +5,21 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 RUN_DIR = Path(__file__).resolve().parents[1] / "RUN"
 if str(RUN_DIR) not in sys.path:
     sys.path.insert(0, str(RUN_DIR))
 
-from strategy_06_crash_low_chase_v1 import Config, Strategy06Engine  # noqa: E402
+from strategy_06_crash_low_chase_v1 import (  # noqa: E402
+    ChaseState,
+    Config,
+    Strategy06Engine,
+)
 
 KST = ZoneInfo("Asia/Seoul")
 CODE = "123450"
@@ -47,6 +53,7 @@ class ChaseMachineTest(unittest.TestCase):
             manual_buy_block_path=base / "block.flag",
             lock_path=base / "engine.lock",
             live_requested=False,
+            early_entry_cap_pct=0.0,
         )
         write_json(self.config.watch_path, {
             "codes": [CODE], "crown_codes": [CODE],
@@ -88,7 +95,13 @@ class ChaseMachineTest(unittest.TestCase):
     def pos(self, n: int = 1) -> dict:
         return self.engine._positions().get(f"{CODE}:{n}")
 
-    def test_universe_uses_only_core_codes_in_existing_order(self) -> None:
+    def test_universe_covers_all_high_range_with_crown_first(self) -> None:
+        """★[UNIVERSE-FIX 2026-08-06] 대상은 고저폭30 전체 · crown 은 우선순위일 뿐.
+
+        종전 시험은 'crown 만 본다'를 못박고 있었다. 그 동작 때문에 8/6 에
+        crown=1종목이라 -8% 급락 3건이 전부 감시 밖이었다(파일 상단 8/1 승인
+        설계는 "대상: 그날의 고저폭30"). 되돌리면 이 시험이 깨진다.
+        """
         other = "654320"
         write_json(self.config.watch_path, {
             "codes": [other, CODE],
@@ -97,8 +110,123 @@ class ChaseMachineTest(unittest.TestCase):
             "source_stale": False,
         })
         codes, block = self.engine._universe(self.now)
-        self.assertEqual(codes, [CODE])
+        self.assertEqual(codes, [CODE, other])   # crown 먼저, 그다음 나머지
         self.assertEqual(block, "")
+
+    def test_universe_keeps_watching_when_crown_is_empty(self) -> None:
+        """crown 이 비어도 고저폭 목록 전체는 계속 본다(종전엔 통째로 멈췄다)."""
+        other = "654320"
+        write_json(self.config.watch_path, {
+            "codes": [other, CODE],
+            "crown_codes": [],
+            "crown_priority_codes": [],
+            "for_date": self.today,
+            "source_stale": False,
+        })
+        codes, block = self.engine._universe(self.now)
+        self.assertEqual(sorted(codes), sorted([CODE, other]))
+        self.assertEqual(block, "")
+
+    def test_common_quantity_and_slot_limit(self) -> None:
+        # ★[QTY 2026-08-06 친구님 지시 "원래대로 1주"] 8/5 의 2주 전환을 되돌렸다.
+        self.assertEqual(self.config.quantity, 1)
+        self.assertEqual(self.config.max_slots, 6)
+
+    def test_live_entry_acquires_and_releases_common_slot(self) -> None:
+        class Broker:
+            real_session = True
+            buy_allowed = True
+            mode = "LIVE"
+            last_error = ""
+
+            def __init__(self):
+                self.submissions = []
+
+            def holdings(self):
+                return {}
+
+            def open_orders(self, code, *, buy):
+                return {}
+
+            def submit(self, **kwargs):
+                self.submissions.append(kwargs)
+                return "OK"
+
+        class Slots:
+            def __init__(self):
+                self.acquired = []
+                self.released = []
+
+            def acquire(self, code, owner, day):
+                self.acquired.append((code, owner, day))
+                return True
+
+            def release(self, code, day):
+                self.released.append((code, day))
+
+        broker = Broker()
+        slots = Slots()
+        self.engine.broker = broker
+        self.engine.slots = slots
+        chase = ChaseState(low=19_700, low_at=self.now.isoformat())
+        point = {
+            "price": 20_000,
+            "ts": self.now,
+            "che_str": 100.0,
+            "buy_money_cum": 1_000.0,
+            "sell_money_cum": 500.0,
+        }
+        write_json(self.config.snapshot_path, {"codes": {CODE: {
+            "cur": 20_000,
+            "ts": self.now.isoformat(),
+        }}})
+        with patch(
+            "strategy_06_crash_low_chase_v1.ma3_rows",
+            return_value={"ma5": 1.0},
+        ), patch(
+            "strategy_06_crash_low_chase_v1.kst_now",
+            return_value=self.now,
+        ):
+            result = self.engine._try_entry(
+                CODE, "TEST", point, chase, self.now)
+
+        self.assertEqual(result, "BOUGHT")
+        state_day = str(self.engine.state["date"])
+        self.assertEqual(slots.acquired, [(CODE, "S06_CRASH_LOW_CHASE", state_day)])
+        position = self.pos()
+        self.assertTrue(position["slot_reserved"])
+        # ★[QTY 2026-08-06 친구님 지시 "원래대로 1주"] 8/5 의 2주 전환을 되돌렸다.
+        self.assertEqual(position["pending"]["requested_qty"], 1)
+        position["phase"] = "FAILED"
+        self.engine._cleanup_terminal()
+        self.assertEqual(slots.released, [(CODE, state_day)])
+
+    def test_first_rebound_enters_one_share_inside_early_band(self) -> None:
+        self.engine.config = replace(
+            self.config,
+            early_entry_cap_pct=1.8,
+        )
+        self.feed(price=20_000, hr_low=20_000)
+        self.feed(price=18_200, hr_low=18_200)
+        self.feed(price=18_480, hr_low=18_200)  # +1.538%: early entry
+
+        position = self.pos(1)
+        self.assertIsNotNone(position)
+        self.assertEqual(position["phase"], "HOLD")
+        self.assertEqual(position["qty"], 1)
+        self.assertEqual(position["entry_reason"], "FIRST_REBOUND_EARLY_ENTRY")
+
+    def test_first_rebound_above_early_band_keeps_legacy_observe(self) -> None:
+        self.engine.config = replace(
+            self.config,
+            early_entry_cap_pct=1.8,
+        )
+        self.feed(price=20_000, hr_low=20_000)
+        self.feed(price=18_200, hr_low=18_200)
+        self.feed(price=18_530, hr_low=18_200)  # +1.813%, below absolute 2%
+
+        self.assertEqual(self.chase()["phase"], "OBSERVE")
+        self.assertEqual(self.engine._positions(), {})
 
     def test_universe_puts_min12_priority_core_first(self) -> None:
         core_b = "111110"
@@ -114,16 +242,9 @@ class ChaseMachineTest(unittest.TestCase):
         self.assertEqual(codes, [CODE, core_a2, core_b])
         self.assertEqual(block, "")
 
-    def test_universe_blocks_entries_when_core_is_empty(self) -> None:
-        write_json(self.config.watch_path, {
-            "codes": [CODE],
-            "crown_codes": [],
-            "for_date": self.today,
-            "source_stale": False,
-        })
-        codes, block = self.engine._universe(self.now)
-        self.assertEqual(codes, [])
-        self.assertEqual(block, "CORE_WATCHLIST_EMPTY")
+    # ★[UNIVERSE-FIX 2026-08-06] 종전의 test_universe_blocks_entries_when_core_is_empty
+    #   (crown 이 비면 감시를 통째로 멈춘다)는 새 동작과 정면으로 어긋나 제거했다.
+    #   대체 시험은 위 test_universe_keeps_watching_when_crown_is_empty.
 
     def first_entry_setup(self) -> None:
         """-9% 저점까지 매도 우위 흐름을 만든다."""
@@ -331,13 +452,16 @@ class ChaseMachineTest(unittest.TestCase):
     def test_next_morning_rising_ma_holds_after_peak_pullback(self) -> None:
         position = self.buy_shadow()
         entry = float(position["entry_price"])
-        self.set_rising_ma(entry)
         peak_at = datetime(2026, 8, 4, 9, 2, 0, tzinfo=KST)
-        self.snap(entry * 1.10, peak_at, buy_cum=1000, sell_cum=1000)
-        self.engine._evaluate_exit(position, peak_at)
         pullback_at = datetime(2026, 8, 4, 9, 5, 0, tzinfo=KST)
-        self.snap(entry * 1.0835, pullback_at, buy_cum=1100, sell_cum=1400)
-        self.engine._evaluate_exit(position, pullback_at)
+        with patch(
+            "strategy_06_crash_low_chase_v1.ma3_rider_permit",
+            return_value=True,
+        ):
+            self.snap(entry * 1.10, peak_at, buy_cum=1000, sell_cum=1000)
+            self.engine._evaluate_exit(position, peak_at)
+            self.snap(entry * 1.0835, pullback_at, buy_cum=1100, sell_cum=1400)
+            self.engine._evaluate_exit(position, pullback_at)
         self.assertEqual(position["phase"], "HOLD")
         self.assertTrue(position["morning_daily_ma_permit"])
 

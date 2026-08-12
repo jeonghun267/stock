@@ -667,6 +667,12 @@ def _broker_request_se(req_type: str, extra: dict = None,
     }
     if extra:
         req.update(extra)
+    if req_type in ("ACCOUNT_INFO", "BALANCE_TR"):
+        try:
+            from ipc_order_auth_v1 import sign_order_request
+            req = sign_order_request(req)
+        except Exception:
+            return None
     req_path = _BROKER_IPC_REQ_DIR_SE / f"{request_id}.json"
     res_path = _BROKER_IPC_RES_DIR_SE / f"{request_id}.json"
     try:

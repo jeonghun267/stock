@@ -31,10 +31,17 @@ class MarketPoint:
     bid_tot: float
     buy_money_cum: float
     sell_money_cum: float
+    buy_vol_cum: float = -1.0
+    sell_vol_cum: float = -1.0
     best_ask_px: float = 0.0
     best_bid_px: float = 0.0
     best_ask_qty: float = 0.0
     best_bid_qty: float = 0.0
+    # ★[DAY-LOW 2026-08-05] 거래소가 주는 당일 저가/고가(브로커 FID 18/17).
+    #   왜 — 전략이 자기가 본 틱으로 저점을 만들면 장중 재기동 때 그 시점부터
+    #   다시 시작해 엉뚱한 값이 된다. 안 실리면 0(=모름).
+    broker_day_low: float = 0.0
+    broker_day_high: float = 0.0
 
 
 @dataclass(frozen=True)

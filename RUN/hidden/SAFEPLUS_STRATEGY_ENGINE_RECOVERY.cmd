@@ -10,3 +10,5 @@ start "" /min cmd /c C:\stock_bot\RUN\hidden\SAFEPLUS_STRATEGY01_LIVE.cmd
 start "" /min cmd /c C:\stock_bot\RUN\hidden\SAFEPLUS_STRATEGY02_LIVE.cmd
 start "" /min cmd /c C:\stock_bot\RUN\hidden\SAFEPLUS_STRATEGY03_LIVE_ASCII.cmd
 start "" /min cmd /c C:\stock_bot\RUN\hidden\SAFEPLUS_STRATEGY04_LIVE.cmd
+start "" /min cmd /c C:\stock_bot\RUN\hidden\SAFEPLUS_STRATEGY05_RECOVERY.cmd
+start "" /min cmd /c C:\stock_bot\RUN\hidden\SAFEPLUS_STRATEGY06_RECOVERY.cmd

@@ -111,7 +111,7 @@ print()
 print("[5] 계좌 마스킹")
 MASK_CASES = [
     ("0000000000", "0000**"),   # 테스트용 더미 계좌 — 뒷자리 전부 가려짐
-    ("6502", "0000**"),
+    ("1234", "1234**"),         # [SEC 2026-08-06] 실계좌 앞자리 하드코딩 제거 + 기대값 수정
     ("650", "**"),
     ("", "**"),
     (None, "**"),
@@ -362,4 +362,9 @@ print(f"  {'PASS' if ok else 'FAIL'}  jsonl 쓰고 되읽기 {len(_EVT_SINK)}건
 print()
 print("=" * 78)
 print(f"결과: {'전부 통과' if fail == 0 else str(fail) + '건 실패'}")
-sys.exit(1 if fail else 0)
+# [SEC 2026-08-06] 모듈 수준 sys.exit 가 pytest 수집을 통째로 중단시켰다.
+#   이 파일은 test_* 함수가 없는 독립 검증 '스크립트'라 스크립트로 직접 돌릴 때만
+#   종료코드를 낸다. pytest import 시엔 __name__ != "__main__" 이라 SystemExit 없이
+#   지나가고, 수집할 test 함수도 없어 조용히 0건 수집된다.
+if __name__ == "__main__":
+    sys.exit(1 if fail else 0)

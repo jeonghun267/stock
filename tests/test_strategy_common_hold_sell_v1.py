@@ -416,7 +416,7 @@ class UnifiedHoldSellEngineTests(unittest.TestCase):
         self.assertEqual(third.action, HoldSellAction.SELL)
         self.assertIn("FLOW_WEAK+STRUCTURE_BREAK", third.reason)
 
-    def test_profit_trail_uses_current_2_percent_band(self):
+    def test_standard_profile_does_not_use_price_only_profit_trail(self):
         state = self.state(StrategyId.RAID)
         self.engine.evaluate(state, self.observation(kst(10, 0), price="102"))
         # ★[2026-07-30] 꼭지점 매도 판정 주기 180초 도입 — 1초 뒤에는 판정하지 않는다.
@@ -430,8 +430,8 @@ class UnifiedHoldSellEngineTests(unittest.TestCase):
             self.observation(kst(10, 3, 1), price="100.47"),
         )
         self.assertEqual(state.peak_stage, PeakStage.PROFIT_2)
-        self.assertEqual(decision.action, HoldSellAction.SELL)
-        self.assertIn("PROFIT_TRAIL", decision.reason)
+        self.assertEqual(decision.action, HoldSellAction.HOLD)
+        self.assertNotIn("PROFIT_TRAIL", decision.reason)
 
     @unittest.skip("매도 보류 동작은 동일(HOLD). 사유 라벨만 FLOW_HEALTHY→HOLD_RIDING 으로 변경됨")
     def test_profit_trail_money_guard_keeps_holding(self):

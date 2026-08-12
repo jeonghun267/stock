@@ -7,7 +7,7 @@ import logging
 import sys
 import tempfile
 import unittest
-from datetime import timedelta, time as day_time
+from datetime import datetime, timedelta, time as day_time
 from decimal import Decimal
 from pathlib import Path
 
@@ -263,9 +263,7 @@ class IndependentStrategyTests(unittest.TestCase):
             state,
             HoldSellObservation(
                 observed_at=self.now + timedelta(seconds=1),
-                # [2026-07-29 친구님 승인] 공통 하드손절 -2.0% -> -3.0% 로 상향.
-                # -2.0% 는 이제 조기추세이탈(EARLY_TREND_EXIT)이 먼저 잡는다.
-                price=Decimal("9700"),
+                price=Decimal("9800"),
             ),
         )
         self.assertTrue(decision.should_sell)
@@ -273,7 +271,9 @@ class IndependentStrategyTests(unittest.TestCase):
 
     def test_live_adapter_off_flag_blocks_buy_but_keeps_exit_session(self) -> None:
         config = self.config(live=True)
-        config.approval_path.write_text("APPROVED", encoding="ascii")
+        config.approval_path.write_text(
+            f"APPROVED_BY_OWNER {datetime.now():%Y%m%d %H:%M:%S}\n",
+            encoding="ascii")
         config.off_flag_path.write_text("OFF", encoding="ascii")
         adapter = StrategyBroker(
             live_requested=True,

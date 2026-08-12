@@ -9,6 +9,7 @@ import argparse
 import csv
 import json
 import os
+import sys
 import time as time_module
 from collections import deque
 from dataclasses import asdict, dataclass, field
@@ -180,7 +181,7 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
-def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -190,13 +191,18 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     # ★[2026-07-29 친구님 승인 "재시도 패치"] 읽는 쪽이 파일을 잡은 순간 os.replace가
     #   WinError 5(접근거부)로 죽어 신호기 전체 정지(7/29 11:29 실제 사고·마감까지 낡은 신호로 운행).
     #   최초 1회 + 0.2초 간격 재시도 3회. 그래도 실패면 종전대로 예외(원인 은폐 방지). 롤백: 루프 제거.
-    for _attempt in range(4):
+    for _attempt in range(6):
         try:
             os.replace(temporary, path)
-            return
-        except PermissionError:
-            if _attempt == 3:
-                raise
+            return True
+        except PermissionError as exc:
+            if _attempt == 5:
+                print(
+                    f"ATOMIC_WRITE_RETRY_EXHAUSTED_CONTINUING path={path} error={exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False
             time_module.sleep(0.2)
 
 
@@ -942,14 +948,15 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
             [code for code in leaders if code in eligible] + armed_codes
         ))
         if watch_codes != last_watch_codes:
-            _write_json_atomic(config.watch_path, {
+            watch_saved = _write_json_atomic(config.watch_path, {
                 "schema": "strategy_05_base_watch_v1",
                 "for_date": day,
                 "ts": now.isoformat(timespec="seconds"),
                 "codes": watch_codes,
                 "order_capability": 0,
             })
-            last_watch_codes = watch_codes
+            if watch_saved:
+                last_watch_codes = watch_codes
 
         names = _name_map(_read_json(config.names_path))
         snapshot = _read_json(config.snapshot_path)
@@ -989,13 +996,15 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
             "signals": monitor.signals[-1000:],
             "candidates": list(monitor.latest.values()),
         }
-        _write_json_atomic(config.output_path, payload)
+        if not _write_json_atomic(config.output_path, payload):
+            print(f"SIGNAL_OUTPUT_STALE_CONTINUING path={config.output_path}", file=sys.stderr, flush=True)
         if bars_completed or last_state_save != now.strftime("%Y%m%d%H%M"):
-            _write_json_atomic(
+            state_saved = _write_json_atomic(
                 config.state_path,
                 monitor.state_payload(now, codes=watch_codes),
             )
-            last_state_save = now.strftime("%Y%m%d%H%M")
+            if state_saved:
+                last_state_save = now.strftime("%Y%m%d%H%M")
         _append_events(
             config.event_dir / f"strategy_05_signals_{now:%Y%m%d}.csv",
             new_signals,

@@ -29,6 +29,72 @@ from strategy_01_open_surge_buy_v1 import (
 
 KST = ZoneInfo("Asia/Seoul")
 
+EARLY_ENTRY_STAGE = "EARLY_FLOW"
+STRONG_ENTRY_STAGE = "STRONG_FLOW"
+EARLY_REBOUND_MIN_PCT = 1.0
+EARLY_REBOUND_MAX_PCT = 1.5
+STRONG_REBOUND_MIN_PCT = 1.5
+STRONG_REBOUND_MAX_PCT = 2.5
+SURGE_RECENT_SEC = 5.0
+SURGE_PREVIOUS_SEC = 10.0
+SURGE_MIN_BUY_RATE = 1_666_667.0
+SURGE_BUY_ACCEL_MULT = 2.5
+SURGE_BUY_OVER_SELL_MULT = 1.5
+SURGE_MIN_VOLUME_RATE = 50.0
+SURGE_VOLUME_ACCEL_MULT = 2.0
+SURGE_MIN_CHE_STR = 105.0
+SURGE_MIN_CHE_RISE = 5.0
+SURGE_CONFIRM_TICKS = 2
+# ★[2026-08-10] 시가 위 강세 종목은 실주문에 바로 연결하지 않고 별도 그림자로만 기록한다.
+ABOVE_OPEN_REBREAK_SHADOW = (
+    os.environ.get("S01_ABOVE_OPEN_REBREAK_SHADOW", "YES").strip().upper()
+    in {"YES", "Y", "1", "TRUE", "ON"}
+)
+
+# ★[2026-08-06 친구님 지시 "1·2가 매매 방법은 같지만 매수 깊이만 서로 다른 거야"]
+#   1번의 '저점 찾는 법'을 2번 모듈에 맡기는 다리.
+#   판정을 베끼지 않는다 — 2번 모듈을 그대로 부른다. 2번이 바뀌면 1번도 자동으로 따라간다.
+#   같은 방식으로 재생기(replay_buy_method_v1.py)가 8/6 실제 신호 4건을 소수점까지 재현했다.
+#
+#   같아지는 것 : 저점 찾는 법(죽은저점·재무장·60초 관찰·속도역전·1차반등 1.0/추격상한 2.0)
+#   그대로인 것 : 매수 깊이 띠(-3%~+3%) · 시간대(09:00~09:20) · 슬롯 · 매도 · 감사기록
+#
+# ★[2026-08-10 배선 결함 수정]
+#   기본값을 NO 로 되돌린다. S01 은 -3% 보다 깊으면 S02 영역으로 넘기는데,
+#   연결된 S02 판정기는 아침에 시가 대비 최소 -3% 하락부터 추적을 시작한다.
+#   두 관문의 교집합이 사실상 -3% 한 점뿐이라 S01 신호가 구조적으로 막혔다.
+#   S01 기본 동작은 자체 5~10초 흐름 확인 + EARLY/STRONG 2단계 진입이다.
+#   S02 다리는 비교 실험용으로만 남긴다.
+#   실험 켜기: setx S01_USE_S02_LOWFIND YES   (프로세스 재기동 후 적용)
+USE_S02_LOWFIND = (
+    os.environ.get("S01_USE_S02_LOWFIND", "NO").strip().upper()
+    in {"YES", "Y", "1", "TRUE", "ON"}
+)
+
+
+def _load_s02():
+    """2번 판정기와 그 입력형을 늦게 불러온다(꺼져 있으면 아예 안 부른다)."""
+    from 저점매수_매도소진 import MarketPoint  # noqa: E402
+    import strategy_02_low_buy_signal_v1 as S02  # noqa: E402
+    return MarketPoint, S02
+
+
+def _to_market_point(point: ShadowPoint, market_point_cls):
+    """1번 틱을 2번 틱으로 옮겨 담는다. 값을 새로 만들지 않고 그대로 옮기기만 한다."""
+    return market_point_cls(
+        ts=point.ts,
+        price=point.price,
+        cum_vol=point.cum_vol,
+        che_str=point.che_str,
+        ask_tot=point.ask_tot,
+        bid_tot=point.bid_tot,
+        buy_money_cum=point.buy_money_cum,
+        sell_money_cum=point.sell_money_cum,
+        buy_vol_cum=point.buy_vol_cum,
+        sell_vol_cum=point.sell_vol_cum,
+    )
+SURGE_CONFIRM_MAX_GAP_SEC = 2.0
+
 
 @dataclass(frozen=True)
 class ShadowConfig:
@@ -66,6 +132,8 @@ class ShadowPoint:
     buy_money_cum: float
     sell_money_cum: float
     exact_flow: bool
+    che_str: float = 0.0
+    cum_vol: float = 0.0
     theme_leader: bool = False
     open_hint: float = 0.0
     board_fresh: bool = True
@@ -73,6 +141,13 @@ class ShadowPoint:
     book_bid_share: float = 0.0
     spread_bps: float = 0.0
     microprice_edge_bps: float = 0.0
+    # ★[2026-08-06] 2번 저점찾기에 넘기려고 실어 나른다. 스냅샷엔 원래 있던 값이고
+    #   1번 자신의 판정에는 안 쓴다(기본값을 두어 종전 동작은 그대로다).
+    #   거래량 누적은 '모르면 -1.0' 이 2번의 규약이다(없으면 그 조건을 통과시킨다).
+    ask_tot: float = 0.0
+    bid_tot: float = 0.0
+    buy_vol_cum: float = -1.0
+    sell_vol_cum: float = -1.0
 
 
 @dataclass(frozen=True)
@@ -82,6 +157,8 @@ class Sample:
     buy_money_cum: float
     sell_money_cum: float
     exact_flow: bool
+    che_str: float
+    cum_vol: float
 
 
 @dataclass
@@ -97,6 +174,15 @@ class CodeState:
     last_ts: datetime | None = None
     emission_count: int = 0
     ready_latched: bool = False
+    emitted_stages: set[str] = field(default_factory=set)
+    early_confirm_hits: int = 0
+    early_last_confirm_ts: datetime | None = None
+    above_open_peak: float = 0.0
+    above_open_pullback_low: float = 0.0
+    above_open_pullback_seen: bool = False
+    above_open_confirm_hits: int = 0
+    above_open_last_confirm_ts: datetime | None = None
+    above_open_shadow_emitted: bool = False
     samples: Deque[Sample] = field(default_factory=lambda: deque(maxlen=45))
 
 
@@ -266,12 +352,22 @@ def _to_point(
         money_speed_5s=_safe_float(money.get("money_speed_5s")),
         money_speed_30s=_safe_float(money.get("money_speed_30s")),
         buy_money_cum=buy_cum, sell_money_cum=sell_cum,
-        exact_flow=exact, open_hint=opens.get(code, 0.0),
+        # ★[공통배관 2026-08-07 친구님 "전 전략이 다 같이 써야 돼"]
+        #   분봉 시가가 없으면 거래소 시가(스냅샷 op = FID 16, 8/4 배선 통로)로 메운다.
+        #   분봉 값이 있으면 종전 그대로 — 비교 기준선 보존.
+        exact_flow=exact, open_hint=opens.get(code, 0.0) or _safe_float(raw.get("op")),
+        che_str=_safe_float(raw.get("che_str")),
+        cum_vol=_safe_float(raw.get("cum_vol")),
         board_fresh=board_fresh,
         order_book_fresh=order_book_fresh,
         book_bid_share=book_bid_share,
         spread_bps=spread_bps,
         microprice_edge_bps=microprice_edge_bps,
+        # ★[2026-08-06] 2번 저점찾기용. 스냅샷에 이미 있던 열을 그대로 옮긴다.
+        ask_tot=_safe_float(raw.get("ask_tot")),
+        bid_tot=_safe_float(raw.get("bid_tot")),
+        buy_vol_cum=_safe_float(raw.get("buy_vol_cum"), -1.0),
+        sell_vol_cum=_safe_float(raw.get("sell_vol_cum"), -1.0),
     )
 
 def _book_telemetry(
@@ -317,6 +413,14 @@ class OpenSurgeShadowMonitor:
         self.states: Dict[str, CodeState] = {}
         self.latest: Dict[str, Dict[str, Any]] = {}
         self.signals: list[Dict[str, Any]] = []
+        self.shadow_signals: list[Dict[str, Any]] = []
+        self._pending_shadow_signals: list[Dict[str, Any]] = []
+        # ★[2026-08-06] 2번 저점찾기를 쓸 때만 만든다. 종목마다 판정기 하나씩.
+        self._s02_cls = None
+        self._s02_mod = None
+        self._s02_monitors: Dict[str, Any] = {}
+        if USE_S02_LOWFIND:
+            self._s02_cls, self._s02_mod = _load_s02()
 
     def restore_emitted(self, payload: Mapping[str, Any], today: str) -> None:
         if str(payload.get("date") or "") != today:
@@ -329,12 +433,24 @@ class OpenSurgeShadowMonitor:
                     state.emission_count,
                     int(row.get("signal_sequence") or state.emission_count + 1),
                 )
+                stage = str(row.get("entry_stage") or "")
+                if stage:
+                    state.emitted_stages.add(stage)
+                else:
+                    state.emitted_stages.update(
+                        {EARLY_ENTRY_STAGE, STRONG_ENTRY_STAGE})
                 self.signals.append(dict(row))
         for row in payload.get("candidates") or []:
             code = str(row.get("code") or "").zfill(6)
             if code:
                 state = self.states.setdefault(code, CodeState())
                 state.ready_latched = str(row.get("action") or "") == "BUY_READY"
+        for row in payload.get("shadow_signals") or []:
+            code = str(row.get("code") or "").zfill(6)
+            if code:
+                state = self.states.setdefault(code, CodeState())
+                state.above_open_shadow_emitted = True
+                self.shadow_signals.append(dict(row))
 
     def process_points(self, points: Iterable[ShadowPoint]) -> list[Dict[str, Any]]:
         new_signals = []
@@ -387,6 +503,14 @@ class OpenSurgeShadowMonitor:
             buy_ratio, rising_sec, flow_observation_sec,
             float(decision.gap_pct), decision.priority_bonus,
         )
+        if ABOVE_OPEN_REBREAK_SHADOW:
+            self._track_above_open_rebreak_shadow(point, state, row)
+        if USE_S02_LOWFIND:
+            return self._process_with_s02_lowfind(point, state, row, decision)
+        if getattr(self.strategy, "staged_entries", False):
+            return self._process_staged_entry(
+                point, state, row, decision.action is BuyAction.BUY_READY,
+            )
         ready = decision.action is BuyAction.BUY_READY
         fired = (
             ready
@@ -398,6 +522,277 @@ class OpenSurgeShadowMonitor:
             row["signal_sequence"] = state.emission_count
         state.ready_latched = ready
         return row, fired
+
+    def drain_shadow_signals(self) -> list[Dict[str, Any]]:
+        rows = self._pending_shadow_signals
+        self._pending_shadow_signals = []
+        return rows
+
+    # ★[2026-08-06] 1번의 '구조 관문'에서 걸린 사유들. 여기서 걸리면 2번에게 사도 되냐고
+    #   물어보지도 않는다. 이 목록의 마지막이 깊이 띠(DIP_TOO_DEEP_S02_ZONE)이고,
+    #   그 뒤의 사유들(반등·추격·돈흐름)이 바로 2번이 대신할 '저점 찾는 법'이다.
+    S01_GATE_STOP_REASONS = frozenset({
+        "OUTSIDE_ENTRY_WINDOW", "UNIVERSE_BLOCK", "NOT_IN_OPENING_POOL",
+        "PRICE_BELOW_10000", "DAY_LOW_NOT_READY", "DIP_TOO_DEEP_S02_ZONE",
+    })
+
+    def _process_with_s02_lowfind(self, point, state, row, decision):
+        """저점 찾기를 2번 모듈에 맡긴다(친구님: 방법은 같고 깊이만 다르다).
+
+        1번의 관문(시간창·유니버스·가격·갭·깊이 띠)은 그대로 건다.
+        2번에게는 매 틱을 빠짐없이 먹인다 — 저점 추적이 끊기면 죽은저점·재무장이 망가진다.
+        다만 관문을 통과한 틱에서만 신호를 허용한다(allow_signal).
+        """
+        gate_ok = decision.reason not in self.S01_GATE_STOP_REASONS
+        mon = self._s02_monitors.get(point.code)
+        if mon is None:
+            mon = self._s02_mod.LowBuySignalMonitor()
+            self._s02_monitors[point.code] = mon
+        s02_row, hit = mon.process_point(
+            point.code, point.name, _to_market_point(point, self._s02_cls),
+            allow_signal=gate_ok,
+            # 1번 창(09:00~09:20)은 전부 09:30 이전이라 2번은 '시가 기준'으로 판정한다.
+            # 같은 값을 두 곳에 주면 재현이 깨진다(재생기에서 확인한 사고).
+            open_price=state.open_price,
+            session_high=state.high_so_far,
+        )
+        s02_row = s02_row or {}
+        row["s02_lowfind"] = "Y"
+        row["s02_gate_ok"] = "Y" if gate_ok else "N"
+        row["s02_reason"] = str(s02_row.get("reason") or "")
+        row["s02_anchor_low"] = s02_row.get("anchor_low")
+        if not hit or state.emission_count >= self.max_signals_per_code:
+            return row, False
+        state.emission_count += 1
+        row.update({
+            "action": BuyAction.BUY_READY.value,
+            "reason": "S02_LOWFIND_CONFIRMED",
+            "entry_stage": "S02_LOWFIND",
+            "requested_quantity": 1,
+            "signal_sequence": state.emission_count,
+        })
+        return row, True
+
+    def _track_above_open_rebreak_shadow(
+        self, point: ShadowPoint, state: CodeState, row: Dict[str, Any],
+    ) -> None:
+        """시가 위 첫 되밀림 뒤 재돌파를 기록만 한다. 실주문 신호는 만들지 않는다."""
+        row["above_open_rebreak"] = "TRACKING"
+        if (
+            point.ts.time() < time(9, 0)
+            or point.ts.time() >= time(9, 20)
+            or state.open_price <= 0
+            or state.low_so_far < state.open_price
+            or state.above_open_shadow_emitted
+        ):
+            row["above_open_rebreak"] = "INELIGIBLE"
+            return
+
+        if state.above_open_peak <= 0:
+            state.above_open_peak = max(state.open_price, point.price)
+            return
+
+        if not state.above_open_pullback_seen:
+            if point.price > state.above_open_peak:
+                state.above_open_peak = point.price
+                return
+            advance_pct = (
+                (state.above_open_peak / state.open_price - 1.0) * 100.0
+            )
+            # 기존 EARLY 하한(1%)을 그대로 써서 새 퍼센트 문턱을 만들지 않는다.
+            if advance_pct >= EARLY_REBOUND_MIN_PCT and point.price < state.above_open_peak:
+                state.above_open_pullback_seen = True
+                state.above_open_pullback_low = point.price
+                row["above_open_rebreak"] = "PULLBACK_SEEN"
+            return
+
+        state.above_open_pullback_low = min(
+            state.above_open_pullback_low or point.price, point.price)
+        row["above_open_peak"] = round(state.above_open_peak, 4)
+        row["above_open_pullback_low"] = round(state.above_open_pullback_low, 4)
+        if point.price < state.above_open_peak:
+            state.above_open_confirm_hits = 0
+            state.above_open_last_confirm_ts = None
+            row["above_open_rebreak"] = "WAIT_REBREAK"
+            return
+
+        if not self._surge_flow_ready(state, point):
+            state.above_open_confirm_hits = 0
+            state.above_open_last_confirm_ts = None
+            row["above_open_rebreak"] = "REBREAK_FLOW_WAIT"
+            return
+
+        if (
+            state.above_open_last_confirm_ts is None
+            or (point.ts - state.above_open_last_confirm_ts).total_seconds()
+            > SURGE_CONFIRM_MAX_GAP_SEC
+        ):
+            state.above_open_confirm_hits = 1
+        else:
+            state.above_open_confirm_hits += 1
+        state.above_open_last_confirm_ts = point.ts
+        row["above_open_confirm_hits"] = state.above_open_confirm_hits
+        if state.above_open_confirm_hits < SURGE_CONFIRM_TICKS:
+            row["above_open_rebreak"] = "REBREAK_CONFIRM_WAIT"
+            return
+
+        state.above_open_shadow_emitted = True
+        row["above_open_rebreak"] = "SHADOW_READY"
+        shadow = row.copy()
+        shadow.update({
+            "action": "SHADOW_READY",
+            "reason": "ABOVE_OPEN_REBREAK_CONFIRMED",
+            "entry_stage": "ABOVE_OPEN_REBREAK_SHADOW",
+            "requested_quantity": 0,
+            "mode": "SHADOW_ORDER_ZERO",
+        })
+        self.shadow_signals.append(shadow)
+        self._pending_shadow_signals.append(shadow)
+
+    def _process_staged_entry(
+        self,
+        point: ShadowPoint,
+        state: CodeState,
+        row: Dict[str, Any],
+        strong_flow_ready: bool,
+    ) -> tuple[Dict[str, Any], bool]:
+        rebound_pct = (
+            (point.price / state.low_so_far - 1.0) * 100.0
+            if state.low_so_far > 0 else 0.0
+        )
+        stage = ""
+        if (
+            STRONG_ENTRY_STAGE not in state.emitted_stages
+            and EARLY_ENTRY_STAGE not in state.emitted_stages
+            and self._early_flow_ready(state, point, rebound_pct)
+        ):
+            stage = EARLY_ENTRY_STAGE
+            row["reason"] = "MONEY_SURGE_ONSET"
+        elif (
+            STRONG_ENTRY_STAGE not in state.emitted_stages
+            and strong_flow_ready
+            and STRONG_REBOUND_MIN_PCT <= rebound_pct <= STRONG_REBOUND_MAX_PCT
+        ):
+            stage = STRONG_ENTRY_STAGE
+            row["reason"] = "STRONG_FLOW_CONFIRMED"
+
+        if not stage or state.emission_count >= self.max_signals_per_code:
+            return row, False
+        state.emission_count += 1
+        state.emitted_stages.add(stage)
+        row.update({
+            "action": BuyAction.BUY_READY.value,
+            "entry_stage": stage,
+            "requested_quantity": 1,
+            "signal_sequence": state.emission_count,
+        })
+        return row, True
+
+    @classmethod
+    def _early_flow_ready(
+        cls, state: CodeState, point: ShadowPoint, rebound_pct: float,
+    ) -> bool:
+        dip_pct = (
+            (state.low_so_far / state.open_price - 1.0) * 100.0
+            if state.open_price > 0 else 0.0
+        )
+        if (
+            # ★[2026-08-06 친구님 지시 "1번은 -3~3%까지, 2번은 -3% 이하"] 부등호를 뒤집었다.
+            #   종전 `> -3.0` 은 "-3% 보다 깊어야 통과" 였다 = 2번과 같은 구간.
+            #   짝: strategy_01_open_surge_buy_v1.py 의 min_dip_pct 조건. 반드시 같이 간다.
+            dip_pct < -3.0
+            # ★[2026-08-10] EARLY_FLOW가 본 판정을 우회하지 못하게 같은 무눌림 관문을 둔다.
+            or dip_pct >= 0.0
+            or not EARLY_REBOUND_MIN_PCT <= rebound_pct <= EARLY_REBOUND_MAX_PCT
+            or not point.order_book_fresh
+        ):
+            state.early_confirm_hits = 0
+            state.early_last_confirm_ts = None
+            return False
+        if not cls._surge_flow_ready(state, point):
+            state.early_confirm_hits = 0
+            state.early_last_confirm_ts = None
+            return False
+        if (
+            state.early_last_confirm_ts is None
+            or (point.ts - state.early_last_confirm_ts).total_seconds()
+            > SURGE_CONFIRM_MAX_GAP_SEC
+        ):
+            state.early_confirm_hits = 1
+        else:
+            state.early_confirm_hits += 1
+        state.early_last_confirm_ts = point.ts
+        return state.early_confirm_hits >= SURGE_CONFIRM_TICKS
+
+    @classmethod
+    def _surge_flow_ready(cls, state: CodeState, point: ShadowPoint) -> bool:
+        rates = cls._surge_window_rates(state)
+        if rates is None:
+            return False
+        (
+            recent_buy, recent_sell, recent_volume,
+            previous_buy, previous_volume, prior_che,
+        ) = rates
+        return (
+            recent_buy >= SURGE_MIN_BUY_RATE
+            and recent_buy >= previous_buy * SURGE_BUY_ACCEL_MULT
+            and recent_buy >= recent_sell * SURGE_BUY_OVER_SELL_MULT
+            and recent_volume >= SURGE_MIN_VOLUME_RATE
+            and recent_volume >= previous_volume * SURGE_VOLUME_ACCEL_MULT
+            and point.che_str >= SURGE_MIN_CHE_STR
+            and point.che_str - prior_che >= SURGE_MIN_CHE_RISE
+        )
+
+    @staticmethod
+    def _surge_window_rates(
+        state: CodeState,
+    ) -> tuple[float, float, float, float, float, float] | None:
+        points = list(state.samples)
+        if len(points) < 3:
+            return None
+        end = points[-1]
+        recent_target = end.ts.timestamp() - SURGE_RECENT_SEC
+        previous_target = recent_target - SURGE_PREVIOUS_SEC
+
+        def at_or_before(target: float) -> Sample | None:
+            return next(
+                (row for row in reversed(points) if row.ts.timestamp() <= target),
+                None,
+            )
+
+        recent_start = at_or_before(recent_target)
+        previous_start = at_or_before(previous_target)
+        tolerance = max(2.0, SURGE_RECENT_SEC * 0.4)
+        if recent_start is None or previous_start is None:
+            return None
+        if (
+            recent_target - recent_start.ts.timestamp() > tolerance
+            or previous_target - previous_start.ts.timestamp() > tolerance
+        ):
+            return None
+        recent_span = (end.ts - recent_start.ts).total_seconds()
+        previous_span = (recent_start.ts - previous_start.ts).total_seconds()
+        if recent_span <= 0 or previous_span <= 0:
+            return None
+        deltas = (
+            end.buy_money_cum - recent_start.buy_money_cum,
+            end.sell_money_cum - recent_start.sell_money_cum,
+            end.cum_vol - recent_start.cum_vol,
+            recent_start.buy_money_cum - previous_start.buy_money_cum,
+            recent_start.cum_vol - previous_start.cum_vol,
+        )
+        if min(deltas) < 0:
+            return None
+        return (
+            deltas[0] / recent_span,
+            deltas[1] / recent_span,
+            deltas[2] / recent_span,
+            deltas[3] / previous_span,
+            deltas[4] / previous_span,
+            recent_start.che_str,
+        )
+
+
 
     @staticmethod
     def _update_state(state: CodeState, point: ShadowPoint) -> None:
@@ -411,6 +806,8 @@ class OpenSurgeShadowMonitor:
         elif point.price < state.low_so_far:
             state.low_so_far = point.price
             state.low_time = point.ts.strftime("%H:%M:%S")
+            state.early_confirm_hits = 0
+            state.early_last_confirm_ts = None
         if state.last_ts is not None:
             if point.price > state.last_price and state.rise_since is None:
                 state.rise_since = state.last_ts
@@ -420,6 +817,7 @@ class OpenSurgeShadowMonitor:
         state.samples.append(Sample(
             point.ts, point.price, point.buy_money_cum,
             point.sell_money_cum, point.exact_flow,
+            point.che_str, point.cum_vol,
         ))
         cutoff = point.ts.timestamp() - 35.0
         while state.samples and state.samples[0].ts.timestamp() < cutoff:
@@ -477,6 +875,8 @@ class OpenSurgeShadowMonitor:
             "buy_ratio": round(buy_ratio, 4),
             "money_speed_5s": round(point.money_speed_5s, 1),
             "money_speed_30s": round(point.money_speed_30s, 1),
+            "che_str": round(point.che_str, 2),
+            "cum_vol": round(point.cum_vol, 0),
             "rising_sec": round(rising_sec, 1),
             "flow_observation_sec": round(flow_observation_sec, 1),
             "order_book_fresh": point.order_book_fresh,
@@ -584,6 +984,7 @@ class ShadowRuntime:
         points, status, watch_count, range_meta = load_live_points(
             self.config, now)
         signals = self.monitor.process_points(points)
+        shadow_signals = self.monitor.drain_shadow_signals()
         for _code, _row in self.monitor.latest.items():
             if isinstance(_row, dict):
                 _row.update(range_meta.get(str(_code).zfill(6)) or {})
@@ -599,6 +1000,7 @@ class ShadowRuntime:
             "watch_count": watch_count,
             "point_count": len(points),
             "signals": self.monitor.signals,
+            "shadow_signals": self.monitor.shadow_signals,
             "candidates": list(self.monitor.latest.values()),
         }
         _atomic_text(self.config.output_path, json.dumps(
@@ -606,6 +1008,11 @@ class ShadowRuntime:
         _atomic_text(self.config.html_path, _html_board(payload))
         event_path = self.config.event_dir / f"strategy_01_open_surge_signal_{now:%Y%m%d}.csv"
         _append_events(event_path, signals)
+        shadow_path = (
+            self.config.event_dir
+            / f"strategy_01_above_open_rebreak_shadow_{now:%Y%m%d}.csv"
+        )
+        _append_events(shadow_path, shadow_signals)
         return payload
 
 

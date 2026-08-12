@@ -125,13 +125,21 @@ Response: `{"data": {"screen_no": "...", "code_list": "...", "fid_list": "...", 
 
 `code="ALL"` 시 화면 전체 해제 + `broker_state.json` 갱신.
 
-### 10. `SET_REAL_REMOVE_ALL` — SetRealRemove("ALL","ALL") 단축
+### 10. `SET_REAL_REMOVE_ALL` — SetRealRemove("ALL","ALL") 단축 🔒**서명 필수**
 
 | Request | Response |
 |---|---|
-| `{"type": "SET_REAL_REMOVE_ALL"}` | `{"data": {"removed": "ALL"}}` |
+| `{"type": "SET_REAL_REMOVE_ALL"}` + 서명 필드 | `{"data": {"removed": "ALL"}}` |
 
 `broker_state.json` 전체 초기화.
+
+★[IPC-AUTH-SCOPE 2026-08-04] **`SENDORDER_REAL` 과 같은 HMAC 서명이 없으면 거부된다**
+(`ipc_order_auth_v1.PROTECTED_TYPES`). `BrokerClient` 를 쓰면 자동으로 서명되므로
+호출 코드는 바뀔 게 없다. 요청 파일을 손으로 만들어 넣는 경로만 막힌다.
+
+이유: 브로커를 살려 둔 채 전 종목 실시간만 끊는 명령이라, 하트비트·프리징을 보는
+워치독이 절대 못 잡는다. 그 사이 전 전략이 손절·트레일까지 눈이 먼 채로 돈다.
+거부 시 로그 표식은 `[SEC-REALREMOVE-AUTH]`.
 
 ### 11. `GET_COMM_REAL_DATA` — GetCommRealData 단건 풀
 

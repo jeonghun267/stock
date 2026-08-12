@@ -43,6 +43,7 @@ from 골짜기_급반등 import (
     RapidReboundMonitor,
     SignalConfig,
     load_live_points,
+    load_prior_profile_universe,
     _minute_opens,
 )
 
@@ -97,6 +98,26 @@ class Strategy03RapidReboundTests(unittest.TestCase):
             previous_range_pct=8.0,
             previous_close_position=0.7,
         )
+
+    def test_prior_profile_universe_loads_multiple_dates_in_one_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "eod.csv"
+            path.write_text(
+                "date,code,open,high,low,close,value\n"
+                "20260809,123456,100,120,90,110,1000\n"
+                "20260810,123456,110,130,100,120,2000\n"
+                "20260810,654321,200,230,180,220,3000\n",
+                encoding="utf-8",
+            )
+
+            universe = load_prior_profile_universe(
+                path,
+                source_dates={"20260809", "20260810"},
+            )
+
+        self.assertEqual(len(universe), 3)
+        self.assertEqual(universe[("20260810", "123456")].previous_close, 120)
+        self.assertEqual(universe[("20260810", "654321")].previous_value, 3000)
 
     def point(
         self,
@@ -282,30 +303,38 @@ class Strategy03RapidReboundTests(unittest.TestCase):
         self.assertGreater(rows[-1]["drop_from_open_pct"], -8.0)
         self.assertLessEqual(rows[-1]["drop_from_open_pct"], -4.0)
 
-    def test_exact_minus_8_hands_off_to_s06_and_restore_keeps_it(self) -> None:
+    def test_below_minus_8_keeps_chasing_and_old_restore_does_not_block(self) -> None:
+        """★[S03-EXPRESS 2026-08-06 친구님 지시 "09:20까지만 급락을 잡고 이후는 6번"]
+        -8% S06 인계 폐지 — 창 안에서는 깊이 제한 없이 신저점을 계속 쫓는다.
+        옛 저장분(인계 사유)을 복원해도 추적이 막히지 않는다.
+        근거: 8/6 씨어스(458870) 인계 구멍 — S06 감시망에 없어 아무도 저점을 못 잡았다."""
         detector = RapidReboundDetector()
-        detector.feed(
+        armed = detector.feed(
             self.point(0, 10_050, 0, 0, ask_px=10_060, bid_px=10_050,
                        ask_qty=100, bid_qty=80),
             self.profile,
             allow_signal=True,
         )
-        handoff = detector.feed(
+        self.assertEqual(armed["action"], "ARMED")
+        deep = detector.feed(
             self.point(1, 9_660, 0, 100, ask_px=9_670, bid_px=9_660,
                        ask_qty=100, bid_qty=80),
             self.profile,
-            allow_signal=False,
+            allow_signal=True,
         )
-        self.assertEqual(handoff["action"], "DONE")
-        self.assertEqual(handoff["reason"], "OPEN_DROP_LE_8PCT_HANDOFF_S06")
+        self.assertEqual(deep["action"], "RESET")
+        self.assertEqual(deep["reason"], "NEW_LOW_STAIRCASE_RESET")
+        deeper = detector.feed(
+            self.point(2, 9_000, 0, 200, ask_px=9_010, bid_px=9_000,
+                       ask_qty=100, bid_qty=80),
+            self.profile,
+            allow_signal=True,
+        )
+        self.assertEqual(deeper["reason"], "NEW_LOW_STAIRCASE_RESET")
 
         rebound = self.point(
-            2, 9_700, 50, 120,
+            3, 9_700, 50, 120,
             ask_px=9_710, bid_px=9_700, ask_qty=80, bid_qty=100)
-        still_handoff = detector.feed(
-            rebound, self.profile, allow_signal=True)
-        self.assertEqual(still_handoff["reason"], "OPEN_DROP_LE_8PCT_HANDOFF_S06")
-
         monitor = RapidReboundMonitor()
         monitor.restore({
             "schema": SIGNAL_SCHEMA,
@@ -320,7 +349,8 @@ class Strategy03RapidReboundTests(unittest.TestCase):
         restored, fired = monitor.process_point(
             "123456", "TEST", rebound, self.profile, allow_signal=True)
         self.assertFalse(fired)
-        self.assertEqual(restored["reason"], "OPEN_DROP_LE_8PCT_HANDOFF_S06")
+        self.assertNotEqual(restored["reason"], "OPEN_DROP_LE_8PCT_HANDOFF_S06")
+        self.assertEqual(restored["action"], "ARMED")
 
     def test_minute_open_requires_today_and_positive_price(self) -> None:
         today = self.now.strftime("%Y%m%d")
@@ -422,8 +452,11 @@ class Strategy03RapidReboundTests(unittest.TestCase):
             buy_money_cum=1_010,
             sell_money_cum=1_860,
         )
-        handoff = detector.feed(not_deep, self.profile, allow_signal=True)
-        self.assertEqual(handoff["reason"], "OPEN_DROP_LE_8PCT_HANDOFF_S06")
+        # ★[S03-EXPRESS 2026-08-06] 종전엔 이 지점(-8.1%)이 인계로 끝났지만,
+        #   인계 폐지 후엔 재무장 규칙이 직접 판정한다 — 1% 더 깊어야 두 번째 기회.
+        second_chance = detector.feed(not_deep, self.profile, allow_signal=True)
+        self.assertEqual(
+            second_chance["reason"], "SECOND_CHANCE_REQUIRES_1PCT_DEEPER_LOW")
 
     def test_contract_accepts_only_one_fresh_s03_signal(self) -> None:
         payload = self.signal_payload()
@@ -614,7 +647,9 @@ class Strategy03RapidReboundTests(unittest.TestCase):
             self.assertEqual(broker.submit(
                 side="BUY", code="123456", quantity=1,
                 idempotency_key="s03:no-approval"), "SHADOW")
-            approval.write_text("APPROVED", encoding="utf-8")
+            approval.write_text(
+                f"APPROVED_BY_OWNER {datetime.now():%Y%m%d %H:%M:%S}\n",
+                encoding="ascii")
             self.assertTrue(broker.real_session)
             self.assertFalse(broker.buy_allowed)
             self.assertEqual(broker.submit(

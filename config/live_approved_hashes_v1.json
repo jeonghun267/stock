@@ -1,0 +1,149 @@
+{
+  "schema": "live_approved_hashes_v1",
+  "approved_at": "2026-08-12T15:46:00+09:00",
+  "approval_scope": "Owner retained the previously approved common capital policy and S02-only entry/WMI-lock changes, and additionally approved prioritizing EOD_GAP opt10032 and realtime registration broker requests ahead of ordinary TR traffic. Existing order, sell, quantity, and all other strategy conditions are unchanged.",
+  "common": [
+    {
+      "path": "RUN/live_owner_approval_guard_v1.py",
+      "sha256": "fb5c91e56450a013d7bc743cbc7d20cfd142d933dead69c95f97d5e97c0007c6"
+    },
+    {
+      "path": "RUN/strategy_all_live_gate_launcher_v1.py",
+      "sha256": "207c6fac481c3faef9e601bdb9a855e6e2a4ee6a39e491351ae2d1f4ad0ff0de"
+    },
+    {
+      "path": "RUN/strategy_all_auto_live_preflight_v1.py",
+      "sha256": "0dac05e6438c93a543ff920b25809ea9e3aa18e69f1d2815215aa1bb0eb015c3"
+    },
+    {
+      "path": "RUN/broker_gateway_v1.py",
+      "sha256": "0b76e4b6bce4dd8a5c2d6336183d8a630680e9a85284e9d80d9484790341b191"
+    },
+    {
+      "path": "RUN/capital_config.py",
+      "sha256": "f634ad673634da858ab122f6afb02634ac143c9ee072ce1ef6344de6e9368bcd"
+    },
+    {
+      "path": "RUN/position_budget.py",
+      "sha256": "e951a52ed0e9b48fa3bd8ce41b0d67398b71b74a623f480467889fc30cc70fad"
+    },
+    {
+      "path": "config/capital.json",
+      "sha256": "3db6b35652b2e366ff8698d2f3d458b2ba07018a5f2bde4e0b97c016c76e7b89"
+    },
+    {
+      "path": "RUN/strategy_common_order_v1.py",
+      "sha256": "f349b47ea63faf1f94ecfc781c7f97ee84674b4f60b7debee5fb4d50de0dcd77"
+    },
+    {
+      "path": "RUN/strategy_01_rotation_engine_v2.py",
+      "sha256": "4780f996089770b66aee2238ce1286b324d6fed9a809f15d9f20fd79d5548392"
+    },
+    {
+      "path": "RUN/strategy_common_hold_sell_v1.py",
+      "sha256": "ebe3ed09581c806e60317fba2feb8cb060dca8eb909ed49b51aa1463619498a3"
+    },
+    {
+      "path": "RUN/strategy_broker_live_guard.py",
+      "sha256": "223d85badc149d91c41496ac9c47e700d0620956b951a700c75229f0cb29b448"
+    },
+    {
+      "path": "RUN/ma3_common_v1.py",
+      "sha256": "41eae320a96b88ea354a8587a8971ad78841c9937114b7df245807f253b93d0a"
+    },
+    {
+      "path": "RUN/shared_slots.py",
+      "sha256": "7a38e8f65af6b7081589ecb7b7d8cf029664b17d5a8534c3f85efe93cf226ab7"
+    }
+  ],
+  "strategies": {
+    "S01": [
+      {
+        "path": "RUN/hidden/SAFEPLUS_STRATEGY01_LIVE.cmd",
+        "sha256": "02032a6da8d6ecee6ffe41c81907896550b75b522dc7c36e582ad5caefaebc52"
+      },
+      {
+        "path": "RUN/hidden/SAFEPLUS_STRATEGY01_SIGNAL.cmd",
+        "sha256": "fa5155ffaf017f34a19d419d40b75850f0419e6dcf1657baa24b01796bdb10ad"
+      },
+      {
+        "path": "RUN/strategy_01_open_surge_signal_v2.py",
+        "sha256": "3d54d8a2cf9354d80f3557d2f78e8b6983fd08860660b73a2810fe2fda7ce337"
+      },
+      {
+        "path": "RUN/strategy_01_open_surge_buy_v1.py",
+        "sha256": "f30245ad32a9d943efb02db7bb9e441545a1d3ade59cb7db39eb485a69b46c6c"
+      },
+      {
+        "path": "RUN/strategy_01_rotation_engine_v2.py",
+        "sha256": "4780f996089770b66aee2238ce1286b324d6fed9a809f15d9f20fd79d5548392"
+      }
+    ],
+    "S02": [
+      {
+        "path": "RUN/hidden/SAFEPLUS_STRATEGY02_LIVE.cmd",
+        "sha256": "ab6a82ba29c75d775567cdcce7396b206b2fe92cc06c15dd7d20ac40837c4889"
+      },
+      {
+        "path": "RUN/hidden/SAFEPLUS_STRATEGY02_SIGNAL.cmd",
+        "sha256": "d59075c9488750c3af249f09526122feb88dfa275cf2a0de995bddf4530cf8fa"
+      },
+      {
+        "path": "RUN/strategy_02_low_buy_signal_v1.py",
+        "sha256": "d6281e89e7e6c07bf90145149a46b82f46d86a3dab962fdd8ab2e801ca7b02e6"
+      },
+      {
+        "path": "RUN/strategy_02_signal_contract_v1.py",
+        "sha256": "9c9992a0bcce686773e75bcd241b07714880a998171fccb75dae1c9ece791a21"
+      },
+      {
+        "path": "RUN/strategy_02_rotation_engine_v1.py",
+        "sha256": "d61470e5076f3c34553838bfdb8d50aa731794b56e377fd7a1df1dcf12218b6d"
+      },
+      {
+        "path": "RUN/저점매수_매도소진.py",
+        "sha256": "b4b7a475b7eb63a93254425e6ed648482a83f9b11cb61326a6f13c5f7d3ba244"
+      }
+    ],
+    "S03": [
+      {
+        "path": "RUN/hidden/SAFEPLUS_STRATEGY03_LIVE_ASCII.cmd",
+        "sha256": "794c81f8483f64c2d5894bec6198417d9a291d84076bde6b3259579250b72742"
+      },
+      {
+        "path": "RUN/hidden/SAFEPLUS_STRATEGY03_SIGNAL_ASCII.cmd",
+        "sha256": "307b084c6ee188575354e85b47f1abd3e563434fe2424f8a6e6fbf8c102169d6"
+      },
+      {
+        "path": "RUN/strategy_03_valley_signal_launcher_v1.py",
+        "sha256": "8695fd47a3c8eb0db060a9c3e9e475160915ab2b0c4f9685b1dba800d18e347b"
+      },
+      {
+        "path": "RUN/골짜기_급반등.py",
+        "sha256": "b216bf2d82760568cd0685afeaad9808e47f6611ec2c7b42c38a211630912331"
+      },
+      {
+        "path": "RUN/strategy_03_intraday_rebound_v1.py",
+        "sha256": "919a29993fafb38e2ccae1271aa46ffa0ff074abdf14021528bc754f79d255cd"
+      },
+      {
+        "path": "RUN/strategy_03_signal_contract_v1.py",
+        "sha256": "cc6f43c149dc536bfaf5d3e7df12166f777b757a8c1fbe444bcca59e12a81311"
+      },
+      {
+        "path": "RUN/strategy_03_rotation_engine_v1.py",
+        "sha256": "c53f603bad0d02ffbeea65fdd55358d518477c41333b7db17d201c755fceb47d"
+      }
+    ],
+    "S06": [
+      {
+        "path": "RUN/run_strategy_06_crash_low_chase.cmd",
+        "sha256": "659eb2bb3e0d39f5105f9854ec690e69819988eeb38f53e0356cdb84df684f79"
+      },
+      {
+        "path": "RUN/strategy_06_crash_low_chase_v1.py",
+        "sha256": "1399011183ed74487c51c1fc561b9910964d3b77b6398d1076780871f154a5f3"
+      }
+    ]
+  }
+}

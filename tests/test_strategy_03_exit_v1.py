@@ -10,6 +10,7 @@ from dataclasses import replace
 from datetime import time as day_time, timedelta
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 RUN = Path(__file__).resolve().parents[1] / "RUN"
 if str(RUN) not in sys.path:
@@ -108,7 +109,7 @@ class Strategy03ExitTests(unittest.TestCase):
         self.assertTrue(weak_decision.should_sell)
         self.assertIn("EARLY_TREND_EXIT", weak_decision.reason)
 
-    def test_open_risk_exits_override_daily_ma_hold(self) -> None:
+    def test_hard_stop_overrides_rider_but_ma5_break_alone_does_not(self) -> None:
         engine = Strategy03HoldSellEngine()
         hard_stop = engine.evaluate(
             self._state("hard-stop-overrides-rider"),
@@ -131,8 +132,8 @@ class Strategy03ExitTests(unittest.TestCase):
                 daily_ma5_broken=True,
             ),
         )
-        self.assertTrue(ma5_break.should_sell)
-        self.assertEqual(ma5_break.reason, "DAILY_MA5_BREAK")
+        self.assertFalse(ma5_break.should_sell)
+        self.assertEqual(ma5_break.reason, "DAILY_MA_RIDER_HOLD")
 
     def test_open_daily_ma_hold_still_blocks_structure_exit(self) -> None:
         engine = Strategy03HoldSellEngine()
@@ -149,8 +150,11 @@ class Strategy03ExitTests(unittest.TestCase):
         )
         self.assertEqual(decision.reason, "DAILY_MA_RIDER_HOLD")
 
-    def test_open_lane_forces_exit_at_0950(self) -> None:
-        decision = Strategy03HoldSellEngine().evaluate(
+    def test_open_lane_forces_exit_at_1030(self) -> None:
+        """★[S03-EXPRESS 2026-08-06 친구님 지시 "매도 방법은 10:30까지"] 09:50 → 10:30.
+        09:50 에는 더 이상 강제청산하지 않고, 10:30 에 판다."""
+        engine = Strategy03HoldSellEngine()
+        at_0950 = engine.evaluate(
             self._state("time-0950"),
             HoldSellObservation(
                 observed_at=self.now.replace(hour=9, minute=50),
@@ -158,10 +162,19 @@ class Strategy03ExitTests(unittest.TestCase):
                 daily_ma_permit=True,
             ),
         )
-        self.assertTrue(decision.should_sell)
-        self.assertEqual(decision.reason, "TIME_EXIT_0950")
+        self.assertFalse(at_0950.should_sell)
+        at_1030 = engine.evaluate(
+            self._state("time-1030", code="654321"),
+            HoldSellObservation(
+                observed_at=self.now.replace(hour=10, minute=30),
+                price=Decimal("10000"),
+                daily_ma_permit=True,
+            ),
+        )
+        self.assertTrue(at_1030.should_sell)
+        self.assertEqual(at_1030.reason, "TIME_EXIT_1030")
 
-    def test_open_profit_trail_overrides_daily_ma_hold(self) -> None:
+    def test_open_daily_ma_hold_precedes_profit_trail(self) -> None:
         engine = Strategy03HoldSellEngine()
         state = self._state("trail")
         peak = HoldSellObservation(
@@ -177,6 +190,15 @@ class Strategy03ExitTests(unittest.TestCase):
             price=Decimal("10100"),
         )
         decision = engine.evaluate(state, pullback)
+        self.assertFalse(decision.should_sell)
+        self.assertEqual(decision.reason, "DAILY_MA_RIDER_HOLD")
+
+        support_lost = replace(
+            pullback,
+            observed_at=pullback.observed_at + timedelta(seconds=1),
+            daily_ma_permit=False,
+        )
+        decision = engine.evaluate(state, support_lost)
         self.assertTrue(decision.should_sell)
         self.assertIn("PROFIT_TRAIL", decision.reason)
 
@@ -300,37 +322,15 @@ class Strategy03ExitTests(unittest.TestCase):
         self.assertTrue(observation.valley_exact_sell_dominant)
 
     def test_open_daily_ma_matches_common_rider_and_ignores_future_day(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
-            eod = Path(folder) / "eod.csv"
-            bars = Path(folder) / "bars.json"
-            rows = ["code,date,close"]
-            for offset in range(21):
-                day = f"202606{offset + 1:02d}"
-                rows.append(f"111111,{day},{100 + offset}")
-                rows.append(f"222222,{day},{120 - offset}")
-            rows.append("111111,20260803,1")
-            eod.write_text("\n".join(rows) + "\n", encoding="utf-8")
-            bars.write_text(json.dumps({"m": {
-                "111111": {"prev": [
-                    [150, 151, 149, 150],
-                    [150, 152, 149, 151],
-                    [151, 153, 150, 152],
-                ]},
-                "222222": {"prev": [
-                    [150, 151, 149, 150],
-                    [150, 152, 149, 151],
-                    [151, 153, 150, 152],
-                ]},
-            }}), encoding="utf-8")
-            engine = Strategy03Engine.__new__(Strategy03Engine)
-            engine.config = replace(
-                build_config(), eod_bars_path=eod, bars_path=bars
-            )
-            engine.state = {"date": "20260802"}
-            engine.log = logging.getLogger("s03-daily-trend-test")
-            engine._s03_daily_trend = None
+        # S03도 일봉이 아니라 전 전략 공통 3분봉 rider를 그대로 호출한다.
+        engine = Strategy03Engine.__new__(Strategy03Engine)
+        with patch(
+            "strategy_03_rotation_engine_v1.ma3_rider_permit",
+            side_effect=lambda code, _price, buy_side=None: code == "111111",
+        ) as rider:
             self.assertTrue(engine._daily_ma_permit("111111", 120.0))
             self.assertFalse(engine._daily_ma_permit("222222", 120.0))
+        self.assertEqual(rider.call_count, 2)
 
     def test_open_and_intraday_lanes_keep_separate_force_exit_times(self) -> None:
         engine = Strategy03Engine.__new__(Strategy03Engine)
@@ -342,8 +342,9 @@ class Strategy03ExitTests(unittest.TestCase):
         intraday_position = {
             **open_position, "entry_lane": "INTRADAY_CRASH",
         }
+        # ★[S03-EXPRESS 2026-08-06] 아침 창구 강제청산 09:50 → 10:30 (친구님 지시).
         self.assertEqual(
-            engine._position_force_exit_at(open_position), day_time(9, 50)
+            engine._position_force_exit_at(open_position), day_time(10, 30)
         )
         self.assertEqual(
             engine._position_force_exit_at(intraday_position), day_time(15, 10)
@@ -364,16 +365,18 @@ class Strategy03ExitTests(unittest.TestCase):
             }), encoding="utf-8")
             engine = Strategy03Engine.__new__(Strategy03Engine)
             engine.config = replace(build_config(), bars_path=bars)
-            engine._s03_daily_trend = {"123456": {
-                "ma5": 100.0, "ma10": 90.0,
-                "ma20": 80.0, "ma20_prev": 79.0,
-            }}
             position = {
                 "code": "123456", "entry_at": entry_at.isoformat(),
                 "s03_ma5_seen_above": True,
             }
             point = {"ts": observed_at, "price": 99.0}
-            self.assertTrue(engine._completed_open_ma5_broken(position, point))
+            with patch(
+                "strategy_03_rotation_engine_v1.ma3_rows",
+                return_value={"ma5": 100.0},
+            ):
+                self.assertTrue(
+                    engine._completed_open_ma5_broken(position, point)
+                )
 
 if __name__ == "__main__":
     unittest.main()
