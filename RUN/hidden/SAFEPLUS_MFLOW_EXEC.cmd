@@ -3,7 +3,6 @@ REM Money-flow executor - LIVE. Isolation ON (only_moneyflow.flag). CAP 200k, MA
 REM ASCII-only: Korean REM before a SET line breaks cmd parsing (UTF-8 read as cp949) and skips the SET.
 REM Rollback to shadow: set MF_EXEC_LIVE=NO
 set MF_EXEC_LIVE=YES
-set MF_EXEC_CAP=200000
 REM [2026-07-08 4-directives] No position-count cap (opportunity-first). Real cap = daily buy budget 2,000,000 KRW (no refill).
 set MF_EXEC_MAXPOS=99
 set MF_BOARD_REFRESH=NO

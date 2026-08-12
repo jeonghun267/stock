@@ -13,8 +13,22 @@ import datetime as dt
 import html
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
+
+# ★[SYSPATH-FIX 2026-08-05 09:54] 중계판이 8/4 15:30 이후 멈춰 있던 원인.
+#   python._pth 때문에 sys.path 에 스크립트 폴더가 안 들어간다
+#   (실측: python310.zip / C:\python310 / site-packages). 그래서 아래
+#   approval_settings_guard import 가 ModuleNotFoundError 로 죽었고,
+#   태스크는 매분 정상 실행되는데(result=0) HTML 만 갱신이 멈춰 있었다.
+#   같은 패턴을 strategy_all_live_gate_launcher_v1.py:12-14 가 쓰고 있다.
+#   되돌리기: backup\stockbot_live_broadcast_v1_20260805_before_syspath_fix.py
+RUN_DIR = Path(__file__).resolve().parent
+if str(RUN_DIR) not in sys.path:
+    sys.path.insert(0, str(RUN_DIR))
+
+from approval_settings_guard import KST, legacy_daily_approval_valid
 
 
 BASE = Path(os.environ.get("STOCKBOT_BASE", r"C:\stock_bot"))
@@ -180,6 +194,30 @@ def _heartbeat(state: dict[str, Any], now: dt.datetime) -> tuple[float | None, s
     return age, f"멈춤 의심 {age / 60:.0f}분전"
 
 
+def _approval_gate(path: Path, now: dt.datetime) -> str:
+    """주문 관문(StrategyBroker.real_session)과 똑같은 판정을 쓴다.
+
+    ★[APPROVAL-DISPLAY 2026-08-04] 예전엔 파일 존재만 봤다. 깃발이 있어도 내용·날짜가
+    무효면 실제 주문은 전부 그림자로 나가는데 중계판만 LIVE 로 떠 있었다.
+    더 나쁜 건 아래 BUY_BLOCKED/APPROVAL_OR_OFF_FLAG 억제 규칙(게이트가 LIVE 면
+    그 사건을 화면에서 숨긴다)까지 겹쳐서, "승인 때문에 매수가 막혔다"는 증거마저
+    지워졌다는 점이다. 켜진 줄 알고 하루를 날리는 경로였다.
+
+    깃발 없음(승인대기)과 깃발이 깨짐(승인무효)을 구분해서 보여준다 — 원인이 다르다.
+    되돌리기: backup/stockbot_live_broadcast_v1_20260804_before_approval_display.py
+    """
+    if not path.exists():
+        return "승인대기"
+    try:
+        text = path.read_text(encoding="ascii", errors="strict")
+    except (OSError, UnicodeError):
+        return "승인무효"
+    moment = now if now.tzinfo else now.replace(tzinfo=KST)
+    if legacy_daily_approval_valid(text, moment.astimezone(KST)):
+        return "LIVE"
+    return "승인무효"
+
+
 def load_strategy(meta: dict[str, str], now: dt.datetime, names: dict[str, str]) -> dict[str, Any]:
     day = now.strftime("%Y%m%d")
     state = read_json(DATA / meta["state"], {})
@@ -188,8 +226,9 @@ def load_strategy(meta: dict[str, str], now: dt.datetime, names: dict[str, str])
     age, heartbeat = _heartbeat(state, now) if current_state else (None, "시작 전")
 
     off = (CONFIG / f"strategy_{meta['number']}_off.flag").exists()
-    approved = (CONFIG / f"strategy_{meta['number']}_live_approved.flag").exists()
-    gate = "OFF" if off else ("LIVE" if approved else "승인대기")
+    gate = "OFF" if off else _approval_gate(
+        CONFIG / f"strategy_{meta['number']}_live_approved.flag", now)
+    approved = gate == "LIVE"
 
     positions = state.get("positions") if current_state else {}
     if not isinstance(positions, dict):

@@ -91,7 +91,10 @@ class OpenSurgeConfig:
     min_price: Decimal = Decimal("10000")
     gap_min_pct: Decimal = Decimal("3.0")
     # ★되돌림 3문턱 (2026-07-31 교체)
-    min_dip_pct: Decimal = S01_MIN_DIP_PCT       # 당일저점이 시가 대비 이만큼은 밀려야 대상
+    # ★[2026-08-06 이후] 이 값은 최소 밀림이 아니라 S01/S02 깊이 경계다.
+    #   -3%보다 깊으면 S02 영역이며, S01은 시가 아래의 얕은 눌림만 담당한다.
+    min_dip_pct: Decimal = S01_MIN_DIP_PCT
+    require_below_open_pullback: bool = True
     min_rebound_pct: Decimal = Decimal("0.5")    # 저점에서 이만큼 되돌아오면 매수
     max_rebound_pct: Decimal = Decimal("3.0")    # 저점에서 이만큼 넘게 올랐으면 추격 금지
     # ★[2026-07-31 친구님 지시 "매수 비중을 60%로 낮춰봐 — 눌림이니까 당연히 매도가
@@ -205,6 +208,9 @@ def _flow_block_reason(
 
 
 class OpenSurgeBuyStrategy:
+    # Strategy 01 live monitor uses two one-share entry stages.
+    staged_entries = True
+
     def __init__(self, config: OpenSurgeConfig | None = None) -> None:
         self.config = config or OpenSurgeConfig()
 
@@ -240,10 +246,32 @@ class OpenSurgeBuyStrategy:
         if low <= 0:
             return _decision(BuyAction.WAIT, "DAY_LOW_NOT_READY", route=route, gap_pct=gap_pct)
 
+        # ★[2026-08-10 무눌림 추격 방지]
+        # 브리지 OFF로 S01 고유의 빠른 진입을 복구하면, 저점=시가인 직선 상승도
+        # 반등으로 오인할 수 있다. 과거 개장 직후 추격을 되살리지 않도록 실제로
+        # 시가 아래에서 체결된 얕은 눌림이 확인된 경우만 다음 단계로 보낸다.
+        if self.config.require_below_open_pullback and low >= opening:
+            return _decision(
+                BuyAction.WAIT,
+                "PULLBACK_BELOW_OPEN_NOT_SEEN",
+                route=route,
+                gap_pct=gap_pct,
+            )
+
         dip_pct = (low / opening - Decimal("1")) * Decimal("100")
-        if dip_pct > -self.config.min_dip_pct:
-            # 아직 충분히 안 밀렸다. 제외가 아니라 '때가 아님' — 밀리면 다시 본다.
-            return _decision(BuyAction.WAIT, "DIP_NOT_DEEP_ENOUGH", route=route, gap_pct=gap_pct)
+        # ★[2026-08-06 친구님 지시 "1번은 -3~3%까지, 2번은 -3% 이하 -4 -5 /
+        #   지금 서로 달라야 돼"] 부등호를 뒤집었다.
+        #   종전: dip_pct > -3% 면 거름 = "-3% 보다 깊어야 산다"(DIP_NOT_DEEP_ENOUGH).
+        #   그래서 1번이 2번(저점매수)과 똑같이 -3% 이상 빠진 것만 보고 있었다.
+        #   지금: -3% 보다 깊게 빠진 것은 2번 영역이라 넘긴다. 1번은 얕은 띠만 본다.
+        #   ⚠️신호기 strategy_01_open_surge_signal_v2.py 의 같은 조건도 함께 뒤집었다.
+        #     한쪽만 뒤집으면 두 조건이 모순돼 신호가 한 건도 안 나온다.
+        #   ⚠️주의: 위 240행이 말하는 옛 규칙(시가~시가+3% 띠)이 3일 -32.51% 로 폐기된 적이
+        #     있다. 이 띠는 '2번의 저점찾기'와 함께 가야 의미가 있다(단독 적용은 그 실패 재현 위험).
+        #   롤백: backup\s01_lowfind_20260806\ 의 두 파일 복원.
+        if dip_pct < -self.config.min_dip_pct:
+            # 너무 깊이 빠졌다 = 2번 담당. 제외가 아니라 '내 구간이 아님'.
+            return _decision(BuyAction.WAIT, "DIP_TOO_DEEP_S02_ZONE", route=route, gap_pct=gap_pct)
 
         rebound_pct = (current / low - Decimal("1")) * Decimal("100")
         if rebound_pct < self.config.min_rebound_pct:

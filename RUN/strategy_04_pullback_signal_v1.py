@@ -591,14 +591,26 @@ class PullbackSignalMonitor:
         return row
 
 
-def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
-    os.replace(temporary, path)
+    for attempt in range(6):
+        try:
+            os.replace(temporary, path)
+            return True
+        except PermissionError as exc:
+            if attempt == 5:
+                print(
+                    f"ATOMIC_WRITE_RETRY_EXHAUSTED_CONTINUING path={path} error={exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False
+            time_module.sleep(0.2)
 
 
 def _append_events(path: Path, rows: Iterable[Mapping[str, Any]]) -> bool:
@@ -738,10 +750,11 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
             "signals": monitor.signals[-1000:],
             "candidates": list(monitor.latest.values()),
         }
-        _write_json_atomic(config.output_path, payload)
+        if not _write_json_atomic(config.output_path, payload):
+            print(f"SIGNAL_OUTPUT_STALE_CONTINUING path={config.output_path}", file=sys.stderr, flush=True)
         if bars_completed or last_state_save != now.strftime("%Y%m%d%H%M"):
-            _write_json_atomic(config.state_path, monitor.state_payload(now))
-            last_state_save = now.strftime("%Y%m%d%H%M")
+            if _write_json_atomic(config.state_path, monitor.state_payload(now)):
+                last_state_save = now.strftime("%Y%m%d%H%M")
         _append_events(
             config.event_dir / f"strategy_04_signals_{now:%Y%m%d}.csv",
             new_signals,

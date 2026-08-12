@@ -274,6 +274,7 @@ class ContractAndWiringTests(unittest.TestCase):
         with patch.dict(os.environ, {"S04_LIVE": "NO"}, clear=False):
             config = build_config()
         self.assertFalse(config.live_requested)
+        # ★[2026-08-06 친구님 지시 "QTY 2주 원래대로 1주로 돌려줘"] 2 -> 1.
         self.assertEqual(config.quantity, 1)
         self.assertEqual(config.max_slots, 6)
         self.assertEqual(config.max_daily_codes, 6)

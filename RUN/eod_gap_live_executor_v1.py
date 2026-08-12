@@ -125,7 +125,59 @@ EOD_CHE_WEAK     = float(os.environ.get("EOD_GAP_CHE_WEAK", "90"))   # 종가 �
 EOD_OB_WEAK      = float(os.environ.get("EOD_GAP_OB_WEAK", "0.7"))   # 호가 imb(매수/매도총잔량) 이 미만(매도잔량 우위)이면 매수보류
 MICRO_SNAP_FILE  = Path(r"C:\stock_bot\IPC\live_micro_snapshot.json")
 MICRO_WATCH_FILE = Path(r"C:\stock_bot\IPC\micro_watch_eod.json")
+LIVE_BOARD_CACHE = Path(r"C:\stock_bot\DATA\eod_gap_live_board_cache.json")
 ACCOUNT = os.environ.get("SWING_ACCOUNT", "").strip()
+LAST_ORDER_STATUS = ""
+LIVE_BOARD_MAX_AGE_SEC = float(os.environ.get("EOD_GAP_BOARD_MAX_AGE_SEC", "120"))
+LIVE_BOARD_CACHE_FALLBACK = os.environ.get(
+    "EOD_GAP_BOARD_CACHE_FALLBACK", "NO"
+).strip().upper() == "YES"
+
+
+def _pick_window_open(now=None):
+    """Allow new EOD_GAP entries only during 15:00:00-15:19:59."""
+    now = now or datetime.now()
+    return (15, 0) <= (now.hour, now.minute) < (15, 20)
+
+
+def _passes_final_score(score):
+    """One immutable score floor shared by every EOD_GAP buy route."""
+    try:
+        return float(score) >= MIN_SCORE
+    except (TypeError, ValueError):
+        return False
+
+
+def _save_live_board_cache(rows, now=None):
+    """당일 opt10032 성공 결과만 원자적으로 보존한다."""
+    now = now or datetime.now()
+    _jsave(LIVE_BOARD_CACHE, {
+        "date": now.strftime("%Y%m%d"),
+        "captured_at": now.isoformat(),
+        "source": "opt10032",
+        "rows": [list(row[:3]) for row in rows],
+    })
+
+
+def _load_fresh_live_board_cache(now=None, max_age_sec=None):
+    """같은 날·기본 2분 이내 opt10032 캐시만 허용한다."""
+    now = now or datetime.now()
+    max_age_sec = LIVE_BOARD_MAX_AGE_SEC if max_age_sec is None else float(max_age_sec)
+    payload = _jload(LIVE_BOARD_CACHE)
+    if str(payload.get("date") or "") != now.strftime("%Y%m%d"):
+        return []
+    try:
+        captured = datetime.fromisoformat(str(payload.get("captured_at") or ""))
+        age_sec = (now - captured).total_seconds()
+    except Exception:
+        return []
+    if age_sec < 0 or age_sec > max_age_sec:
+        return []
+    out = []
+    for row in payload.get("rows") or []:
+        if isinstance(row, (list, tuple)) and len(row) >= 3:
+            out.append((str(row[0]).zfill(6), str(row[1]), float(row[2] or 0)))
+    return out
 
 
 def _shadow_log(today, cur, leader, active):
@@ -174,7 +226,8 @@ def _log(m):
     print(s, flush=True)
     try:
         LOG.parent.mkdir(parents=True, exist_ok=True)
-        io.open(LOG, "a", encoding="utf-8").write(s + "\n")
+        with io.open(LOG, "a", encoding="utf-8") as handle:
+            handle.write(s + "\n")
     except Exception:
         pass
 
@@ -247,6 +300,8 @@ def _broker():
 
 def _order(bc, code, qty, side, tag):
     """검증된 send_order_real(최유리06). side=BUY/SELL. LIVE=NO면 모의."""
+    global LAST_ORDER_STATUS
+    LAST_ORDER_STATUS = ""
     # ★[2026-07-01 대장주 순위표 게이트] 종가매수도 전날 종가 대장주 순위표 안에서만.
     #   board 없거나 LEADER_FILTER OFF면 is_leader=True(fail-open). 롤백 setx EODGAP_LEADER_BOARD NO
     if side == "BUY" and os.environ.get("EODGAP_LEADER_BOARD", "YES").strip().upper() == "YES":
@@ -264,6 +319,7 @@ def _order(bc, code, qty, side, tag):
         except Exception:
             pass
     if not LIVE:
+        LAST_ORDER_STATUS = "SIMULATED"
         _log(f"[{tag}][모의] {side} {code} x{qty} (EOD_GAP_LIVE=NO)")
         return True
     try:
@@ -286,21 +342,21 @@ def _order(bc, code, qty, side, tag):
                                price=0, hoga_gb="06", rqname=f"EODGAP_{side}_{code}", screen_no="9703")
         _log(f"[{tag}][LIVE] {side} {code} x{qty} acct={ACCOUNT[:4]}** → {str(r)[:100]}")
         _st = str((r or {}).get("status", "")).upper()
+        LAST_ORDER_STATUS = _st or "EMPTY"
         # [BUGFIX 2026-06-30 #1 비대칭] 매수=OK|TIMEOUT 기록(미체결확인불가→재매수 중복위험 회피)·매도=OK만 완료(비OK는 OPEN유지 재시도)
-        if side == "BUY":
-            _ok = _st in ("OK", "TIMEOUT")
-        else:
-            _ok = (_st == "OK")
+        _ok = (_st == "OK")
         if not _ok or _st != "OK":
             _log(f"[{tag}] 주문 status={_st or 'EMPTY'} → " + ("성공" if _ok else "실패처리") + (" (TIMEOUT=체결미확인·수동확인 권장)" if _st == "TIMEOUT" else ""))
         return _ok
     except Exception as e:
+        LAST_ORDER_STATUS = "ERROR"
         _log(f"[{tag}] 주문실패: {e}"); return False
 
 
 def _opt10032_top(bc, n=100):
     res = bc.tr("opt10032", inputs={"시장구분": "101", "관리종목포함": "0"},
-                output_fields=["종목코드", "종목명", "거래대금"], timeout_sec=12.0)
+                output_fields=["종목코드", "종목명", "거래대금"],
+                rqname="EODGAP_OPT10032", screen_no="9705", timeout_sec=20.0)
     out = []
     for r in (((res or {}).get("data") or {}).get("records") or [])[:n]:
         code = str(r.get("종목코드", "")).strip().lstrip("A").zfill(6)
@@ -311,6 +367,8 @@ def _opt10032_top(bc, n=100):
         except ValueError:
             v = 0
         out.append((code, str(r.get("종목명", "")).strip(), v))  # v=누적거래대금(백만원)
+    if out:
+        _save_live_board_cache(out)
     return out
 
 
@@ -516,7 +574,10 @@ def _buy_one(bc, pick, today, held):
     sc, code, nm, eok, px, pv, pc, pb, _lim, w52, ma20over, _dret, _vr, _vrt, *_rest = pick
     if px <= 0:
         _log(f"{code} 가격0 → skip"); return False
-    if code in held and held[code].get("status") == "OPEN":
+    if not _passes_final_score(sc):
+        _log(f"[FINAL-SCORE-GATE] {code} {sc} < {MIN_SCORE} -> NO_TRADE")
+        return False
+    if code in held and held[code].get("status") in ("OPEN", "PENDING"):
         return False                              # 이미 보유 → 중복방지
     qty = max(1, int(CAP // px))
     # ★[2026-07-29 친구님 지시 "상한가도 무조건 1주로 해줘 15만원 아니야"]
@@ -556,7 +617,15 @@ def _buy_one(bc, pick, today, held):
     except Exception:
         pass
     _log(f"★EOD_GAP 매수 {code} {nm} {sc}점 @{px:,.0f} x{qty}={qty*px:,}원 (캡{CAP:,})")
-    if not _order(bc, code, qty, "BUY", "PICK"):
+    order_ok = _order(bc, code, qty, "BUY", "PICK")
+    if LIVE and LAST_ORDER_STATUS in ("OK", "TIMEOUT"):
+        held[code] = {"code": code, "name": nm, "qty": qty, "buy_price": px, "score": sc,
+                      "date": today, "status": "PENDING", "live": True,
+                      "order_status": LAST_ORDER_STATUS, "ts": datetime.now().isoformat()}
+        _jsave(POS, held)
+        _log(f"[PENDING] {code} order_status={LAST_ORDER_STATUS}; balance confirmation required")
+        return True
+    if not order_ok:
         _log("매수 실패/모의 → 기록보류" if LIVE else "모의매수")
         if LIVE:
             return False
@@ -612,6 +681,15 @@ def _unified_scores(cands, today, lag):
 def mode_pick():
     today = datetime.now().strftime("%Y%m%d")
     _log(f"=== EOD_GAP pick (LIVE={LIVE} CAP={CAP:,} MAX_POS={MAX_POS} MIN={MIN_SCORE}) ===")
+    if not _pick_window_open():
+        _log("[TIME-GATE] new entries allowed only from 15:00 through 15:19 -> NO_TRADE")
+        return
+    _existing = _jload(POS)
+    _pending = [c for c, p in _existing.items()
+                if isinstance(p, dict) and p.get("status") == "PENDING"]
+    if _pending:
+        _log(f"[PENDING-GATE] awaiting fill confirmation {_pending} -> block new/repeat order")
+        return
     bc = _broker()
     if not bc:
         _log("broker dead → pick 중단"); return
@@ -673,13 +751,26 @@ def mode_pick():
                     _log(f"⛔ EOD_GAP[FROM_RUNNER] {code} 스마트머니 던지기 차단 [{_smi}] — 매수스킵"); continue
             except Exception:
                 pass
+            runner_score = round(float(d.get("score2", 0)))
+            if not _passes_final_score(runner_score):
+                _log(f"[FINAL-SCORE-GATE] {code} {runner_score} < {MIN_SCORE} -> NO_TRADE")
+                continue
             _log(f"★[FROM_RUNNER] ②{rank} {code} {nm} @{px:,} x{qty}={qty*px:,}원 {msg} "
                  f"(거래대금{d.get('val',0)/100:.0f}억·종가{d.get('cp',0)*100:.0f}%·상승{d.get('chg',0):+.0f}%·가속{d.get('late_vacc',0):.1f})")
-            if not _order(bc, code, qty, "BUY", "PICK"):
+            order_ok = _order(bc, code, qty, "BUY", "PICK")
+            if LIVE and LAST_ORDER_STATUS in ("OK", "TIMEOUT"):
+                held[code] = {"code": code, "name": nm, "qty": qty, "buy_price": px,
+                              "score": runner_score, "date": today, "status": "PENDING",
+                              "live": True, "src": "RUNNER", "rank": rank,
+                              "order_status": LAST_ORDER_STATUS, "ts": datetime.now().isoformat()}
+                _jsave(POS, held); bought = True
+                _log(f"[PENDING] {code} order_status={LAST_ORDER_STATUS}; balance confirmation required")
+                break
+            if not order_ok:
                 _log("매수 실패/모의" if LIVE else "모의매수")
                 if LIVE: return
             held[code] = {"code": code, "name": nm, "qty": qty, "buy_price": px,
-                          "score": round(float(d.get("score2", 0))), "date": today, "status": "OPEN",
+                          "score": runner_score, "date": today, "status": "OPEN",
                           "live": LIVE, "src": "RUNNER", "rank": rank, "ts": datetime.now().isoformat()}
             _jsave(POS, held); bought = True; break
         if not bought:
@@ -687,12 +778,18 @@ def mode_pick():
         return
     top = _opt10032_top(bc, TOP_N_UNI)
     if not top:
-        # ★[2026-07-01 백업] opt10032 실패 → 전날 대장주 순위표로 대체(종가매수 안 끊기게)
-        top = _board_fallback_top(TOP_N_UNI)
-        if top:
-            _log(f"[FALLBACK] opt10032 빈결과 → 전날 대장주 순위표 {len(top)}종목으로 진행")
+        cached_top = _load_fresh_live_board_cache()
+        if cached_top and LIVE_BOARD_CACHE_FALLBACK:
+            top = cached_top
+            _log(f"[LIVE-BOARD-CACHE] opt10032 실패 → 당일 2분 이내 캐시 {len(top)}종목 사용")
         else:
-            _log("opt10032 빈결과 + 순위표 없음 → 중단"); return
+            if cached_top:
+                _log(
+                    f"[LIVE-BOARD-CACHE-SHADOW] fresh cache {len(cached_top)} rows available; "
+                    "fallback disabled pending production replay"
+                )
+            _log("[LIVE-BOARD-GATE] opt10032 empty/error; no same-day <=2m cache -> NO_TRADE")
+            return
     # ★[LIMITUP-ADD 2026-07-29] 상한가는 거래가 잠겨 거래대금 상위 N 밖으로 밀린다 → 따로 보탠다.
     limitup_px = {}     # ★유니버스 밖 상한가는 분봉(im)이 없다 → 현재가를 여기서 받아 day_ret 계산에 쓴다
     if LIMITUP_ADD and top:
@@ -835,7 +932,7 @@ def mode_pick():
     # ★[LOCKED-FIRST 2026-07-29] 상한가가 있으면 전략A/B보다 먼저 집는다(위 LOCKED_FIRST 주석 참조).
     #   상한가 없으면 picks=None 유지 → 종전 흐름(전략A/B → LEADER_ONLY → SKIP_LOCKED) 그대로.
     if LOCKED_FIRST and n_locked:
-        _lk = [c for c in cands if c[8] and c[0] >= LOCKED_MIN
+        _lk = [c for c in cands if c[8] and _passes_final_score(c[0])
                and (VAL_CEIL_EOK <= 0 or c[3] <= VAL_CEIL_EOK)]
         if _lk:
             picks = _lk[:MAX_POS]
@@ -843,7 +940,7 @@ def mode_pick():
                  + ", ".join("%s %s %s점" % (c[1], (c[2] or "")[:6], c[0]) for c in picks))
         else:
             _log("[LOCKED-FIRST] 상한가 %d개 있으나 점수<%g 또는 대금상한 초과 → 종전 경로"
-                 % (n_locked, LOCKED_MIN))
+                 % (n_locked, MIN_SCORE))
     if picks is None and (STRATA_ON or STRATB_ON):
         # [2026-07-17 친구님 "종가매수 통합"] 전략A(횡보후돌파) OR 전략B(수렴선) 2택1. 중복종목 제거 안 함.
         _setup = []
@@ -952,7 +1049,7 @@ def mode_pick():
         if skipped:
             _log(f"[SKIP_LOCKED] 잠긴 상위 {len(skipped)}개 건너뜀(예:{skipped[0][1]} {skipped[0][0]}점) → 살수있는 {pick[1]} {pick[0]}점 매수")
     else:
-        pick_floor = LOCKED_MIN if (LOCKED_PRIORITY and cands and cands[0][8]) else MIN_SCORE
+        pick_floor = MIN_SCORE
         if not cands or cands[0][0] < pick_floor:
             _shadow_log(today, None, leader_pick, False)
             _log(f"1등 {cands[0][0] if cands else '-'} < {pick_floor}{'(LOCKED)' if (cands and cands[0][8]) else ''} → NO_TRADE"); return
@@ -974,7 +1071,8 @@ def mode_pick():
         pass
     # [MULTIPOS] 남은 슬롯만큼 매수(상위순)·중복방지·각 CAP
     held = _jload(POS)
-    open_now = sum(1 for p in held.values() if isinstance(p, dict) and p.get("status") == "OPEN")
+    open_now = sum(1 for p in held.values()
+                   if isinstance(p, dict) and p.get("status") in ("OPEN", "PENDING"))
     # [GLOBAL-BUDGET 2026-06-28 친구님] 전 전략 합산 동시보유 상한
     _grem = 9999
     try:
@@ -991,6 +1089,9 @@ def mode_pick():
             break
         if _buy_one(bc, pk, today, held):
             bought += 1
+            if held.get(pk[1], {}).get("status") == "PENDING":
+                _jsave(POS, held)
+                break
             _jsave(POS, held)          # [즉시저장 2026-06-29] 매수 직후 영구화 → 크래시시 broker/RT_OPEN/POS 불일치 방지
     if bought:
         _log(f"기록완료 {bought}건 (보유 {open_now + bought}/{MAX_POS}) → {POS}")
@@ -1032,9 +1133,34 @@ def mode_sell():
     #   통째로 덮어써 전용 매도기의 CLOSED 를 OPEN 으로 되살리던 경합의 원인이었다.
 
 
+def mode_prefetch():
+    """Warm the same-day opt10032 cache without entering the order path."""
+    _log("=== EOD_GAP board prefetch (ORDER_PATH=NONE) ===")
+    bc = _broker()
+    if not bc:
+        _log("[PREFETCH] broker dead")
+        return
+    for attempt in range(1, 3):
+        rows = _opt10032_top(bc, TOP_N_UNI)
+        if rows:
+            _log(f"[PREFETCH] saved {len(rows)} rows attempt={attempt}")
+            return
+        _log(f"[PREFETCH] empty/error attempt={attempt}/2")
+        if attempt < 2:
+            time.sleep(1.0)
+    _log("[PREFETCH] failed; live fallback remains disabled")
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "pick"
     try:
-        (mode_pick if mode == "pick" else mode_sell)()
+        if mode == "pick":
+            mode_pick()
+        elif mode == "sell":
+            mode_sell()
+        elif mode == "prefetch":
+            mode_prefetch()
+        else:
+            raise ValueError(f"unknown mode: {mode}")
     except Exception as ex:
         _log(f"[FATAL] {ex}"); import traceback; traceback.print_exc(); sys.exit(1)

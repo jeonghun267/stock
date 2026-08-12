@@ -18,7 +18,7 @@ import sys
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime, time as day_time
+from datetime import datetime, time as day_time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -29,12 +29,29 @@ if str(RUN_DIR) not in sys.path:
     sys.path.insert(0, str(RUN_DIR))
 
 import shared_slots
+import capital_config
+import position_budget
+from json_cache_v1 import read_json_cached
+# ★[MA3-COMMON 2026-08-03] 상승보유 판정을 3분봉 5/10/20선 + 수급으로 통일. S01~S06 공통.
+from ma3_common_v1 import (
+    ma3_rows,
+    buy_side_alive as ma3_buy_side_alive,
+    ma5_broken as ma3_ma5_broken,
+    request_missing_history as ma3_request_missing_history,
+    rider_permit as ma3_rider_permit,
+)
 from strategy_01_signal_contract_v2 import select_fresh_signals
 from strategy_common_hold_sell_v1 import (
+    HoldSellAction,
     HoldSellObservation,
     HoldSellState,
     StrategyId,
     UnifiedHoldSellEngine,
+    strategy_profile_runtime_snapshot,
+)
+from hold_sell_audit_v1 import (
+    HoldSellAuditRecorder,
+    PostExitObservationAuditRecorder,
 )
 from strategy_common_order_v1 import StrategyBroker, fills_by_order
 
@@ -45,6 +62,13 @@ ACTIVE_PHASES = {"BUY_PENDING", "HOLD", "SELL_PENDING", "RECOVERY_BLOCKED"}
 BUY_FEE = Decimal("0.00015")
 SELL_FEE = Decimal("0.00015")
 SELL_TAX = Decimal("0.0018")
+FORCE_EXIT_EXTRA_RETRIES = int(
+    os.environ.get("S01_FORCE_EXIT_EXTRA_RETRIES", "5")
+)
+MAX_SELL_RECOVERY_CYCLES = int(
+    os.environ.get("S01_MAX_SELL_RECOVERY_CYCLES", "3")
+)
+EXHAUSTED_EVENT_COOLDOWN_SEC = 60.0
 
 
 def kst_now() -> datetime:
@@ -84,14 +108,69 @@ def read_json(path: Path, default: Any) -> Any:
         return default
 
 
-def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+# ★[READ-CACHE 2026-08-05] 읽기 캐시는 공통모듈 json_cache_v1 로 옮겼다.
+#   S01~S05(이 코어) · S06 · ma3_common_v1 이 같은 것을 쓴다.
+#   ⚠️돌려주는 객체를 공유하므로 순수 읽기 소비처에만 쓴다.
+#     여기서는 bars/snapshot/board 3개만 캐시한다. state_path(엔진이 직접 씀)·
+#     names_path·signal_path(선별기가 콜백이라 변형 여부 보장 못 함)는 제외.
+
+
+def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
+    # A fixed ``state.json.tmp`` lets two overlapping writers clobber the same
+    # temporary file.  Use a per-process/per-write name and give short-lived
+    # Windows readers (indexer/AV included) enough time to release the target.
+    temporary = path.with_name(
+        f"{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
     )
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        for attempt in range(20):
+            try:
+                os.replace(temporary, path)
+                return True
+            except PermissionError:
+                if attempt == 19:
+                    return False
+                time.sleep(0.25)
+            except OSError:
+                return False
+    except OSError:
+        return False
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def state_save_failure_marker(state_path: Path) -> Path:
+    return state_path.with_suffix(state_path.suffix + ".save_failed.flag")
+
+
+def state_save_failure_markers(state_path: Path) -> tuple[Path, ...]:
+    primary = state_save_failure_marker(state_path)
+    fallback_dir = Path(
+        os.environ.get("STOCK_BOT_RECOVERY_FLAG_DIR")
+        or Path(__file__).resolve().parents[1] / "IPC" / "recovery_flags"
+    )
+    fallback = fallback_dir / (state_path.name + ".save_failed.flag")
+    return (primary,) if fallback == primary else (primary, fallback)
+
+
+def mark_state_save_failure(state_path: Path) -> Optional[Path]:
+    payload = f"STATE_SAVE_FAILED {kst_now().isoformat(timespec='seconds')}\n"
+    for marker in state_save_failure_markers(state_path):
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(payload, encoding="ascii")
+            return marker
+        except OSError:
+            continue
+    return None
 
 
 @dataclass(frozen=True)
@@ -106,6 +185,12 @@ class Config:
     fills_dir: Path = Path(r"C:\stock_bot\LOG")
     event_dir: Path = Path(r"C:\stock_bot\data\strategy_01_rotation_v2")
     log_path: Path = Path(r"C:\stock_bot\LOG\strategy_01_rotation_v2.log")
+    audit_root: Path = Path(r"C:\stock_bot\data\audit\hold_sell")
+    post_exit_observation_sec: float = 60.0
+    audit_enabled: bool = (
+        os.environ.get("HOLD_SELL_AUDIT_ENABLED", "YES").strip().upper()
+        == "YES"
+    )
     approval_path: Path = Path(r"C:\stock_bot\config\strategy_01_live_approved.flag")
     off_flag_path: Path = Path(r"C:\stock_bot\config\strategy_01_off.flag")
     manual_buy_block_path: Path = Path(r"C:\stock_bot\config\manual_buy_block.flag")
@@ -113,11 +198,11 @@ class Config:
     live_requested: bool = (
         os.environ.get("S01_LIVE", "NO").strip().upper() == "YES"
     )
-    quantity: int = int(os.environ.get("S01_QTY", "1"))
+    quantity: int = capital_config.get_order_quantity()
     max_slots: int = int(os.environ.get("S01_MAX_SLOTS", "6"))
     max_daily_codes: int = int(os.environ.get("S01_MAX_DAILY_CODES", "6"))
     max_cycles_per_code: int = int(os.environ.get("S01_MAX_CYCLES_PER_CODE", "2"))
-    rotation_capital_krw: int = int(os.environ.get("S01_ROTATION_CAPITAL_KRW", "2000000"))
+    rotation_capital_krw: int = capital_config.get_limit("daily_total_max")
     max_sell_retries: int = int(os.environ.get("S01_MAX_SELL_RETRIES", "3"))
     signal_max_age_sec: float = float(os.environ.get("S01_SIGNAL_MAX_AGE_SEC", "5"))
     snapshot_max_age_sec: float = float(os.environ.get("S01_SNAPSHOT_MAX_AGE_SEC", "4"))
@@ -137,8 +222,8 @@ class Config:
     event_prefix: str = "strategy_01"
 
     def __post_init__(self) -> None:
-        if self.quantity != 1:
-            raise ValueError(f"{self.strategy_label} validation requires exactly one share")
+        if self.quantity < 1:
+            raise ValueError(f"{self.strategy_label} quantity must be positive")
         if self.max_slots != 6:
             raise ValueError(f"{self.strategy_label} requires exactly six concurrent slots")
         required_daily_codes = (
@@ -159,6 +244,8 @@ class Config:
             raise ValueError("rotation_capital_krw must be positive")
         if self.max_sell_retries < 1:
             raise ValueError("max_sell_retries must be positive")
+        if self.post_exit_observation_sec <= 0:
+            raise ValueError("post_exit_observation_sec must be positive")
         if not all((
             self.state_schema,
             self.strategy_slug,
@@ -285,11 +372,35 @@ class Strategy01Engine:
         self.signal_selector = signal_selector
         self.exit_engine = UnifiedHoldSellEngine()
         self.windows = FlowWindows()
-        self._daily_ma: Optional[Dict[str, Dict[str, float]]] = None
+        # S01 reads the same exact exit telemetry as S02.
+        self._common_exit_micro = defaultdict(lambda: deque(maxlen=80))
+        # ★[LEGACY-DAILY-MA 제거 2026-08-05] 여기 있던 self._daily_ma 는 아래에서
+        #   지운 _load_daily_ma 전용 캐시였다. 자세한 건 그 자리 주석 참조.
         self.names = self._load_names()
         self.state = self._load_state()
-        force_exit_only = any(
-            position.get("real") and position.get("phase") in ACTIVE_PHASES
+        self.state_save_failure_paths = state_save_failure_markers(
+            self.config.state_path)
+        self.state_save_failure_path = self.state_save_failure_paths[0]
+        # ★[SELL-LOCK 2026-08-04] __init__ 1회 계산 -> 매 판정마다 재계산.
+        #   장중에 새로 산 포지션이 보호를 못 받아, 승인 깃발이 깨지면 팔지도 않고
+        #   장부에서 지워졌다. 상세는 StrategyBroker.force_exit_only 참조.
+        # ★[BUYPENDING-DEADLOCK 2026-08-05 09:13 친구님 지시 "수정해"] BUY_PENDING 제외.
+        #   증상: 08/05 09:05~09:09 매수 3건이 전부 BUY_KILL_SWITCH_OR_APPROVAL 로 거부.
+        #   원인: 매수하려고 포지션을 BUY_PENDING 으로 올리는 순간 이 lambda 가 True 가
+        #   되고, buy_signal = ... and not force_exit_only 이므로 자기 매수를 자기가
+        #   거부한다. 거부되면 포지션이 지워져 상태 파일엔 0건으로 보여 추적이 어려웠다.
+        #   BUY_PENDING 은 '실보유'가 아니라 '사려는 중'이므로 매도잠김 보호 대상이
+        #   아니다. SELL_PENDING·HOLD·RECOVERY_BLOCKED 는 그대로 두어 8/4 수리
+        #   (승인 깃발이 장중에 깨져도 유령 삭제 금지)는 유지된다.
+        #   ⚠️장중 긴급 수정이라 사전 테스트 없이 들어갔다. 마감 후 테스트 추가할 것.
+        #   되돌리기: backup\strategy_01_rotation_engine_v2_20260805_before_buypending_fix.py
+        force_exit_only = lambda: (
+            os.environ.get("STRATEGY_RECOVERY_EXIT_ONLY", "NO").strip().upper()
+            == "YES"
+        ) or any(path.exists() for path in self.state_save_failure_paths) or any(
+            position.get("real")
+            and position.get("phase") in ACTIVE_PHASES
+            and position.get("phase") != "BUY_PENDING"
             for position in (self.state.get("positions") or {}).values()
         )
         self.broker = broker or StrategyBroker(
@@ -301,8 +412,30 @@ class Strategy01Engine:
             order_prefix=self.config.broker_order_prefix,
             force_exit_only=force_exit_only,
         )
+        if self.config.audit_enabled:
+            common_engine_path = Path(__file__).with_name(
+                "strategy_common_hold_sell_v1.py"
+            )
+            self.exit_engine.audit_recorder = HoldSellAuditRecorder(
+                self.config.audit_root,
+                common_engine_path,
+                runtime_profile=strategy_profile_runtime_snapshot(
+                    self.config.strategy_id
+                ),
+            )
+            adapter_module = sys.modules.get(type(self).__module__)
+            adapter_path = Path(
+                getattr(adapter_module, "__file__", __file__)
+            )
+            self.post_exit_observation_recorder = PostExitObservationAuditRecorder(
+                self.config.audit_root.parent / "post_exit_observation",
+                [Path(__file__), adapter_path, common_engine_path],
+            )
+        else:
+            self.post_exit_observation_recorder = None
         self._last_reconcile_epoch: Dict[str, float] = {}
         self._last_data_warning = ""
+        self._last_s01_buy_gate_allowed: Optional[bool] = None
         self._startup_reconcile()
 
     def _blank_state(self, day: str) -> Dict[str, Any]:
@@ -358,6 +491,28 @@ class Strategy01Engine:
                 and normalized not in entered_codes
             ):
                 entered_codes.append(normalized)
+        missing_real = sorted(
+            str(code).zfill(6)
+            for code, position in payload["positions"].items()
+            if (
+                isinstance(position, dict)
+                and position.get("phase") in ACTIVE_PHASES
+                and "real" not in position
+            )
+        )
+        if missing_real:
+            for position in payload["positions"].values():
+                if (
+                    isinstance(position, dict)
+                    and position.get("phase") in ACTIVE_PHASES
+                    and "real" not in position
+                ):
+                    position["phase"] = "RECOVERY_BLOCKED"
+            payload["recovery_blocked"] = True
+            payload["last_error"] = (
+                "POSITION_REAL_FLAG_MISSING_MANUAL_CHECK:"
+                + ",".join(missing_real)
+            )
         payload["entered_codes"] = entered_codes
         payload.setdefault("history", [])
         return payload
@@ -368,7 +523,18 @@ class Strategy01Engine:
 
     def _save(self) -> None:
         self.state["heartbeat"] = kst_now().isoformat(timespec="seconds")
-        write_json_atomic(self.config.state_path, self.state)
+        if not write_json_atomic(self.config.state_path, self.state):
+            marker = mark_state_save_failure(self.config.state_path)
+            if marker is None:
+                self.log.critical(
+                    "STATE_SAVE_FAILURE_MARKER_UNWRITABLE state=%s markers=%s",
+                    self.config.state_path,
+                    ",".join(str(path) for path in self.state_save_failure_paths),
+                )
+            self.log.critical(
+                "STATE_SAVE_LOCKED_FAIL_CLOSED path=%s", self.config.state_path)
+            raise RuntimeError(
+                f"STATE_SAVE_LOCKED_FAIL_CLOSED:{self.config.state_path}")
 
     def _positions(self) -> Dict[str, Dict[str, Any]]:
         positions = self.state.setdefault("positions", {})
@@ -386,7 +552,8 @@ class Strategy01Engine:
         for position in self._active_positions().values():
             pending = position.get("pending") or {}
             quantity = (
-                int(pending.get("requested_qty") or self.config.quantity)
+                int(pending.get("pre_hold_qty") or 0)
+                + int(pending.get("requested_qty") or self.config.quantity)
                 if position.get("phase") == "BUY_PENDING"
                 else int(position.get("qty") or self.config.quantity)
             )
@@ -414,7 +581,7 @@ class Strategy01Engine:
         self.state["recovery_blocked"] = any(
             position.get("phase") == "RECOVERY_BLOCKED"
             for position in self._positions().values()
-        )
+        ) or any(path.exists() for path in self.state_save_failure_paths)
 
     def _cleanup_terminal(self) -> None:
         history = self.state.setdefault("history", [])
@@ -436,6 +603,55 @@ class Strategy01Engine:
             targets = audit.setdefault("targets", {})
             exit_at = parse_dt(position.get("exit_at"), now)
             elapsed_sec = max(0.0, (now - exit_at).total_seconds())
+            observation_capture = audit.get("observation_capture") or {}
+            recorder = self.post_exit_observation_recorder
+            if (
+                recorder is not None
+                and 0.0 <= elapsed_sec <= self.config.post_exit_observation_sec
+                and not observation_capture.get("complete")
+            ):
+                code = str(position.get("code") or "").zfill(6)
+                point = self._snapshot_point(code, now)
+                last_observed_at = parse_dt(
+                    observation_capture.get("last_observed_at"), exit_at,
+                )
+                if (
+                    point is not None
+                    and point.get("board_fresh")
+                    and point["ts"] > last_observed_at
+                ):
+                    observation = self._build_observation(position, point)
+                    hold_state = position.get("hold_state") or {}
+                    audit_position = {
+                        "strategy_id": str(
+                            hold_state.get("strategy_id")
+                            or self.config.strategy_id.value
+                        ),
+                        "code": code,
+                        "position_id": str(hold_state.get("position_id") or ""),
+                        "entry_at": str(position.get("entry_at") or ""),
+                        "entry_price": str(position.get("entry_price") or ""),
+                    }
+                    target = recorder.record(
+                        position=audit_position,
+                        observation=observation,
+                        exit_at=exit_at,
+                    )
+                    if target is not None:
+                        observation_capture.update({
+                            "last_observed_at": point["ts"].isoformat(),
+                            "path": str(target),
+                            "rows": int(observation_capture.get("rows") or 0) + 1,
+                            "error": "",
+                        })
+                    elif recorder.last_error:
+                        observation_capture["error"] = recorder.last_error
+                audit["observation_capture"] = observation_capture
+            elif (
+                observation_capture
+                and elapsed_sec > self.config.post_exit_observation_sec
+            ):
+                observation_capture["complete"] = True
             due = [
                 minutes for minutes in (15, 30, 60)
                 if str(minutes) not in targets and elapsed_sec >= minutes * 60
@@ -528,6 +744,46 @@ class Strategy01Engine:
             position for position in self._active_positions().values()
             if position.get("real")
         ]
+        if any(path.exists() for path in self.state_save_failure_paths):
+            self.state["recovery_blocked"] = True
+            self.state["last_error"] = "STATE_SAVE_FAILURE_RECONCILE_REQUIRED"
+            if not self.broker.connect():
+                self._save()
+                return
+            holdings = self.broker.holdings()
+            if holdings is None:
+                self.state["last_error"] = (
+                    "STATE_SAVE_FAILURE_BALANCE_UNAVAILABLE:"
+                    + self.broker.last_error
+                )
+                self._save()
+                return
+            broker_codes = sorted(str(code).zfill(6) for code in holdings)
+            if not real_positions:
+                if broker_codes:
+                    self.state["last_error"] = (
+                        "STATE_SAVE_FAILURE_BROKER_REVIEW_REQUIRED:"
+                        + ",".join(broker_codes)
+                    )
+                    self._save()
+                    return
+                self.state["recovery_blocked"] = False
+                self.state["last_error"] = ""
+                self._save()
+                marker_errors = []
+                for marker in self.state_save_failure_paths:
+                    try:
+                        marker.unlink(missing_ok=True)
+                    except OSError as exc:
+                        marker_errors.append(f"{marker}:{exc}")
+                if marker_errors:
+                    self.state["recovery_blocked"] = True
+                    self.state["last_error"] = (
+                        "STATE_SAVE_FAILURE_MARKER_CLEAR_FAILED:"
+                        + "|".join(marker_errors)
+                    )
+                    self._save()
+                return
         if not real_positions:
             return
         if not self.broker.connect():
@@ -579,7 +835,7 @@ class Strategy01Engine:
             self.state["last_error"] = f"SLOT_RELEASE: {exc}"
 
     def _snapshot_point(self, code: str, now: datetime) -> Optional[Dict[str, Any]]:
-        snapshot = read_json(self.config.snapshot_path, {})
+        snapshot = read_json_cached(self.config.snapshot_path, {})
         raw = (snapshot.get("codes") or {}).get(str(code).zfill(6))
         if not isinstance(raw, dict):
             return None
@@ -589,7 +845,7 @@ class Strategy01Engine:
         price = abs(number(raw.get("cur")))
         if price <= 0:
             return None
-        board_payload = read_json(self.config.board_path, {})
+        board_payload = read_json_cached(self.config.board_path, {})
         board_at = parse_dt(board_payload.get("ts"), now)
         board_fresh = (
             abs((now - board_at).total_seconds()) <= self.config.board_max_age_sec
@@ -607,11 +863,88 @@ class Strategy01Engine:
             "cum_vol": max(0.0, number(raw.get("cum_vol"))),
             "buy_money_cum": number(raw.get("buy_money_cum"), -1.0),
             "sell_money_cum": number(raw.get("sell_money_cum"), -1.0),
+            "che_str": max(0.0, number(raw.get("che_str"))),
+            "buy_vol_cum": number(raw.get("buy_vol_cum"), -1.0),
+            "sell_vol_cum": number(raw.get("sell_vol_cum"), -1.0),
             "money_speed_5s": max(0.0, number(board_row.get("money_speed_5s"))),
             "money_speed_10s": max(0.0, number(board_row.get("money_speed_10s"))),
             "money_speed_30s": max(0.0, number(board_row.get("money_speed_30s"))),
             "board_fresh": board_fresh,
+            # ★[DAY-LOW 2026-08-05 친구님 지시 "모든 전략들이 공동으로 사용하게 해줘"]
+            #   거래소가 주는 당일 시가/고가/저가를 공용 point 에 그대로 실어 배달한다.
+            #   왜 — 전략이 각자 자기가 본 틱으로 저점을 만들면 (ㄱ)구독 전 저점을 못 보고
+            #   (ㄴ)엔진 사정으로 리셋된다. 실제로 S02 의 anchor_low 는 새 고점마다
+            #   현재가로 리셋돼서, 문턱을 조일수록 "저점 대비 %"는 좋아 보이는데 실제
+            #   매수가는 올라갔다(8/5 원익IPS: 계약서 1.439% vs 진짜 3.785%, 착시 2.347%p).
+            #   브로커 broker_gateway_v1 이 체결 FID 16/17/18 을 op/hi/lo 로 싣는다.
+            #   ⚠️안 실리면 0 이다 — 쓰는 쪽에서 0 검사 필수(0 을 저점으로 쓰면 재앙).
+            #   ⚠️지금은 기록·참고용이다. 어떤 매수/매도 판정에도 넣지 않았다.
+            "open_price": max(0.0, number(raw.get("op"))),
+            "day_high": max(0.0, number(raw.get("hi"))),
+            "day_low": max(0.0, number(raw.get("lo"))),
         }
+
+    def _common_exit_micro_rates(
+        self,
+        code: str,
+        point: Mapping[str, Any],
+    ) -> Tuple[float, float, float, float, float]:
+        """Exact volume/strength rates shared by every common exit adapter."""
+        if not hasattr(self, "_common_exit_micro"):
+            self._common_exit_micro = defaultdict(lambda: deque(maxlen=80))
+        rows = self._common_exit_micro[str(code).zfill(6)]
+        current = (
+            point["ts"],
+            number(point.get("buy_vol_cum"), -1.0),
+            number(point.get("sell_vol_cum"), -1.0),
+            number(point.get("che_str")),
+        )
+        if min(current[1], current[2]) < 0 or current[3] <= 0:
+            rows.clear()
+            return 0.0, 0.0, 0.0, 0.0, 0.0
+        if rows and (
+            current[0] <= rows[-1][0]
+            or current[1] < rows[-1][1]
+            or current[2] < rows[-1][2]
+        ):
+            rows.clear()
+        rows.append(current)
+        while rows and (current[0] - rows[0][0]).total_seconds() > 20:
+            rows.popleft()
+
+        def at_or_before(target: datetime):
+            for item in reversed(rows):
+                if item[0] <= target:
+                    return item
+            return None
+
+        recent_target = current[0] - timedelta(seconds=5)
+        previous_target = current[0] - timedelta(seconds=15)
+        recent_start = at_or_before(recent_target)
+        previous_start = at_or_before(previous_target)
+        if recent_start is None or previous_start is None:
+            return 0.0, 0.0, 0.0, current[3], 0.0
+        if (
+            (recent_target - recent_start[0]).total_seconds() > 2
+            or (previous_target - previous_start[0]).total_seconds() > 3
+        ):
+            return 0.0, 0.0, 0.0, current[3], 0.0
+        recent_span = (current[0] - recent_start[0]).total_seconds()
+        previous_span = (recent_start[0] - previous_start[0]).total_seconds()
+        deltas = (
+            current[1] - recent_start[1],
+            current[2] - recent_start[2],
+            recent_start[2] - previous_start[2],
+        )
+        if recent_span <= 0 or previous_span <= 0 or min(deltas) < 0:
+            return 0.0, 0.0, 0.0, current[3], 0.0
+        return (
+            deltas[0] / recent_span,
+            deltas[1] / recent_span,
+            deltas[2] / previous_span,
+            current[3],
+            current[3] - recent_start[3],
+        )
 
     def _known_orders(self, code: str, side: str) -> Optional[list[str]]:
         known = set(fills_by_order(
@@ -665,9 +998,181 @@ class Strategy01Engine:
             )
         return current, fills, open_orders
 
+    def _try_staged_add(
+        self,
+        position: Dict[str, Any],
+        signal: Mapping[str, Any],
+        now: datetime,
+        candidate_rank: int,
+        candidate_count: int,
+    ) -> bool:
+        if str(signal.get("entry_stage") or "") != "STRONG_FLOW":
+            return False
+        code = str(position.get("code") or "").zfill(6)
+        name = str(position.get("name") or code)
+        signal_id = str(signal["signal_id"])
+        if position.get("phase") != "HOLD":
+            self._event(
+                "BUY_WAIT", code=code, name=name,
+                reason="STAGED_ADD_WAITS_FOR_FIRST_FILL",
+            )
+            return True
+
+        target_qty = min(2, int(self.config.quantity))
+        stages = set(position.get("entry_stages") or [])
+        if int(position.get("qty") or 0) >= target_qty or "STRONG_FLOW" in stages:
+            self.state.setdefault("consumed_signals", []).append(signal_id)
+            self._event(
+                "BUY_BLOCKED", code=code, name=name,
+                reason="STAGED_TARGET_ALREADY_FILLED",
+            )
+            return True
+
+        point = self._snapshot_point(code, now)
+        if point is None:
+            return True
+        required = int(Decimal(str(point["price"])))
+        if self._active_capital_krw() + required > self.config.rotation_capital_krw:
+            self._event(
+                "BUY_WAIT", code=code, name=name,
+                price=point["price"], quantity=1,
+                reason="STAGED_ADD_CAPITAL_WAIT",
+            )
+            return True
+
+        known_orders: list[str] = []
+        if getattr(self.broker, "real_session", False):
+            if not getattr(self.broker, "buy_allowed", False):
+                self._event(
+                    "BUY_BLOCKED", code=code, name=name,
+                    reason="APPROVAL_OR_OFF_FLAG",
+                )
+                return True
+            holdings = self.broker.holdings()
+            if holdings is None:
+                self._event(
+                    "BUY_WAIT", code=code, name=name,
+                    reason="STAGED_ADD_BALANCE_UNAVAILABLE",
+                )
+                return True
+            actual_qty = int((holdings.get(code) or {}).get("qty") or 0)
+            if actual_qty != int(position.get("qty") or 0):
+                self._event(
+                    "BUY_WAIT", code=code, name=name,
+                    reason="STAGED_ADD_BALANCE_MISMATCH",
+                )
+                return True
+            open_buy = self.broker.open_orders(code, buy=True)
+            if open_buy is None or open_buy:
+                self._event(
+                    "BUY_WAIT", code=code, name=name,
+                    reason="STAGED_ADD_OPEN_BUY_EXISTS_OR_UNKNOWN",
+                )
+                return True
+            known = self._known_orders(code, "매수")
+            if known is None:
+                self._event(
+                    "BUY_WAIT", code=code, name=name,
+                    reason="STAGED_ADD_ORDER_HISTORY_UNAVAILABLE",
+                )
+                return True
+            known_orders = known
+
+        attempt = int(self.state.get("order_attempts_total") or 0) + 1
+        order_key = (
+            f"{self.config.strategy_slug}:"
+            f"{self.state['date']}:buy-add:{code}:{attempt}"
+        )
+        pending = {
+            "side": "BUY",
+            "idempotency_key": order_key,
+            "known_orders": known_orders,
+            "order_no": "",
+            "requested_qty": 1,
+            "pre_hold_qty": int(position.get("qty") or 0),
+            "entry_stage": "STRONG_FLOW",
+            "since_hms": now.strftime("%H:%M:%S"),
+            "sent_epoch": time.time(),
+            "cancel_requested": False,
+            "cancel_epoch": 0.0,
+            "last_status": "PREPARED",
+            "reason": str(signal.get("reason") or "STRONG_FLOW_CONFIRMED"),
+        }
+        position.update({
+            "phase": "BUY_PENDING",
+            "pending": pending,
+            "last_price": point["price"],
+            "last_ts": point["ts"].isoformat(),
+            "signal_id": signal_id,
+            "candidate_rank_at_entry": candidate_rank,
+            "candidate_count_at_entry": candidate_count,
+        })
+        self.state.setdefault("consumed_signals", []).append(signal_id)
+        self.state["order_attempts_total"] = attempt
+        self._save()
+        status = self.broker.submit(
+            side="BUY", code=code, quantity=1, idempotency_key=order_key,
+        )
+        pending["last_status"] = status
+        if status == "SHADOW":
+            self._confirm_entry(position, 1, point["price"], now, shadow=True)
+        elif status == "OK":
+            self._event(
+                "BUY_ADD_PENDING", code=code, name=name,
+                price=point["price"], quantity=1,
+                reason="OK: exact fill reconciliation",
+            )
+        elif status in {"TIMEOUT", "UNKNOWN"}:
+            position["phase"] = "RECOVERY_BLOCKED"
+            self.state["recovery_blocked"] = True
+            self.state["last_error"] = f"BUY_ADD_{status}_BROKER_TRUTH_REQUIRED"
+            self._event(
+                "RECOVERY_BLOCKED", code=code, name=name,
+                reason=self.state["last_error"],
+            )
+        else:
+            self._fail_or_restore_buy(position, "BUY_ADD_REJECTED")
+        self._save()
+        return True
+
     def _try_entries(self, now: datetime) -> None:
         if self.state.get("recovery_blocked"):
             return
+        # S01~S03 start before the all-strategy preflight so opening signals
+        # are not lost to process startup. Do not even select/consume a signal
+        # until StrategyBroker confirms that the existing approval/off gate
+        # has actually enabled buys. Hold/sell recovery runs earlier in tick().
+        gate_controlled = (
+            self.config.strategy_id == StrategyId.S01_OPEN_SURGE
+            or (
+                bool(getattr(self.broker, "live_requested", False))
+                and self.config.strategy_id in {
+                    StrategyId.S02_LOW_BUY_SELL_EXHAUSTION,
+                    StrategyId.VALLEY_MORNING_CRASH,
+                }
+            )
+        )
+        if gate_controlled:
+            buy_gate_allowed = self.broker.buy_allowed
+            if not buy_gate_allowed:
+                if self._last_s01_buy_gate_allowed is not False:
+                    self.log.critical(
+                        "%s_BUY_GATE_CLOSED standby; no signal consumed",
+                        self.config.strategy_id.value,
+                    )
+                    self._event(
+                        "BUY_GATE_CLOSED",
+                        reason="APPROVAL_OR_SAFETY_GATE",
+                    )
+                self._last_s01_buy_gate_allowed = False
+                return
+            if self._last_s01_buy_gate_allowed is False:
+                self.log.info(
+                    "%s_BUY_GATE_OPEN entries enabled",
+                    self.config.strategy_id.value,
+                )
+                self._event("BUY_GATE_OPEN", reason="PREFLIGHT_APPROVED")
+            self._last_s01_buy_gate_allowed = True
         payload = read_json(self.config.signal_path, {})
         rows = self.signal_selector(
             payload,
@@ -676,18 +1181,29 @@ class Strategy01Engine:
             consumed=self.state.get("consumed_signals") or [],
         )
         candidate_count = len(rows)
+        bars_payload = read_json_cached(self.config.bars_path, {})
         for candidate_rank, signal in enumerate(rows, start=1):
-            if len(self._active_positions()) >= self.config.max_slots:
-                return
             code = str(signal["code"]).zfill(6)
             signal_id = str(signal["signal_id"])
             name = str(signal.get("name") or self.names.get(code) or code)
-            if code in self._active_positions():
+            active = self._active_positions().get(code)
+            if active is not None:
+                if self._try_staged_add(
+                    active, signal, now, candidate_rank, candidate_count,
+                ):
+                    continue
                 self._event(
                     "BUY_BLOCKED", code=code, name=name,
                     reason="CODE_ALREADY_ACTIVE",
                 )
                 continue
+            if len(self._active_positions()) >= self.config.max_slots:
+                return
+            entry_stage = str(signal.get("entry_stage") or "")
+            order_qty = (
+                1 if entry_stage in {"EARLY_FLOW", "STRONG_FLOW"}
+                else int(self.config.quantity)
+            )
             entered_codes = {
                 str(item).zfill(6)
                 for item in (self.state.get("entered_codes") or [])
@@ -720,11 +1236,17 @@ class Strategy01Engine:
             if point is None:
                 continue
             required = int(
-                Decimal(str(point["price"])) * int(self.config.quantity))
+                Decimal(str(point["price"])) * order_qty)
+            if not position_budget.can_open_krw(required):
+                self._event(
+                    "BUY_WAIT", code=code, name=name, price=point["price"],
+                    quantity=order_qty, reason="COMMON_CAPITAL_WAIT",
+                )
+                continue
             if self._active_capital_krw() + required > self.config.rotation_capital_krw:
                 self._event(
                     "BUY_WAIT", code=code, name=name, price=point["price"],
-                    quantity=self.config.quantity,
+                    quantity=order_qty,
                     reason=(
                         f"ROTATION_CAPITAL_WAIT "
                         f"{self._active_capital_krw()}+{required}>"
@@ -734,6 +1256,17 @@ class Strategy01Engine:
                 continue
 
             if getattr(self.broker, "real_session", False):
+                if ma3_rows(code, bars_payload) is None:
+                    ma3_request_missing_history(
+                        code, f"{self.config.strategy_id.value}:ENTRY",
+                    )
+                    self.state["last_error"] = f"MA3_SEED_NOT_READY:{code}"
+                    self._event(
+                        "BUY_BLOCKED", code=code, name=name,
+                        reason="MA3_SEED_NOT_READY",
+                    )
+                    self._save()
+                    continue
                 if not getattr(self.broker, "buy_allowed", False):
                     self._event(
                         "BUY_BLOCKED", code=code, name=name,
@@ -741,7 +1274,21 @@ class Strategy01Engine:
                     )
                     self._save()
                     return
-                holdings = self.broker.holdings()
+                fast_prebuy_truth = self.config.strategy_id in {
+                    StrategyId.S01_OPEN_SURGE,
+                    StrategyId.S02_LOW_BUY_SELL_EXHAUSTION,
+                    StrategyId.VALLEY_MORNING_CRASH,
+                }
+                holdings_reader = (
+                    getattr(
+                        self.broker,
+                        "prebuy_holdings",
+                        self.broker.holdings,
+                    )
+                    if fast_prebuy_truth
+                    else self.broker.holdings
+                )
+                holdings = holdings_reader()
                 if holdings is None:
                     self.state["last_error"] = (
                         f"PREBUY_BALANCE_UNAVAILABLE:{self.broker.last_error}")
@@ -758,7 +1305,16 @@ class Strategy01Engine:
                         reason="ACCOUNT_ALREADY_HOLDS_CODE",
                     )
                     continue
-                open_buy = self.broker.open_orders(code, buy=True)
+                open_orders_reader = (
+                    getattr(
+                        self.broker,
+                        "prebuy_open_orders",
+                        self.broker.open_orders,
+                    )
+                    if fast_prebuy_truth
+                    else self.broker.open_orders
+                )
+                open_buy = open_orders_reader(code, buy=True)
                 if open_buy is None:
                     self.state["last_error"] = "PREBUY_OPEN_ORDER_UNAVAILABLE"
                     self._event(
@@ -805,8 +1361,9 @@ class Strategy01Engine:
                 "idempotency_key": order_key,
                 "known_orders": known_orders,
                 "order_no": "",
-                "requested_qty": self.config.quantity,
+                "requested_qty": order_qty,
                 "pre_hold_qty": 0,
+                "entry_stage": entry_stage,
                 "since_hms": now.strftime("%H:%M:%S"),
                 "sent_epoch": time.time(),
                 "cancel_requested": False,
@@ -827,6 +1384,8 @@ class Strategy01Engine:
                 "signal_id": signal_id,
                 "entry_lane": str(signal.get("entry_lane") or ""),
                 "signal_sequence": int(signal.get("signal_sequence") or 0),
+                "entry_stage": entry_stage,
+                "entry_stages": [],
                 "candidate_rank_at_entry": candidate_rank,
                 "candidate_count_at_entry": candidate_count,
                 "cycle_target": cycles + 1,
@@ -844,17 +1403,17 @@ class Strategy01Engine:
             status = self.broker.submit(
                 side="BUY",
                 code=code,
-                quantity=self.config.quantity,
+                quantity=order_qty,
                 idempotency_key=order_key,
             )
             pending["last_status"] = status
             if status == "SHADOW":
                 self._confirm_entry(
-                    position, self.config.quantity, point["price"], now, shadow=True)
+                    position, order_qty, point["price"], now, shadow=True)
             elif status == "OK":
                 self._event(
                     "BUY_PENDING", code=code, name=name,
-                    price=point["price"], quantity=self.config.quantity,
+                    price=point["price"], quantity=order_qty,
                     reason="OK: exact fill reconciliation",
                 )
             elif status in {"TIMEOUT", "UNKNOWN"}:
@@ -863,7 +1422,7 @@ class Strategy01Engine:
                 self.state["last_error"] = f"BUY_{status}_BROKER_TRUTH_REQUIRED"
                 self._event(
                     "RECOVERY_BLOCKED", code=code, name=name,
-                    price=point["price"], quantity=self.config.quantity,
+                    price=point["price"], quantity=order_qty,
                     reason=self.state["last_error"],
                 )
                 self._save()
@@ -874,7 +1433,7 @@ class Strategy01Engine:
                 position["slot_reserved"] = False
                 self._event(
                     "BUY_REJECTED", code=code, name=name,
-                    price=point["price"], quantity=self.config.quantity,
+                    price=point["price"], quantity=order_qty,
                     reason=f"{status}: {getattr(self.broker, 'last_error', '')}",
                 )
             self._save()
@@ -889,6 +1448,43 @@ class Strategy01Engine:
     ) -> None:
         fill_price = fill_price or number(position.get("last_price"))
         code = str(position.get("code") or "").zfill(6)
+        pending = position.get("pending") or {}
+        pre_hold_qty = int(pending.get("pre_hold_qty") or 0)
+        entry_stage = str(
+            pending.get("entry_stage") or position.get("entry_stage") or "")
+        if pre_hold_qty > 0 and position.get("hold_state"):
+            old_price = number(position.get("entry_price"))
+            total_qty = pre_hold_qty + int(quantity)
+            average_price = (
+                old_price * pre_hold_qty + fill_price * int(quantity)
+            ) / total_qty
+            hold_state = HoldSellState.from_dict(position["hold_state"])
+            hold_state.quantity = total_qty
+            hold_state.entry_price = Decimal(str(average_price))
+            hold_state.peak_price = max(
+                hold_state.peak_price, Decimal(str(average_price)))
+            stages = list(position.get("entry_stages") or [])
+            if entry_stage and entry_stage not in stages:
+                stages.append(entry_stage)
+            position.update({
+                "phase": "HOLD",
+                "qty": total_qty,
+                "entry_price": average_price,
+                "hold_state": hold_state.to_dict(),
+                "entry_stages": stages,
+                "pending": None,
+                "real": not shadow,
+                "reserved_capital_krw": int(average_price * total_qty),
+            })
+            self._update_excursion(position, fill_price, observed_at)
+            self._refresh_recovery_blocked()
+            self._event(
+                "SHADOW_BUY_ADD" if shadow else "BUY_ADD_CONFIRMED",
+                code=position["code"], name=position["name"],
+                price=fill_price, quantity=quantity,
+                reason=f"{entry_stage or 'STAGED_ADD'} total_qty={total_qty}",
+            )
+            return
         entered_codes = self.state.setdefault("entered_codes", [])
         if code not in entered_codes:
             entered_codes.append(code)
@@ -915,6 +1511,10 @@ class Strategy01Engine:
             "pending": None,
             "real": not shadow,
         })
+        stages = list(position.get("entry_stages") or [])
+        if entry_stage and entry_stage not in stages:
+            stages.append(entry_stage)
+        position["entry_stages"] = stages
         self._update_excursion(position, fill_price, observed_at)
         self._refresh_recovery_blocked()
         self._event(
@@ -927,6 +1527,44 @@ class Strategy01Engine:
                 + f"{int(position.get('candidate_count_at_entry') or 0)}"
             ),
         )
+
+    def _fail_or_restore_buy(
+        self, position: Dict[str, Any], event: str,
+    ) -> None:
+        pending = position.get("pending") or {}
+        pre_hold_qty = int(pending.get("pre_hold_qty") or 0)
+        if pre_hold_qty > 0 and position.get("hold_state"):
+            position["phase"] = "HOLD"
+            position["qty"] = pre_hold_qty
+            position["pending"] = None
+            self._event(
+                event, code=position["code"], name=position["name"],
+                reason="existing position preserved",
+            )
+            return
+        position["phase"] = "FAILED"
+        self._release_slot(position)
+        position["slot_reserved"] = False
+        position["pending"] = None
+        self._event(
+            event, code=position["code"], name=position["name"],
+            reason="initial buy not created",
+        )
+
+    @staticmethod
+    def _balance_fill_price(
+        position: Dict[str, Any], actual_qty: int, balance_average: float,
+    ) -> float:
+        pending = position.get("pending") or {}
+        pre_qty = int(pending.get("pre_hold_qty") or 0)
+        added = actual_qty - pre_qty
+        if pre_qty <= 0 or added <= 0 or balance_average <= 0:
+            return balance_average
+        old_price = number(position.get("entry_price"))
+        incremental = (
+            balance_average * actual_qty - old_price * pre_qty
+        ) / added
+        return incremental if incremental > 0 else balance_average
 
     def _buy_pending_step(self, position: Dict[str, Any], now: datetime) -> None:
         pending = position["pending"]
@@ -958,19 +1596,19 @@ class Strategy01Engine:
             if quantity > 0:
                 self._confirm_entry(position, min(quantity, needed), average, now)
             elif int(actual.get("qty") or 0) > int(pending.get("pre_hold_qty") or 0):
+                actual_qty = int(actual["qty"])
+                pre_qty = int(pending.get("pre_hold_qty") or 0)
+                balance_average = number(actual.get("buy_price"))
                 self._confirm_entry(
                     position,
-                    min(needed, int(actual["qty"])),
-                    number(actual.get("buy_price")) or number(position["last_price"]),
+                    min(needed, actual_qty - pre_qty),
+                    self._balance_fill_price(
+                        position, actual_qty, balance_average,
+                    ) or number(position["last_price"]),
                     now,
                 )
             else:
-                position["phase"] = "FAILED"
-                self._release_slot(position)
-                position["slot_reserved"] = False
-                position["pending"] = None
-                self._event("BUY_FILL_ZERO", code=code, name=position["name"],
-                            reason="cancel confirmed and broker balance unchanged")
+                self._fail_or_restore_buy(position, "BUY_FILL_ZERO")
             return
 
         elapsed = time.time() - number(pending.get("sent_epoch"))
@@ -1008,56 +1646,39 @@ class Strategy01Engine:
             return
         actual = holdings.get(code) or {}
         if int(actual.get("qty") or 0) > int(pending.get("pre_hold_qty") or 0):
+            actual_qty = int(actual["qty"])
+            pre_qty = int(pending.get("pre_hold_qty") or 0)
+            balance_average = number(actual.get("buy_price"))
             self._confirm_entry(
                 position,
-                min(needed, int(actual["qty"])),
-                number(actual.get("buy_price")) or number(position["last_price"]),
+                min(needed, actual_qty - pre_qty),
+                self._balance_fill_price(
+                    position, actual_qty, balance_average,
+                ) or number(position["last_price"]),
                 now,
             )
             return
         candidates = set(open_orders) - set(pending.get("known_orders") or [])
         if candidates:
             return
-        position["phase"] = "FAILED"
-        self._release_slot(position)
-        position["slot_reserved"] = False
-        position["pending"] = None
-        self._event("BUY_NOT_CREATED", code=code, name=position["name"],
-                    reason="fills/open orders/balance all zero")
+        self._fail_or_restore_buy(position, "BUY_NOT_CREATED")
 
-    def _load_daily_ma(self) -> None:
-        """일봉 종가로 5·10·20일선과 20일선 전일값을 1회 캐시한다(TR 0·읽기 전용)."""
-        if self._daily_ma is not None:
-            return
-        self._daily_ma = {}
-        by_code: Dict[str, Dict[str, float]] = {}
-        try:
-            with self.config.eod_bars_path.open(encoding="utf-8-sig", newline="") as fh:
-                for raw in csv.DictReader(fh):
-                    code = str(raw.get("code") or "").zfill(6)
-                    day = str(raw.get("date") or "").replace("-", "")
-                    close = number(raw.get("close"))
-                    if len(code) == 6 and code.isdigit() and day and close > 0:
-                        by_code.setdefault(code, {})[day] = close
-        except OSError:
-            self.log.warning("일봉 파일 없음 — 상승보유 허가 비활성")
-            return
-        for code, series in by_code.items():
-            days = sorted(series)
-            if len(days) < 21:
-                continue
-            closes = [series[day] for day in days]
-            self._daily_ma[code] = {
-                "ma5": sum(closes[-5:]) / 5,
-                "ma10": sum(closes[-10:]) / 10,
-                "ma20": sum(closes[-20:]) / 20,
-                "ma20_prev": sum(closes[-21:-1]) / 20,
-            }
-        self.log.info("일봉 이평 캐시 %d종목 (5·10·20일선)", len(self._daily_ma))
+    # ★[LEGACY-DAILY-MA 제거 2026-08-05 친구님 지시 "그것도 지워"] 여기 있던
+    #   _load_daily_ma(일봉 종가 -> 5/10/20선 캐시)와 __init__ 의 self._daily_ma 를
+    #   지웠다. 8/3 에 상승보유를 일봉->3분봉(ma3_common_v1)으로 전면 교체한 뒤로
+    #   이 로더를 부르는 곳이 아무 데도 없었다(같은 날 S02 쪽 사본과 그 유일한
+    #   소비자 _daily_ma_permit_legacy 도 함께 제거).
+    #   ⚠️되살리지 말 것 — 일봉 5일선은 장중에 안 움직이는 고정값이라 하루 안에
+    #     깨질 수가 없다. 8/3 실측: 에스피지 손절가가 일봉 5일선보다 +38.2% 위 ->
+    #     상승보유 100% 참 -> 매도 판정이 478번 중 124번 통째로 막혔다.
+    #   상승보유 판정은 아래 _daily_ma_permit(3분봉) 하나뿐이다.
+    #   ⚠️config.eod_bars_path 와 csv 임포트는 지우지 않았다 — 각각 S03/S06 의
+    #     자체 로더와 이벤트 CSV 기록이 여전히 쓴다.
+    #   되돌리기: backup\strategy_01_rotation_engine_v2_20260805_before_legacy_removal.py
 
     def _recent_3min_high(self, code: str) -> float:
         """완성 1분봉 3개(=3분봉 1개)의 고가. 자료가 없으면 0."""
-        payload = read_json(self.config.bars_path, {})
+        payload = read_json_cached(self.config.bars_path, {})
         source = payload.get("m") if isinstance(payload.get("m"), dict) else payload
         previous = ((source or {}).get(code) or {}).get("prev") or []
         highs = [
@@ -1066,31 +1687,40 @@ class Strategy01Engine:
         ]
         return max(highs) if len(highs) == 3 else 0.0
 
-    def _daily_ma_permit(self, code: str, price: float) -> bool:
-        """상승보유 허가 — 친구님 확정 조건.
+    def _daily_ma_permit(
+        self,
+        code: str,
+        price: float,
+        buy_side: Optional[bool] = None,
+    ) -> bool:
+        """상승보유 허가 — 전 전략 공통. ma3_common_v1 이 유일한 기준이다.
 
-        3분봉이 5일선을 횡보(고가가 5일선 이상)하고, 10일선이 뒤를 받치며(5일선 위 정배열),
-        10일선을 침범해도 20일선이 우상향으로 보조하면 매도하지 않고 상승보유한다.
-        따라서 현재가가 10일선 아래인지는 조건에 넣지 않는다(침범 허용).
+        ★[MA3-COMMON 2026-08-03 친구님 지시] 종전에는 '일봉' 5/10/20선을 썼다.
+          일봉 5일선은 장중에 안 움직이는 고정값이라 하루 안에 깨질 수가 없다
+          (8/3 실측: 에스피지 손절가가 일봉 5일선보다 +38.2% 위 → 상승보유가
+          100% 참 → 트레일 매도가 478번 판정 중 124번 통째로 막힘. 엔젤로보틱스는
+          고점 대비 -6.06% 를 방치하고 손절). 친구님이 말한 5/10/20선은 '3분봉'의
+          선이었고, 이름만 같은 다른 물건이 들어가 있었다.
+          지금은 3분봉 5/10/20선(선 지지) + 매수세 우위, 2단 판정으로 통일한다.
+          되돌리기: backup\\strategy_01_rotation_engine_v2_20260803_ma3wire.py
         """
-        self._load_daily_ma()
-        row = (self._daily_ma or {}).get(code)
-        if not row:
-            return False
-        ma5, ma10, ma20, ma20_prev = (
-            row["ma5"], row["ma10"], row["ma20"], row["ma20_prev"])
-        if not (ma5 > 0 and ma10 > 0 and ma20 > 0):
-            return False
-        if not ma5 > ma10:                      # 10일선이 뒤를 받치는 정배열
-            return False
-        if not ma20 > ma20_prev:                # 20일선 우상향 보조
-            return False
-        high3 = self._recent_3min_high(code)
-        reference = high3 if high3 > 0 else price
-        return reference >= ma5                 # 3분봉이 5일선을 횡보(걸치거나 위)
+        # ★[MA20-PHASE 2026-08-05 친구님 지시 "남은 어긋남 지금 해결 해"]
+        #   같은 날 지시가 둘이었고 서로 어긋나 있었다.
+        #     (가) "지금 켜" — S01 만 20선 단계를 상승보유에 다시 넣어라.
+        #     (나) "이 해제는 매도(꼭지) 상황에서만이지 손실방어 국면엔 적용 안 한다."
+        #   (가)대로 하면 S01 은 꼭지 국면에서도 20선으로 버텨 이익을 반납한다.
+        #   (나)가 나중 지시이자 더 좁은 규칙이라 (나)로 통일한다 —
+        #     꼭지 국면: 20선만 걸친 상태는 보유 안 줌(= 팔 수 있다)
+        #     손실방어 국면: 20선이 받쳐주면 보유(_build_observation 의
+        #                    ma20_defense_permit 이 담당한다)
+        #   그래서 여기(꼭지용 daily_ma_permit)는 allow_ma20 을 붙이지 않는다.
+        #   이제 S01·S02·S05 가 같은 규칙이다.
+        #   되돌리기: allow_ma20=True 를 다시 붙이면 8/5 (가) 상태로 간다.
+        #   백업: backup\strategy_01_rotation_engine_v2_20260805_before_s01_ma20_phase.py
+        return ma3_rider_permit(code, price, buy_side=buy_side)
 
     def _completed_structure_low(self, code: str) -> float:
-        payload = read_json(self.config.bars_path, {})
+        payload = read_json_cached(self.config.bars_path, {})
         source = payload.get("m") if isinstance(payload.get("m"), dict) else payload
         row = (source or {}).get(code) or {}
         previous = row.get("prev") or []
@@ -1099,6 +1729,35 @@ class Strategy01Engine:
             if len(bar) >= 3 and number(bar[2]) > 0
         ]
         return min(lows) if len(lows) == 3 else 0.0
+
+    def _one_minute_bull_to_bear(self, code: str) -> bool:
+        payload = read_json_cached(self.config.bars_path, {})
+        source = payload.get("m") if isinstance(payload.get("m"), dict) else payload
+        row = (source or {}).get(str(code).zfill(6)) or {}
+        previous = row.get("prev") or []
+        if not previous or len(previous[-1]) < 4:
+            return False
+        previous_bull = number(previous[-1][3]) > number(previous[-1][0])
+        current_open = number(row.get("o"))
+        current_close = number(row.get("c"))
+        return bool(
+            previous_bull
+            and current_open > 0
+            and current_close > 0
+            and current_close < current_open
+        )
+
+    def _one_minute_bearish(self, code: str) -> bool:
+        payload = read_json_cached(self.config.bars_path, {})
+        source = payload.get("m") if isinstance(payload.get("m"), dict) else payload
+        row = (source or {}).get(str(code).zfill(6)) or {}
+        current_open = number(row.get("o"))
+        current_close = number(row.get("c"))
+        return bool(
+            current_open > 0
+            and current_close > 0
+            and current_close < current_open
+        )
 
     def _build_observation(
         self,
@@ -1127,6 +1786,24 @@ class Strategy01Engine:
         if not (price * 0.5 <= vwap <= price * 2.0):
             vwap = 0.0
         structure_low = self._completed_structure_low(code)
+        bars_payload = read_json_cached(self.config.bars_path, {})
+        (
+            buy_volume_5s,
+            sell_volume_5s,
+            previous_sell_volume_10s,
+            che_str,
+            che_change_5s,
+        ) = self._common_exit_micro_rates(code, point)
+        ma3 = ma3_rows(code, bars_payload) or {}
+        # ★[MA20-PHASE 2026-08-05] 국면마다 답이 다르므로 두 번 구한다(위
+        #   _daily_ma_permit 주석 참조). 매수세 판정은 한 번만 하고 나눠 쓴다.
+        #   ⚠️파일을 두 번 읽지 않는다 — bars_payload 를 그대로 넘기기 때문이다.
+        ma_buy_side = ma3_buy_side_alive(
+            buy10, buy30, sell10, sell30,
+            sell_volume_5s, previous_sell_volume_10s,
+        )
+        ma_hold = ma3_rider_permit(          # 꼭지용: 20선만 걸친 상태는 보유 없음
+            code, price, payload=bars_payload, buy_side=ma_buy_side)
         return HoldSellObservation(
             observed_at=observed_at,
             price=Decimal(str(price)),
@@ -1139,6 +1816,12 @@ class Strategy01Engine:
             sell_money_per_sec_10s=Decimal(str(sell10)),
             buy_money_per_sec_30s=Decimal(str(buy30)),
             sell_money_per_sec_30s=Decimal(str(sell30)),
+            buy_volume_per_sec_5s=Decimal(str(buy_volume_5s)),
+            sell_volume_per_sec_5s=Decimal(str(sell_volume_5s)),
+            sell_volume_per_sec_previous_10s=Decimal(
+                str(previous_sell_volume_10s)),
+            che_str=Decimal(str(che_str)),
+            che_str_change_5s=Decimal(str(che_change_5s)),
             structure_broken=bool(structure_low > 0 and price < structure_low),
             money_accelerating=bool(
                 point["money_speed_10s"] > 0
@@ -1146,7 +1829,39 @@ class Strategy01Engine:
             ),
             recent_buy_money_rising=bool(
                 rate10 and rate30 and rate10[0] >= rate30[0]),
-            daily_ma_permit=self._daily_ma_permit(code, price),
+            one_minute_bull_to_bear=self._one_minute_bull_to_bear(code),
+            one_minute_bearish=self._one_minute_bearish(code),
+            # 명시적 그림자 포지션만 order-zero 규칙을 쓴다. real 키가 없는
+            # 구형/손상 상태는 _load_state에서 RECOVERY_BLOCKED로 차단한다.
+            common_peak_flow_ready=bool(
+                exact
+                and rate10 is not None
+                and isinstance(position.get("real"), bool)
+            ),
+            # ★[MA3-COMMON 2026-08-03] 상승보유는 '선 지지 + 매수세 우위' 2단이다.
+            #   매수세는 여기 있는 거래대금 속도(10s/30s)로 판정한다. 체결량 속도는
+            #   S02·S05 만 관측하므로 그쪽에서 따로 더 넣는다.
+            daily_ma_permit=ma_hold,
+            # ★[MA20-DEFENSE 2026-08-05] 20선 단계까지 인정한 상승보유.
+            #   공통 매도엔진이 손실방어 국면에서만 쓴다(꼭지에는 안 쓴다).
+            #   ★[MA20-PHASE 2026-08-05] 8/5 밤에 위 ma_hold 와 갈랐다. 그 전에는
+            #   둘이 같은 값(allow_ma20=True)이라 S01 만 꼭지에서도 20선으로
+            #   버텼다. 이제 S01·S02·S05 가 같은 규칙이다. ⚠️S04 는 이 엔진을
+            #   그대로 쓰므로(strategy_04_rotation_engine_v1.py 가 Strategy01Engine
+            #   을 직접 생성) 같이 바뀐다.
+            #   ⚠️여기 붙여서 부르는 형태를 유지할 것 — 아침 계약 검사가
+            #     'ma20_defense_permit= 에 대입되는 호출'만 손실방어용으로 세고
+            #     나머지 allow_ma20=True 는 꼭지용 예외로 고발한다(S02 와 같은 꼴).
+            ma20_defense_permit=ma3_rider_permit(
+                code, price, payload=bars_payload, buy_side=ma_buy_side,
+                allow_ma20=True),
+            daily_ma5_broken=ma3_ma5_broken(code, price, bars_payload),
+            ma10_support=bool(
+                ma3.get("ma10", 0.0) > 0 and price >= ma3["ma10"]
+            ),
+            ma20_rising=bool(
+                ma3.get("ma20", 0.0) > ma3.get("ma20_prev", 0.0) > 0
+            ),
         )
 
     def _direct_hard_stop_permitted(
@@ -1183,16 +1898,6 @@ class Strategy01Engine:
         position["last_price"] = point["price"]
         position["last_ts"] = point["ts"].isoformat()
         self._update_excursion(position, point["price"], point["ts"])
-        entry_price = number(position.get("entry_price"))
-        return_pct = (
-            (point["price"] / entry_price - 1.0) * 100
-            if entry_price > 0 else 0.0
-        )
-        if return_pct <= -2.0 and self._direct_hard_stop_permitted(
-            position, point
-        ):
-            self._start_sell(position, now, f"HARD_STOP {return_pct:.2f}%", point)
-            return
         if now.time() >= force_exit_at:
             self._start_sell(
                 position,
@@ -1213,7 +1918,15 @@ class Strategy01Engine:
         decision = self.exit_engine.evaluate(hold_state, observation)
         position["hold_state"] = hold_state.to_dict()
         if decision.should_sell:
-            self._start_sell(position, now, decision.reason, point)
+            partial = decision.action is HoldSellAction.PARTIAL_SELL
+            self._start_sell(
+                position,
+                now,
+                decision.reason,
+                point,
+                quantity_override=1 if partial else None,
+                partial=partial,
+            )
 
     def _start_sell(
         self,
@@ -1221,17 +1934,51 @@ class Strategy01Engine:
         now: datetime,
         reason: str,
         point: Optional[Mapping[str, Any]],
+        *,
+        quantity_override: Optional[int] = None,
+        partial: bool = False,
     ) -> None:
-        if int(position.get("sell_retries") or 0) >= self.config.max_sell_retries:
+        retries = int(position.get("sell_retries") or 0)
+        force_exit_order = str(reason or "").startswith("TIME_EXIT_")
+        retry_limit = self.config.max_sell_retries + (
+            FORCE_EXIT_EXTRA_RETRIES if force_exit_order else 0
+        )
+        if retries >= retry_limit:
             position["phase"] = "RECOVERY_BLOCKED"
             self.state["recovery_blocked"] = True
-            self.state["last_error"] = "SELL_RETRY_EXHAUSTED_MANUAL_CHECK"
-            self._event("SELL_RETRY_EXHAUSTED", code=position["code"],
-                        name=position["name"], reason=reason)
+            self.state["last_error"] = (
+                "FORCE_EXIT_RETRY_EXHAUSTED_MANUAL_CHECK"
+                if force_exit_order
+                else "SELL_RETRY_EXHAUSTED_MANUAL_CHECK"
+            )
+            now_epoch = time.time()
+            last_event = number(
+                position.get("sell_retry_exhausted_event_epoch"), -1.0
+            )
+            if (
+                last_event < 0
+                or now_epoch - last_event >= EXHAUSTED_EVENT_COOLDOWN_SEC
+            ):
+                position["sell_retry_exhausted_event_epoch"] = now_epoch
+                self._event(
+                    "SELL_RETRY_EXHAUSTED",
+                    code=position["code"],
+                    name=position["name"],
+                    reason=reason,
+                )
             return
         price = number((point or {}).get("price"), number(position.get("last_price")))
+        position_qty = int(position.get("qty") or 0)
+        partial_intent = bool(partial and position_qty > 1)
+        requested_qty = position_qty
+        if quantity_override is not None:
+            requested_qty = min(requested_qty, max(1, int(quantity_override)))
         if not position.get("real"):
-            self._confirm_exit(position, price, reason, shadow=True)
+            if partial_intent and 0 < requested_qty < position_qty:
+                self._confirm_partial_exit(
+                    position, requested_qty, price, reason, shadow=True)
+            else:
+                self._confirm_exit(position, price, reason, shadow=True)
             return
         holdings = self.broker.holdings()
         if holdings is None:
@@ -1246,6 +1993,8 @@ class Strategy01Engine:
             self._confirm_exit(position, price, "BROKER_ALREADY_FLAT")
             return
         quantity = min(int(position.get("qty") or 0), available or actual_qty)
+        if quantity_override is not None:
+            quantity = min(quantity, max(1, int(quantity_override)))
         if quantity <= 0:
             position["retry_after_epoch"] = time.time() + 5
             self._event("SELL_WAIT", code=position["code"], name=position["name"],
@@ -1256,9 +2005,12 @@ class Strategy01Engine:
             position["retry_after_epoch"] = time.time() + 5
             return
         retry = int(position.get("sell_retries") or 0) + 1
+        recovery_cycle = int(position.get("sell_recovery_cycle") or 0)
         key = (
             f"{self.config.strategy_slug}:"
-            f"{self.state['date']}:sell:{position['code']}:{retry}"
+            f"{self.state['date']}:sell:{position['code']}:"
+            + (f"recovery{recovery_cycle}:" if recovery_cycle else "")
+            + str(retry)
         )
         position["sell_retries"] = retry
         position["phase"] = "SELL_PENDING"
@@ -1275,6 +2027,9 @@ class Strategy01Engine:
             "cancel_epoch": 0.0,
             "last_status": "PREPARED",
             "reason": reason,
+            "partial": bool(
+                partial_intent and quantity < position_qty and quantity < actual_qty
+            ),
         }
         self._save()
         status = self.broker.submit(
@@ -1288,7 +2043,11 @@ class Strategy01Engine:
                 reason=f"{reason} / {status} exact fill reconciliation",
             )
         elif status == "SHADOW":
-            self._confirm_exit(position, price, reason, shadow=True)
+            if position["pending"].get("partial"):
+                self._confirm_partial_exit(
+                    position, quantity, price, reason, shadow=True)
+            else:
+                self._confirm_exit(position, price, reason, shadow=True)
         else:
             position["phase"] = "HOLD"
             position["pending"] = None
@@ -1306,7 +2065,11 @@ class Strategy01Engine:
         filled, average = fills.get(order_no, (0, 0.0)) if order_no else (0, 0.0)
         needed = int(pending["requested_qty"])
         if filled >= needed:
-            self._confirm_exit(position, average, pending["reason"])
+            if pending.get("partial"):
+                self._confirm_partial_exit(
+                    position, needed, average, pending["reason"])
+            else:
+                self._confirm_exit(position, average, pending["reason"])
             return
         if pending.get("cancel_requested"):
             if time.time() - number(pending.get("cancel_epoch")) < 2:
@@ -1318,11 +2081,19 @@ class Strategy01Engine:
                 return
             actual_qty = int((holdings.get(code) or {}).get("qty") or 0)
             if actual_qty <= max(0, int(pending["pre_hold_qty"]) - needed):
-                self._confirm_exit(
-                    position,
-                    average or number(position.get("last_price")),
-                    pending["reason"],
-                )
+                if pending.get("partial") and actual_qty > 0:
+                    self._confirm_partial_exit(
+                        position,
+                        int(pending["pre_hold_qty"]) - actual_qty,
+                        average or number(position.get("last_price")),
+                        pending["reason"],
+                    )
+                else:
+                    self._confirm_exit(
+                        position,
+                        average or number(position.get("last_price")),
+                        pending["reason"],
+                    )
             elif actual_qty < int(pending["pre_hold_qty"]):
                 position["qty"] = min(int(position["qty"]), actual_qty)
                 position["phase"] = "HOLD"
@@ -1369,8 +2140,16 @@ class Strategy01Engine:
         actual_qty = int((holdings.get(code) or {}).get("qty") or 0)
         if actual_qty < int(pending["pre_hold_qty"]):
             if actual_qty <= max(0, int(pending["pre_hold_qty"]) - needed):
-                self._confirm_exit(
-                    position, number(position.get("last_price")), pending["reason"])
+                if pending.get("partial") and actual_qty > 0:
+                    self._confirm_partial_exit(
+                        position,
+                        int(pending["pre_hold_qty"]) - actual_qty,
+                        number(position.get("last_price")),
+                        pending["reason"],
+                    )
+                else:
+                    self._confirm_exit(
+                        position, number(position.get("last_price")), pending["reason"])
             else:
                 position["qty"] = min(int(position["qty"]), actual_qty)
                 position["phase"] = "HOLD"
@@ -1384,6 +2163,81 @@ class Strategy01Engine:
         position["retry_after_epoch"] = time.time() + 5
         self._event("SELL_NOT_CREATED", code=code, name=position["name"],
                     reason="fills/open orders/balance unchanged")
+
+    def _confirm_partial_exit(
+        self,
+        position: Dict[str, Any],
+        sold_qty: int,
+        fill_price: float,
+        reason: str,
+        *,
+        shadow: bool = False,
+    ) -> None:
+        current_qty = int(position.get("qty") or 0)
+        sold_qty = min(max(0, int(sold_qty)), current_qty)
+        remaining = current_qty - sold_qty
+        if sold_qty <= 0:
+            return
+        if remaining <= 0:
+            self._confirm_exit(position, fill_price, reason, shadow=shadow)
+            return
+
+        entry = Decimal(str(number(position.get("entry_price"))))
+        exit_price = Decimal(str(number(fill_price, number(position.get("last_price")))))
+        exit_at = kst_now()
+        self._update_excursion(position, float(exit_price), exit_at)
+        gross = (
+            (exit_price / entry - Decimal("1")) * Decimal("100")
+            if entry > 0 and exit_price > 0 else Decimal("0")
+        )
+        net = (
+            (
+                exit_price * (Decimal("1") - SELL_FEE - SELL_TAX)
+                / (entry * (Decimal("1") + BUY_FEE))
+                - Decimal("1")
+            ) * Decimal("100")
+            if entry > 0 and exit_price > 0 else Decimal("0")
+        )
+
+        hold_state = HoldSellState.from_dict(position["hold_state"])
+        hold_state.quantity = remaining
+        hold_state.peak_partial_taken = True
+        hold_state.peak_flow_since = None
+        hold_state.peak_recovery_since = None
+        hold_state.sell_latched = False
+        hold_state.sell_action = HoldSellAction.SELL
+        hold_state.sell_reason = ""
+        hold_state.sell_latched_at = None
+        hold_state.sell_latched_price = Decimal("0")
+
+        reserved = int(position.get("reserved_capital_krw") or 0)
+        position.update({
+            "phase": "HOLD",
+            "qty": remaining,
+            "hold_state": hold_state.to_dict(),
+            "pending": None,
+            "retry_after_epoch": time.time() + 2,
+            "reserved_capital_krw": int(reserved * remaining / current_qty),
+            "last_price": float(exit_price),
+        })
+        position.setdefault("partial_exits", []).append({
+            "quantity": sold_qty,
+            "price": float(exit_price),
+            "at": exit_at.isoformat(timespec="seconds"),
+            "reason": reason,
+            "gross_return_pct": float(gross),
+            "estimated_net_return_pct_before_slippage": float(net),
+        })
+        self._refresh_recovery_blocked()
+        self._event(
+            "SHADOW_SELL_PARTIAL" if shadow else "SELL_PARTIAL_CONFIRMED",
+            code=position["code"], name=position["name"],
+            price=float(exit_price), quantity=sold_qty,
+            reason=(
+                f"{reason} remaining={remaining} gross={gross:.3f}% "
+                f"net_before_slippage={net:.3f}%"
+            ),
+        )
 
     def _confirm_exit(
         self,
@@ -1420,7 +2274,20 @@ class Strategy01Engine:
             "slot_reserved": False,
             "exit_price": float(exit_price),
             "exit_at": exit_at.isoformat(timespec="seconds"),
-            "post_exit_audit": {"targets": {}},
+            "post_exit_audit": {
+                "targets": {},
+                "observation_capture": {
+                    "last_observed_at": str(
+                        (position.get("hold_state") or {}).get(
+                            "last_observed_at"
+                        ) or exit_at.isoformat(timespec="seconds")
+                    ),
+                    "rows": 0,
+                    "path": "",
+                    "error": "",
+                    "complete": False,
+                },
+            },
             "exit_reason": reason,
             "completed_cycle": cycles[code],
             "gross_return_pct": float(gross),
@@ -1449,21 +2316,108 @@ class Strategy01Engine:
             return
         actual = holdings.get(code) or {}
         actual_qty = int(actual.get("qty") or 0)
+        available_qty = int(actual.get("available") or 0)
         pending = position.get("pending") or {}
         if actual_qty > 0:
+            # Retry exhaustion is a mandatory broker-truth checkpoint, not a
+            # permanent manual stop. Re-arm only when the broker confirms that
+            # shares remain sellable and no sell order is alive.
+            sell_exhausted = (
+                int(position.get("sell_retries") or 0)
+                >= self.config.max_sell_retries
+                and bool(position.get("hold_state"))
+            )
+            if sell_exhausted:
+                recovery_cycle = int(
+                    position.get("sell_recovery_cycle") or 0
+                )
+                if recovery_cycle >= MAX_SELL_RECOVERY_CYCLES:
+                    position["phase"] = "RECOVERY_BLOCKED"
+                    self.state["recovery_blocked"] = True
+                    self.state["last_error"] = (
+                        "SELL_RECOVERY_CYCLES_EXHAUSTED_MANUAL_CHECK"
+                    )
+                    return
+                open_sell = self.broker.open_orders(code, buy=False)
+                if open_sell is None:
+                    return
+                if open_sell or available_qty <= 0:
+                    self._event(
+                        "RECOVERY_SELL_REARM_WAIT",
+                        code=code,
+                        reason=(
+                            f"open_sell={open_sell} available={available_qty}"
+                        ),
+                    )
+                    return
+                position["qty"] = min(
+                    int(position.get("qty") or actual_qty), actual_qty)
+                position["pending"] = None
+                position["sell_retries"] = 0
+                position["sell_recovery_cycle"] = (
+                    int(position.get("sell_recovery_cycle") or 0) + 1
+                )
+                position["retry_after_epoch"] = (
+                    time.time() + max(5.0, self.config.fill_wait_sec)
+                )
+                position["phase"] = "HOLD"
+                self.state["last_error"] = ""
+                self._event(
+                    "RECOVERY_SELL_REARMED",
+                    code=code,
+                    quantity=position["qty"],
+                    reason=(
+                        "broker holdings present, available qty positive, "
+                        "no open sell order"
+                    ),
+                )
+                self._refresh_recovery_blocked()
+                return
+            if (
+                pending.get("side") == "SELL"
+                and pending.get("partial")
+                and actual_qty < int(pending.get("pre_hold_qty") or 0)
+            ):
+                self._confirm_partial_exit(
+                    position,
+                    int(pending["pre_hold_qty"]) - actual_qty,
+                    number(position.get("last_price")),
+                    str(pending.get("reason") or "RECOVERY_PARTIAL_CONFIRMED"),
+                )
+                self._refresh_recovery_blocked()
+                return
+            if pending.get("side") == "BUY":
+                pre_qty = int(pending.get("pre_hold_qty") or 0)
+                if actual_qty > pre_qty:
+                    balance_average = number(actual.get("buy_price"))
+                    self._confirm_entry(
+                        position,
+                        min(
+                            int(pending.get("requested_qty") or 1),
+                            actual_qty - pre_qty,
+                        ),
+                        self._balance_fill_price(
+                            position, actual_qty, balance_average,
+                        ) or number(position.get("last_price")),
+                        now,
+                    )
+                    self._event("RECOVERY_BUY_CONFIRMED", code=code)
+                    self._refresh_recovery_blocked()
+                    return
+                open_buy = self.broker.open_orders(code, buy=True)
+                if open_buy is None or open_buy:
+                    return
+                if pre_qty > 0 and position.get("hold_state"):
+                    position["phase"] = "HOLD"
+                    position["pending"] = None
+                    self._event("RECOVERY_BUY_ADD_NOT_FILLED", code=code)
+                    self._refresh_recovery_blocked()
+                    return
             if position.get("hold_state"):
                 position["qty"] = min(
                     int(position.get("qty") or actual_qty), actual_qty)
                 position["phase"] = "HOLD"
                 self._event("RECOVERY_HOLD_RESUMED", code=code)
-            elif pending.get("side") == "BUY":
-                self._confirm_entry(
-                    position,
-                    min(int(pending.get("requested_qty") or 1), actual_qty),
-                    number(actual.get("buy_price")) or number(position.get("last_price")),
-                    now,
-                )
-                self._event("RECOVERY_BUY_CONFIRMED", code=code)
             self._refresh_recovery_blocked()
             return
         open_buy = self.broker.open_orders(code, buy=True)

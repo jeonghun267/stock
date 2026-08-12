@@ -132,7 +132,7 @@ def run_check(base: Path, apply: bool | None = None) -> int:
     rt_path = base / "DATA" / "rt_open_positions.json"
     held = _read_json(pos_path, {})
     opens = {c: p for c, p in held.items()
-             if isinstance(p, dict) and p.get("status") == "OPEN"}
+             if isinstance(p, dict) and p.get("status") in ("OPEN", "PENDING")}
     mode = "실반영" if apply else "그림자(판정만)"
     _log(base, f"=== 체결확인 시작 · OPEN {len(opens)}건 · {mode} ===")
     if not opens:
@@ -150,11 +150,29 @@ def run_check(base: Path, apply: bool | None = None) -> int:
         return 0
     decisions = judge(opens, balance)
     changed = False
+
+    def promote_pending(code: str, have: int) -> bool:
+        pos = held.get(code) or {}
+        if pos.get("status") != "PENDING":
+            return False
+        pos["status"] = "OPEN"
+        pos["qty"] = have
+        pos["fillcheck"] = f"CONFIRMED_OPEN {datetime.now():%Y%m%d%H%M}"
+        rt = _read_json(rt_path, {})
+        px = float(pos.get("buy_price", 0) or 0)
+        rt[code] = {"qty": have, "entry_price": px, "code": code, "strategy": "EOD_GAP",
+                    "peak_price": px, "stop_price": round(px * 0.95), "_eodgap": 1,
+                    "_chejan_ts": datetime.now().isoformat()}
+        _atomic_write(rt_path, json.dumps(rt, ensure_ascii=False, indent=1))
+        _log(base, f"    {code}: PENDING -> OPEN (balance confirmed {have})")
+        return True
     for d in decisions:
         code = d["code"]
         name = str((held.get(code) or {}).get("name", ""))
         if d["action"] == "KEEP":
             _log(base, f"  {code} {name}: 보유 {d['have']}주 = 기록 일치 → OPEN 유지")
+            if apply and promote_pending(code, d["have"]):
+                changed = True
             continue
         if d["action"] == "FIX_QTY":
             _log(base, f"  {code} {name}: 부분체결 — 기록 {d['want']}주 → 실보유 {d['have']}주로 정정"
@@ -162,6 +180,7 @@ def run_check(base: Path, apply: bool | None = None) -> int:
             if apply:
                 held[code]["qty"] = d["have"]
                 held[code]["fillcheck"] = f"FIX_QTY {d['want']}->{d['have']} {datetime.now():%Y%m%d%H%M}"
+                promote_pending(code, d["have"])
                 changed = True
             continue
         # GHOST

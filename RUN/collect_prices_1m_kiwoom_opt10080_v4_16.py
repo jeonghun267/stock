@@ -362,12 +362,20 @@ def broker_tr_request(tr_code: str, inputs: dict, output_fields: list,
         "ts": datetime.now().isoformat(),
         "ttl_sec": int(timeout_sec) + 5,
         "type": "TR",
+        "caller": "collect_prices_1m_kiwoom_opt10080_v4_16",
         "tr_code": tr_code,
         "rqname": rqname,
         "screen_no": screen_no,
         "input": inputs,
         "output_fields": list(output_fields or []),
     }
+
+    try:
+        from ipc_order_auth_v1 import sign_order_request
+        req = sign_order_request(req)
+    except Exception as e:
+        return {"status": "ERROR", "data": None,
+                "error": f"TR authentication blocked: {e}"}
 
     req_path = _BROKER_IPC_REQ_DIR / f"{request_id}.json"
     res_path = _BROKER_IPC_RES_DIR / f"{request_id}.json"

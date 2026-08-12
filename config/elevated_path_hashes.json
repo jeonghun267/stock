@@ -1,0 +1,26 @@
+{
+  "_설명": "관리자 권한(Highest) 태스크가 실행하는 파일의 sha256 기준표.",
+  "_왜": "UserK 는 관리자 멤버지만 평소 프로세스는 Medium 이다. 이 파일들은 UserK 가 쓸 수 있고 Highest 로 실행되므로, 한 개만 고쳐 두면 UAC 창 없이 관리자 권한을 얻는다. 08:30 에 바뀐 게 있으면 알린다.",
+  "_근본차단": "태스크 RunLevel 을 Limited 로 낮추는 것. 관리자 셸에서만 된다. 브로커 계열 3개(PIPELINE_0900·WATCHDOG_BROKER·BROKER_NIGHT_STOP)는 브로커를 죽이고 살려야 해서 Highest 가 필요하다.",
+  "_다시만들기": "C:\\python310\\python.exe C:\\stock_bot\\RUN\\morning_preflight_rehearsal_v1.py --rebaseline-elevated",
+  "_주의": "일부러 고친 뒤에만 다시 만들 것. 먼저 다시 만들고 나중에 확인하면 검사가 무의미해진다.",
+  "생성": "2026-08-11T08:41:29",
+  "파일": {
+    "RUN\\_run_hidden_wait.vbs": "c0ac14545cc05ce19b58106922dbf0189bf226d8296d43ded14f4bcc8f48266e",
+    "RUN\\broker_night_stop.ps1": "415e983374a11e6ec1f17b27f301147675b0ec253b1ca9d9d7f696d05db80a71",
+    "RUN\\run_safeplus_pipeline_0900.ps1": "f471a3c59ab950416e70b343a60bebdd598aa2d02412a8ff2f105efbf2e429b2",
+    "RUN\\watchdog_broker_gateway_v1.ps1": "295eb69615bb1c9c0db0bcc6021bdf9c47b588a070c8867586ae76342025aca2",
+    "RUN\\hidden\\SAFEPLUS_PREFLIGHT_SELFTEST_HIGH.cmd": "ec1932bd3e85c9287b0c089f0b695b46ba7ee5be63e32690c00b4221aea15b2a",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY_ALL_PREFLIGHT.cmd": "82c043da48155fe6b36315f3589bf3af54fabda2a8f2a35494a635a69fe2dff4",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY_COMMON_CONTEXT.cmd": "35c1c1926a2ff56c3aaab2eb1fe24883dc2e4793be7bf0918bd979bff8481cc4",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY01_LIVE.cmd": "e581efee21bbb87071f8b027ed5ce38d040bb0c7fb8ee7c3cae36b437c127e20",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY01_SIGNAL.cmd": "fa5155ffaf017f34a19d419d40b75850f0419e6dcf1657baa24b01796bdb10ad",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY02_LIVE.cmd": "9c8701e78faefed07c8e637afadae91efcfa47e38c7807133b047d264addb9af",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY02_SIGNAL.cmd": "20226cf1d72e97ec78859d907f17569023d35d004d9890ab84d0bc679cd01094",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY03_LIVE_ASCII.cmd": "4ae7aff2f2742d38cae860e6ef3e482fe1b608c99b85a7473e23d865cd0b2bed",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY03_PREFLIGHT.cmd": "f0ac896aeb6ca1572dfe5059dcdadd08f11fba8eefb6bcf43c8aff1d5662ddf5",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY03_SIGNAL_ASCII.cmd": "307b084c6ee188575354e85b47f1abd3e563434fe2424f8a6e6fbf8c102169d6",
+    "RUN\\broker_gateway_v1.py": "19c3e23eb68b0218b7bae8c9b5d39bea4f58d842268802f073bfa05cace0f950",
+    "RUN\\ipc_order_auth_v1.py": "a29827065d8313c8d8f1c7b17a24b2d4d88321b68b9c507dec973e527a86fcb6"
+  }
+}

@@ -79,8 +79,10 @@ class StockbotLiveBroadcastTests(unittest.TestCase):
         (self.root / "data" / "strategy_06_crash_low_chase_state_v1.json").write_text(
             json.dumps(state, ensure_ascii=False), encoding="utf-8"
         )
+        # ★[APPROVAL-DISPLAY 2026-08-04] "APPROVED" 는 주문 관문이 무효로 보는 값이다.
+        #   실제 S06 깃발이 쓰는 형식으로 맞춘다.
         (self.root / "config" / "strategy_06_live_approved.flag").write_text(
-            "APPROVED", encoding="ascii"
+            "APPROVED_BY_OWNER 20260803 S06_LIVE\n", encoding="ascii"
         )
 
         snapshot = broadcast.build_snapshot(now)
@@ -120,8 +122,11 @@ class StockbotLiveBroadcastTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        # ★[APPROVAL-DISPLAY 2026-08-04] 예전 fixture 는 "APPROVED" 였다. 주문 관문은
+        #   그 값을 무효로 보는데 중계판만 LIVE 로 떴다 = 이 테스트가 버그를 고정하고
+        #   있었다. 실제 자동승인이 쓰는 형식으로 맞춘다.
         (self.root / "config" / "strategy_01_live_approved.flag").write_text(
-            "APPROVED", encoding="ascii"
+            "auto-approved 2026-07-27T08:59:42\n", encoding="ascii"
         )
 
         snapshot = broadcast.build_snapshot(now)
@@ -131,6 +136,39 @@ class StockbotLiveBroadcastTests(unittest.TestCase):
         self.assertEqual(strategy["entered_count"], 1)
         self.assertEqual(len(strategy["held"]), 1)
         self.assertEqual(len(snapshot["slots"]), 1)
+
+    def test_broken_approval_flag_is_not_shown_as_live(self) -> None:
+        """★[APPROVAL-DISPLAY 2026-08-04] 깃발이 있어도 주문이 안 나가면 LIVE 가 아니다.
+
+        깃발 없음(승인대기)과 깃발이 깨짐(승인무효)은 원인이 달라 구분해서 보여준다.
+        """
+        now = datetime(2026, 7, 27, 9, 1)
+        flag = self.root / "config" / "strategy_01_live_approved.flag"
+
+        cases = {
+            "auto-approved 2026-07-27T08:59:42\n": "LIVE",
+            "APPROVED\n": "승인무효",                       # 형식 불명
+            "auto-approved 2026-07-26T08:59:42\n": "승인무효",   # 어제 날짜
+            "auto-approved 2026-07-27T23:59:59\n": "승인무효",   # 미래 시각
+            "": "승인무효",                                  # 재작성 중 빈 파일
+        }
+        for text, expected in cases.items():
+            with self.subTest(flag=text.strip() or "(empty)"):
+                flag.write_text(text, encoding="ascii")
+                self.assertEqual(
+                    expected,
+                    broadcast.build_snapshot(now)["strategies"][0]["gate"],
+                )
+
+        # BOM 은 ascii strict 로 못 읽는다 - PowerShell 로 쓰면 실제로 이렇게 된다
+        flag.write_bytes(
+            b"\xef\xbb\xbf" + b"auto-approved 2026-07-27T08:59:42\n")
+        self.assertEqual(
+            "승인무효", broadcast.build_snapshot(now)["strategies"][0]["gate"])
+
+        flag.unlink()
+        self.assertEqual(
+            "승인대기", broadcast.build_snapshot(now)["strategies"][0]["gate"])
 
     def test_obsolete_live_gate_blocks_are_hidden_and_off_blocks_compacted(self) -> None:
         events = [

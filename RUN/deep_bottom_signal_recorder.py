@@ -18,6 +18,22 @@ import os, sys, csv, json, time
 from pathlib import Path
 from datetime import datetime
 
+# ★[SYSPATH-FIX 2026-08-05 09:50] 이 3줄이 없어 기록기가 매분 즉사하고 있었다.
+#   python._pth 가 있으면 파이썬이 sys.path 를 _pth 내용으로만 만든다
+#   (실측: python310.zip / C:\python310 / site-packages). 스크립트 폴더가 안 들어가서
+#   아래 ma3_backfill_v1 import 가 ModuleNotFoundError 로 죽는다. cwd 를 RUN 으로
+#   바꿔도 소용없다 — _pth 의 '.' 은 cwd 가 아니라 python.exe 폴더를 가리킨다.
+#   8/4 밤 ma3_backfill_v1 import 를 추가하면서 이 부트스트랩을 빼먹은 것이 원인.
+#   여파: 돈맥_1분봉.json 이 8/4 15:10 이후 갱신 정지 -> 전 전략 상승보유가
+#   어제 자료로 판정 + S05 사전점검 MINUTE_DATA_STALE 로 차단.
+#   같은 패턴을 strategy_all_live_gate_launcher_v1.py:12-14 가 이미 쓰고 있다.
+#   되돌리기: backup\deep_bottom_signal_recorder_20260805_before_syspath_fix.py
+RUN_DIR = Path(__file__).resolve().parent
+if str(RUN_DIR) not in sys.path:
+    sys.path.insert(0, str(RUN_DIR))
+
+from ma3_backfill_v1 import start_worker
+
 SNAP      = Path(r"C:\stock_bot\IPC\live_micro_snapshot.json")      # 실시간(TR 0): cur·che_str·ask_tot·bid_tot·imb
 CHE_STATE = Path(r"C:\stock_bot\data\돈흐름_che_state.json")         # 보드 누적: lo·lo_ts·min(체결강도 저점)
 BOARD     = Path(r"C:\stock_bot\data\돈흐름_선별판.json")             # rows[].deep = 깊은바닥 등재
@@ -82,6 +98,73 @@ def _prev_close_map():
     return m
 
 
+
+BARS_SEED = BARS_OUT.with_name(BARS_OUT.stem + "_seed.json")
+def _seed_bar_history(payload):
+    """Seed prior completed 1-minute bars for MA3 at the opening.
+
+    The 08:28 task only collects about ten new 3-minute blocks by 09:00.
+    Only bars with trustworthy timestamps are carried forward. Consumers decide
+    whether prior-session bars are valid for their own rule.
+    """
+    source = payload.get("m") if isinstance(payload.get("m"), dict) else {}
+    try:
+        stamp = datetime.fromisoformat(str(payload.get("ts") or ""))
+    except ValueError:
+        stamp = datetime.now()
+    seeded_bars, seeded_vols, seeded_minutes = {}, {}, {}
+    for raw_code, row in source.items():
+        if not isinstance(row, dict):
+            continue
+        previous = list(row.get("prev") or [])[-70:]
+        if not previous:
+            continue
+        code = str(raw_code).zfill(6)
+        labels = list(row.get("pm") or [])[-len(previous):]
+        if len(labels) != len(previous):
+            continue
+        normalized = []
+        for tag in labels:
+            text = str(tag or "")
+            if len(text) == 12 and text.isdigit():
+                normalized.append(text)
+            elif len(text) == 4 and text.isdigit():
+                normalized.append(stamp.strftime("%Y%m%d") + text)
+            else:
+                normalized = []
+                break
+        if len(normalized) != len(previous):
+            continue
+        labels = normalized
+        volumes = list(row.get("pv") or [])[-len(previous):]
+        if len(volumes) != len(previous):
+            volumes = [0.0] * len(previous)
+        seeded_bars[code] = previous
+        seeded_vols[code] = volumes
+        seeded_minutes[code] = labels
+    return seeded_bars, seeded_vols, seeded_minutes
+
+
+def _select_seed_history(paths):
+    """Prefer a usable latest-session seed, then the broadest coverage."""
+    best = (None, {}, {}, {}, (False, "", -1, -1))
+    for path in paths:
+        bars, vols, minutes = _seed_bar_history(_jload(path))
+        dates = [
+            str(tag)[:8] for labels in minutes.values() for tag in labels
+            if len(str(tag)) >= 8
+        ]
+        ready = sum(len(rows) >= 63 for rows in bars.values())
+        score = (
+            ready > 0,
+            max(dates) if dates else "",
+            ready,
+            sum(len(rows) for rows in bars.values()),
+        )
+        if score > best[4]:
+            best = (path, bars, vols, minutes, score)
+    return best
+
 def main():
     today = datetime.now().strftime("%Y%m%d")
     OUT.parent.mkdir(parents=True, exist_ok=True)
@@ -90,8 +173,21 @@ def main():
             csv.writer(f).writerow(COLS)
 
     bars = {}       # code -> {"hm":분, "o","h","l","c","v0"}  자체 1분봉 (진입=바닥확인용)
-    bars_hist = {}  # code -> [[o,h,l,c], ...] 최근 완성 1분봉 5개 ★'양봉 N개 연속' 관문용
-    vols_hist = {}  # ★[7/14 밤] code -> [v, ...] 최근 완성봉 거래량 5개 (아침대장 '분당 대금'용)
+    # ★[MA3-SEED 2026-08-03] 08:28 기동 시 전일 마지막 완성봉을 먼저 이어 받는다.
+    seed_path, bars_hist, vols_hist, mins_hist, seed_score = (
+        _select_seed_history((BARS_OUT, BARS_SEED)))
+    seed_dates = [
+        str(tag)[:8] for labels in mins_hist.values() for tag in labels
+        if len(str(tag)) >= 8
+    ]
+    _log(f"MA3_SEED source={getattr(seed_path, 'name', 'NONE')} "
+         f"codes={len(bars_hist)} ready63={seed_score[2]} "
+         f"latest={max(seed_dates) if seed_dates else 'NONE'}")
+    # ★[MA3-COMMON] prev와 같은 순서의 날짜+분 ["202608030903", ...].
+    #   prev 는 스냅샷에 안 잡힌 분을 그냥 건너뛰므로 봉이 연속이라는 보장이 없다.
+    #   시각 없이 역산하면 3분 격자가 어긋나 5/10/20선이 엉뚱한 값이 된다
+    #   (특히 08:30~09:00 동시호가는 듬성듬성). prev 구조는 소비자가 20곳 넘어
+    #   못 건드리므로, 거래량 pv 와 같은 방식으로 '분'만 따로 실어 보낸다.
     v_open = {}     # ★[7/14 밤] code -> 09:00 봉 시작 누적거래량 (아침 누적대금 계산용)
     bars3 = {}      # code -> {"hm":3분블록 시작, "o","h","l","c"}  ★자체 3분봉 (매도=꼭지판정용)
     hist = {}       # code -> [(초, 가격)]  감속 계산용 가격 시계열
@@ -99,6 +195,9 @@ def main():
     done = set()    # 결과까지 채운 종목
     pcm = {}
     n_rec = 0
+    last_seed_hm = ""
+    # One central read-only TR worker serves S01/S02/S03/S05/S06.
+    _ma3_backfill_stop, _ma3_backfill_thread = start_worker(_log)
     _log(f"기동 — 진입창 저점 +{REB_MIN}~{CHASE_BAND}% · 등재 {DROP_PCT}% · 낙폭 {MIN_DEPTH}% (주문 0)")
 
     while True:
@@ -166,6 +265,11 @@ def main():
                     _vh = vols_hist.setdefault(code, [])
                     _vh.append(max(0.0, _cv - float(b.get("v0") or _cv)))
                     del _vh[:-70]
+                    # ★[MA3-COMMON 2026-08-03] 방금 완성된 봉이 '몇 분 봉'인지 같이 남긴다.
+                    #   b["hm"] 이 그 봉의 분이다(지금 분 hm 이 아니다 — 혼동 금지).
+                    _mh = mins_hist.setdefault(code, [])
+                    _mh.append(now.strftime("%Y%m%d") + b["hm"])
+                    del _mh[:-70]
                 bars[code] = {"hm": hm, "o": cur, "h": cur, "l": cur, "c": cur, "done": False,
                               "v0": _cv}      # ★봉 시작 시점의 누적거래량
                 # ★[7/14 밤 아침대장] 09:00 봉의 시가를 붙잡아 둔다.
@@ -182,7 +286,18 @@ def main():
                 #   (broker_gateway_v1.py 동일자 수정). 시가는 정적 값이라 장중 어느
                 #   시점에 받아도 정확하다.
                 #   ⚠️op 가 없으면 종전과 100% 동일하게 동작한다 — 되돌림 안전.
-                if code not in v_open:
+                #   ★[OPEN-GATE 2026-08-06 친구님 지시 "지금 고쳐"] 09:00 이후에만 받는다.
+                #     이 구제 경로가 장 시작 전(08:28~08:59)에도 돌아서, 아직 오늘 시가가
+                #     없는 스냅샷의 op(=전일 시가)를 v_open 에 넣어 버렸다. 한 번 채워지면
+                #     위 09:00 분기가 'code not in v_open' 가드에 막혀 진짜 시가로 갱신되지
+                #     않는다 → op 가 하루 종일 전일 시가로 굳었다.
+                #     8/6 실측 4/4 일치: RFHIC 57,800 · 코스모로보틱스 17,730 ·
+                #     지엔씨에너지 49,550 · 태성 42,550 = 전부 8/5 시가.
+                #     피해: S02 가 '장중 고점'을 전일 시가로 잡아 없는 낙폭(RFHIC 16.44%,
+                #     진짜는 4.55%)을 만들어 문턱 미달 종목을 샀다. S03 는 최소가 관문에서
+                #     종목을 통째로 잃었다.
+                #     되돌리기: backup\deep_bottom_signal_recorder_20260806_before_open_gate.py
+                if code not in v_open and hm >= "0900":
                     try:
                         _op = float(sc.get("op") or 0)
                     except Exception:
@@ -330,10 +445,19 @@ def main():
                                 #   op  = ★09:00 봉의 시가      (시가 대비 상승률 = 대장 1번 신호)
                                 "v": _vnow,
                                 "pv": (vols_hist.get(_c) or [])[-70:],
+                                # ★[MA3-COMMON 2026-08-03] prev 와 같은 순서의 날짜+분 라벨.
+                                #   3분 격자를 시각으로 정확히 나누기 위한 것(추가만·기존 무영향).
+                                "pm": (mins_hist.get(_c) or [])[-70:],
                                 "op": v_open.get(_c)}
             _tmp = BARS_OUT.with_suffix(".tmp")
             _tmp.write_text(json.dumps(_bo, ensure_ascii=False), encoding="utf-8")
             os.replace(_tmp, BARS_OUT)
+            if hm >= "1500" and hm != last_seed_hm:
+                _seed_tmp = BARS_SEED.with_suffix(".tmp")
+                _seed_tmp.write_text(
+                    json.dumps(_bo, ensure_ascii=False), encoding="utf-8")
+                os.replace(_seed_tmp, BARS_SEED)
+                last_seed_hm = hm
         except Exception:
             pass
 

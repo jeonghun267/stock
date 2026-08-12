@@ -22,7 +22,7 @@ DAILY_VALUE_MIN_EOK = 100.0
 PRICE_MIN_KRW = 10_000.0
 CORE_AVG_5D_VALUE_EOK = 500.0
 CORE_PRIORITY_MIN_5D_RANGE_PCT = 12.0
-TOP_N = 30
+TOP_N = 50
 
 
 def _atomic_write(path: Path, text: str, encoding: str = "utf-8") -> None:
@@ -71,6 +71,9 @@ def _add_metrics(bars: pd.DataFrame) -> pd.DataFrame:
     )
     bars["avg_5d_value_eok"] = grouped["value_eok"].transform(
         lambda s: s.rolling(5, min_periods=5).mean()
+    )
+    bars["qualified_5d_count"] = grouped["qualified_day"].transform(
+        lambda s: s.rolling(5, min_periods=5).sum()
     )
     return bars
 
@@ -159,6 +162,10 @@ def select_candidates(eod_path: Path) -> tuple[str, list[dict]]:
                 "min_5d_range_pct": _round_or_none(row.min_5d_range_pct),
                 "prev_value_eok": round(float(row.value_eok), 2),
                 "avg_5d_value_eok": _round_or_none(row.avg_5d_value_eok),
+                "qualified_5d_count": (
+                    None if math.isnan(float(row.qualified_5d_count))
+                    else int(row.qualified_5d_count)
+                ),
             }
         )
     return source_date, records
@@ -206,7 +213,7 @@ def build_and_publish(
     expected_source = _prev_trading_day(now, _load_holidays(base))
     source_stale = source_date < expected_source
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": now.isoformat(),
         "for_date": now.strftime("%Y%m%d"),
         "source_date": source_date,

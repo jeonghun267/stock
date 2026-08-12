@@ -16,6 +16,7 @@ from pathlib import Path
 
 _CONFIG_FILE = Path(__file__).resolve().parent.parent / "config" / "capital.json"
 _DEFAULT_CAPITAL = 2_000_000
+_DEFAULT_ORDER_QUANTITY = 1
 _DEFAULT_RATIOS = {
     "order_max": 0.98,          # 한 주문 최대 = 자본 × 0.98
     "daily_total_max": 1.0,     # 오늘 발주 누적 총액 상한 = 자본 × 1.0 (200만 묶기 자물쇠)
@@ -46,6 +47,19 @@ def get_capital() -> int:
         return _DEFAULT_CAPITAL
 
 
+def get_order_quantity() -> int:
+    """Return the common maximum shares for one position/order.
+
+    This value deliberately has no strategy-specific environment override.
+    Every buy engine and the broker's final gate must read the same setting.
+    """
+    try:
+        quantity = int(_load().get("order_quantity", _DEFAULT_ORDER_QUANTITY))
+    except (TypeError, ValueError):
+        quantity = _DEFAULT_ORDER_QUANTITY
+    return max(1, quantity)
+
+
 def get_ratio(name: str) -> float:
     """한도 비율(0~1). config ratios → 기본값."""
     r = (_load().get("ratios") or {}).get(name)
@@ -64,5 +78,6 @@ def get_limit(name: str) -> int:
 
 if __name__ == "__main__":
     print(f"capital_krw       = {get_capital():,}")
+    print(f"order_quantity    = {get_order_quantity():,}")
     for _k in ("order_max", "daily_total_max", "account_usage_max"):
         print(f"  {_k:18s} ratio={get_ratio(_k):.2f} → limit={get_limit(_k):,}")

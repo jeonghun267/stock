@@ -26,6 +26,8 @@ from pathlib import Path
 
 sys.path.insert(0, r"C:\stock_bot\RUN")
 
+from ma3_seed_v1 import DEFAULT_SEED_PATH, build_opening_seed
+
 DATA_DIR = Path(r"C:\stock_bot\data")
 OUT_PATH = DATA_DIR / "prices_1m.csv"
 EOD_PATH = DATA_DIR / "eod_daily_bars.csv"
@@ -53,6 +55,21 @@ def log(msg: str):
     except Exception:
         pass
 
+
+def _refresh_ma3_seed(session_date: str) -> None:
+    try:
+        stats = build_opening_seed(
+            prices_path=OUT_PATH,
+            seed_path=DEFAULT_SEED_PATH,
+            max_session_date=session_date,
+        )
+        log(
+            "MA3 opening seed "
+            f"date={stats['session_date']} ready={stats['ready_codes']} "
+            f"skipped={stats['skipped_codes']}"
+        )
+    except Exception as exc:
+        log(f"MA3 opening seed failed: {exc}")
 
 def _safe_int(v):
     try:
@@ -102,7 +119,9 @@ def main():
         if DRY:
             log(f"[DRY] TR 없이 종료. 대상 예시: {targets[:10]}"); return
         if not targets:
-            log("백필 대상 없음 — 종료"); return
+            log("No EOD targets; refresh MA3 seed from existing prices_1m")
+            _refresh_ma3_seed(today)
+            return
 
         from broker_client import BrokerClient
         bc = BrokerClient()
@@ -149,7 +168,9 @@ def main():
 
         log(f"조회 완료 ok={ok} timeout={to} err={err} · 백필 봉 {len(rows)}")
         if not rows:
-            log("병합할 봉 없음 — 종료"); return
+            log("No new EOD rows; refresh MA3 seed from existing prices_1m")
+            _refresh_ma3_seed(today)
+            return
 
         new_df = pd.DataFrame(rows)
         if old_df is not None:
@@ -167,6 +188,7 @@ def main():
         tmp = OUT_PATH.with_suffix(".bf_tmp")
         merged.to_csv(tmp, index=False, encoding="utf-8-sig")
         os.replace(str(tmp), str(OUT_PATH))
+        _refresh_ma3_seed(today)
         log(f"병합 저장 완료: 총 {len(merged)}행 (중복제거 {before - len(merged)}) → {OUT_PATH.name}")
     except Exception as e:
         import traceback

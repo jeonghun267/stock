@@ -2,7 +2,7 @@
 REM Strategy 05 intraday base-breakout signal/watch monitor. Order capability zero.
 set PYTHONDONTWRITEBYTECODE=1
 set S05_MAX_CYCLES_PER_CODE=2
-set S05_BASE_VOLX=6.0
+set S05_BASE_VOLX=3.0
 set S05_MIN_BUY_MONEY_RATIO=0.58
 set S05_MAX_ENTRY_SPREAD_BPS=35
 set S05_MIN_MICROPRICE_EDGE_BPS=0

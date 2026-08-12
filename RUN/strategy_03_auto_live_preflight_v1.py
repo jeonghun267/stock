@@ -11,10 +11,23 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time as time_module
 import xml.etree.ElementTree as ET
 from datetime import datetime, time
 from pathlib import Path
+
+# ★[SYSPATH-FIX 2026-08-05] python._pth 때문에 스크립트 폴더가 sys.path 에 안 들어간다
+#   (실측 [python310.zip, C:\python310, site-packages]). 이 파일은 .cmd 가 직접
+#   실행하는 진입점(SAFEPLUS_STRATEGY03_PREFLIGHT.cmd)이라 부트스트랩이 필요하다.
+#   없으면 아래 strategy_common_order_v1 import 가 ModuleNotFoundError 로 즉사한다.
+#   ⚠️지금은 해당 태스크가 Disabled 라 잠복 상태였고, 8/5 아침 리허설 검사기가
+#   진입점 130개 중 유일한 잔여 지뢰로 찾아냈다.
+#   같은 패턴: strategy_all_live_gate_launcher_v1.py:12-14
+#   되돌리기: backup\strategy_03_auto_live_preflight_v1_20260805_before_syspath_fix.py
+RUN_DIR = Path(__file__).resolve().parent
+if str(RUN_DIR) not in sys.path:
+    sys.path.insert(0, str(RUN_DIR))
 from typing import Any, Mapping
 
 

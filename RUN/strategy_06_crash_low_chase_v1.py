@@ -11,7 +11,7 @@
   수급: 저점 전 매도우위→저점 후 매수우위, 최근 10초 매수속도 증가·매수우위,
         매도속도 재강화 없음이 모두 필요하다. 수급자료가 없으면 매수하지 않는다.
   포기: 저점+2.0% 초과 회복이면 그 저점은 버리고 다음 신저점 대기(추격매수 금지)
-  규모: 10슬롯 · 1종목 1주 · 종목당 하루 2회(2발째는 산 저점보다 1% 더 깊은
+  규모: 공용 6슬롯 · 1종목 2주 · 종목당 하루 2회(2발째는 산 저점보다 1% 더 깊은
         신저점 뒤에만 — 아침 연속 가짜에 연발 낭비 방지) · 종목당 30만원 이내
 
 ★매도는 당일 +10%와 익일 상승보유·꼭지점 매도를 분리한다:
@@ -24,8 +24,8 @@
   그쪽 매도경로는 모의 OPEN 을 실매도하는 미해결 문제가 있어(7/29 점검)
   끼어들면 안 된다. 이 엔진이 종가매수 방식을 자체 수행한다.
 
-  공용 6슬롯(shared_slots)·공용코어(strategy_01_rotation_engine_v2)는 일절 쓰지도
-  건드리지도 않는다 — 이 전략은 완전 독립 슬롯 10칸으로 돈다.
+  전략 1~5와 shared_slots 6칸을 함께 쓴다. 먼저 조건을 충족한 전략이 슬롯을
+  확보하며, 같은 종목의 다른 전략 중복 진입은 공통 슬롯에서 차단한다.
 
   기본은 그림자 모드(주문 0·기록만). 실전은 S06_LIVE=YES + 승인깃발
   (config\\strategy_06_live_approved.flag)의 이중게이트를 모두 통과해야 한다.
@@ -56,6 +56,16 @@ if str(RUN_DIR) not in sys.path:
 
 from zoneinfo import ZoneInfo
 
+# ★[MA3-COMMON 2026-08-03] 상승보유 = 3분봉 5/10/20선 + 매수세 우위(전 전략 공통).
+from intraday_anchor_v1 import day_anchor
+from json_cache_v1 import read_json_cached
+from ma3_common_v1 import (
+    buy_side_alive as ma3_buy_side_alive,
+    ma3_rows,
+    request_missing_history as ma3_request_missing_history,
+    rider_permit as ma3_rider_permit,
+)
+import shared_slots
 from strategy_common_order_v1 import StrategyBroker, fills_by_order
 
 
@@ -106,14 +116,47 @@ def read_json(path: Path, default: Any) -> Any:
         return default
 
 
-def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
-    os.replace(temporary, path)
+    for attempt in range(6):
+        try:
+            os.replace(temporary, path)
+            return True
+        except PermissionError:
+            if attempt == 5:
+                return False
+            time.sleep(0.2)
+
+
+def state_save_failure_marker(state_path: Path) -> Path:
+    return state_path.with_suffix(state_path.suffix + ".save_failed.flag")
+
+
+def state_save_failure_markers(state_path: Path) -> tuple[Path, ...]:
+    primary = state_save_failure_marker(state_path)
+    fallback_dir = Path(
+        os.environ.get("STOCK_BOT_RECOVERY_FLAG_DIR")
+        or Path(__file__).resolve().parents[1] / "IPC" / "recovery_flags"
+    )
+    fallback = fallback_dir / (state_path.name + ".save_failed.flag")
+    return (primary,) if fallback == primary else (primary, fallback)
+
+
+def mark_state_save_failure(state_path: Path) -> Optional[Path]:
+    payload = f"STATE_SAVE_FAILED {kst_now().isoformat(timespec='seconds')}\n"
+    for marker in state_save_failure_markers(state_path):
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(payload, encoding="ascii")
+            return marker
+        except OSError:
+            continue
+    return None
 
 
 @dataclass(frozen=True)
@@ -136,13 +179,16 @@ class Config:
         os.environ.get("S06_LIVE", "NO").strip().upper() == "YES"
     )
     quantity: int = int(os.environ.get("S06_QTY", "1"))
-    max_slots: int = int(os.environ.get("S06_MAX_SLOTS", "10"))
+    max_slots: int = int(os.environ.get("S06_MAX_SLOTS", "6"))
     max_daily_codes: int = int(os.environ.get("S06_MAX_DAILY_CODES", "20"))
     capital_krw: int = int(os.environ.get("S06_CAPITAL_KRW", "1000000"))
     max_price_krw: int = int(os.environ.get("S06_MAX_PRICE_KRW", "300000"))
     min_price_krw: int = int(os.environ.get("S06_MIN_PRICE_KRW", "10000"))
     drop_pct: float = float(os.environ.get("S06_DROP_PCT", "8.0"))
     rebound_pct: float = float(os.environ.get("S06_REBOUND_PCT", "1.5"))
+    # Live default remains disabled until a preserved-input production replay
+    # passes; the scheduled command may opt in with S06_EARLY_ENTRY_CAP_PCT=1.8.
+    early_entry_cap_pct: float = float(os.environ.get("S06_EARLY_ENTRY_CAP_PCT", "0.0"))
     chase_cap_pct: float = float(os.environ.get("S06_CHASE_CAP_PCT", "2.0"))
     entry_floor_pct: float = float(os.environ.get("S06_ENTRY_FLOOR_PCT", "1.0"))
     pullback_min_pct: float = float(os.environ.get("S06_PULLBACK_MIN_PCT", "0.4"))
@@ -170,16 +216,20 @@ class Config:
     event_prefix: str = "strategy_06"
 
     def __post_init__(self) -> None:
-        if self.quantity != 1:
-            raise ValueError("Strategy 06 requires exactly one-share buys")
-        if not 1 <= self.max_slots <= 10:
-            raise ValueError("Strategy 06 slots must be between 1 and 10")
+        if self.quantity not in {1, 2}:
+            raise ValueError("Strategy 06 requires one or two-share buys")
+        if self.max_slots != 6:
+            raise ValueError("Strategy 06 requires exactly six shared slots")
         if self.capital_krw <= 0 or self.max_price_krw <= 0:
             raise ValueError("capital and price caps must be positive")
         if self.drop_pct <= 0 or self.rebound_pct <= 0 or self.entry_floor_pct <= 0:
             raise ValueError("drop/rebound thresholds must be positive")
         if self.chase_cap_pct <= self.rebound_pct:
             raise ValueError("chase cap must exceed rebound threshold")
+        if self.early_entry_cap_pct and not (
+            self.rebound_pct <= self.early_entry_cap_pct < self.chase_cap_pct
+        ):
+            raise ValueError("early-entry cap must sit between rebound and chase caps")
         if self.entry_floor_pct > self.rebound_pct:
             raise ValueError("entry floor must not exceed first rebound threshold")
         if self.pullback_min_pct <= 0 or self.second_rebound_pct <= 0:
@@ -339,15 +389,26 @@ class Strategy06Engine:
         *,
         broker: Optional[Any] = None,
         logger: Optional[logging.Logger] = None,
+        slots: Any = shared_slots,
     ) -> None:
         self.config = config or Config()
         self.log = logger or setup_logger(self.config)
+        self.slots = slots
         self.volumes: Dict[str, VolumeWindow] = defaultdict(VolumeWindow)
         # (epoch, 매수누적, 매도누적) 흐름 이력 — 저점 전후 역전·최근 10초 재가속 판정
         self.flows: Dict[str, deque] = defaultdict(deque)
         self.names = self._load_names()
         self.state = self._load_state()
-        force_exit_only = any(
+        self.state_save_failure_paths = state_save_failure_markers(
+            self.config.state_path)
+        self.state_save_failure_path = self.state_save_failure_paths[0]
+        # ★[SELL-LOCK 2026-08-04] __init__ 1회 계산 -> 매 판정마다 재계산.
+        #   장중에 새로 산 포지션이 보호를 못 받아, 승인 깃발이 깨지면 팔지도 않고
+        #   장부에서 지워졌다. 상세는 StrategyBroker.force_exit_only 참조.
+        force_exit_only = lambda: (
+            os.environ.get("STRATEGY_RECOVERY_EXIT_ONLY", "NO").strip().upper()
+            == "YES"
+        ) or any(path.exists() for path in self.state_save_failure_paths) or any(
             position.get("real") and position.get("phase") in ACTIVE_PHASES
             for position in (self.state.get("positions") or {}).values()
         )
@@ -425,7 +486,18 @@ class Strategy06Engine:
 
     def _save(self) -> None:
         self.state["heartbeat"] = kst_now().isoformat(timespec="seconds")
-        write_json_atomic(self.config.state_path, self.state)
+        if not write_json_atomic(self.config.state_path, self.state):
+            marker = mark_state_save_failure(self.config.state_path)
+            if marker is None:
+                self.log.critical(
+                    "STATE_SAVE_FAILURE_MARKER_UNWRITABLE state=%s markers=%s",
+                    self.config.state_path,
+                    ",".join(str(path) for path in self.state_save_failure_paths),
+                )
+            self.log.critical(
+                "STATE_SAVE_LOCKED_FAIL_CLOSED path=%s", self.config.state_path)
+            raise RuntimeError(
+                f"STATE_SAVE_LOCKED_FAIL_CLOSED:{self.config.state_path}")
 
     def _positions(self) -> Dict[str, Dict[str, Any]]:
         positions = self.state.setdefault("positions", {})
@@ -470,17 +542,29 @@ class Strategy06Engine:
         self.state["recovery_blocked"] = any(
             position.get("phase") == "RECOVERY_BLOCKED"
             for position in self._positions().values()
-        )
+        ) or any(path.exists() for path in self.state_save_failure_paths)
 
     def _cleanup_terminal(self) -> None:
         history = self.state.setdefault("history", [])
-        for code, position in list(self._positions().items()):
+        for position_key, position in list(self._positions().items()):
             if position.get("phase") not in {"CLOSED", "FAILED"}:
                 continue
+            code = str(position.get("code") or "").zfill(6)
+            other_active = any(
+                other is not position
+                and str(other.get("code") or "").zfill(6) == code
+                and other.get("phase") in ACTIVE_PHASES
+                for other in self._positions().values()
+            )
+            if position.get("slot_reserved") and not other_active:
+                try:
+                    self.slots.release(code, str(self.state.get("date") or ""))
+                except Exception as exc:
+                    self.state["last_error"] = f"SLOT_RELEASE:{exc}"
             archived = dict(position)
             archived["archived_at"] = kst_now().isoformat(timespec="seconds")
             history.append(archived)
-            del self._positions()[code]
+            del self._positions()[position_key]
         if len(history) > 200:
             del history[:-200]
         self._refresh_recovery_blocked()
@@ -607,6 +691,46 @@ class Strategy06Engine:
             position for position in self._active_positions().values()
             if position.get("real")
         ]
+        if any(path.exists() for path in self.state_save_failure_paths):
+            self.state["recovery_blocked"] = True
+            self.state["last_error"] = "STATE_SAVE_FAILURE_RECONCILE_REQUIRED"
+            if not self.broker.connect():
+                self._save()
+                return
+            holdings = self.broker.holdings()
+            if holdings is None:
+                self.state["last_error"] = (
+                    "STATE_SAVE_FAILURE_BALANCE_UNAVAILABLE:"
+                    + self.broker.last_error
+                )
+                self._save()
+                return
+            broker_codes = sorted(str(code).zfill(6) for code in holdings)
+            if not real_positions:
+                if broker_codes:
+                    self.state["last_error"] = (
+                        "STATE_SAVE_FAILURE_BROKER_REVIEW_REQUIRED:"
+                        + ",".join(broker_codes)
+                    )
+                    self._save()
+                    return
+                self.state["recovery_blocked"] = False
+                self.state["last_error"] = ""
+                self._save()
+                marker_errors = []
+                for marker in self.state_save_failure_paths:
+                    try:
+                        marker.unlink(missing_ok=True)
+                    except OSError as exc:
+                        marker_errors.append(f"{marker}:{exc}")
+                if marker_errors:
+                    self.state["recovery_blocked"] = True
+                    self.state["last_error"] = (
+                        "STATE_SAVE_FAILURE_MARKER_CLEAR_FAILED:"
+                        + "|".join(marker_errors)
+                    )
+                    self._save()
+                return
         if not real_positions:
             return
         if not self.broker.connect():
@@ -689,6 +813,12 @@ class Strategy06Engine:
             "che_str": number(raw.get("che_str")),
             "buy_money_cum": number(raw.get("buy_money_cum"), -1.0),
             "sell_money_cum": number(raw.get("sell_money_cum"), -1.0),
+            # ★[DAY-LOW 2026-08-05] 거래소 당일 시가/고가/저가. 공용코어와 같은 통로.
+            #   상세는 strategy_01_rotation_engine_v2._snapshot_point 주석 참조.
+            #   ⚠️안 실리면 0. 쓰는 쪽에서 0 검사 필수. 지금은 기록·참고용(판정 미사용).
+            "open_price": max(0.0, number(raw.get("op"))),
+            "day_high": max(0.0, number(raw.get("hi"))),
+            "day_low": max(0.0, number(raw.get("lo"))),
         }
 
     def _universe(self, now: datetime) -> Tuple[list, str]:
@@ -701,17 +831,29 @@ class Strategy06Engine:
             return [], "WATCHLIST_NOT_TODAY"
         if watch.get("source_stale"):
             return [], "WATCHLIST_SOURCE_STALE"
-        core_codes = [
-            str(c).zfill(6) for c in (watch.get("crown_codes") or [])
-        ]
-        if not core_codes:
-            return [], "CORE_WATCHLIST_EMPTY"
+        # ★[UNIVERSE-FIX 2026-08-06 친구님 지시 "6번 수정해"] 승인 설계로 되돌린다.
+        #   이 파일 상단의 8/1 승인 설계는 "대상: 그날의 고저폭30" 인데, 코드는
+        #   crown_codes 만 대상으로 삼고 있었다 — 8/6 실측 crown=1종목(119850).
+        #   그 결과 오늘 -8% 를 넘긴 3종목(049080 -10.7% · 327260 -10.2% ·
+        #   043260 -8.3%)이 전부 감시 밖이었고 S06 는 구조적으로 0건이었다.
+        #   crown 은 "제외 기준"이 아니라 "우선순위"로만 쓴다: 우선crown → 나머지crown
+        #   → 나머지 고저폭. 대상 집합만 넓히고 매수 조건(-8%·계단·눌림·수급)은
+        #   하나도 건드리지 않는다.
+        #   되돌리기: backup\strategy_06_crash_low_chase_v1_20260806_before_universe_fix.py
         priority_set = {
             str(c).zfill(6) for c in (watch.get("crown_priority_codes") or [])
         }
-        priority_codes = [c for c in core_codes if c in priority_set]
-        other_core_codes = [c for c in core_codes if c not in priority_set]
-        return priority_codes + other_core_codes, ""
+        crown_set = {
+            str(c).zfill(6) for c in (watch.get("crown_codes") or [])
+        }
+        priority_codes = [c for c in codes if c in priority_set]
+        crown_rest = [
+            c for c in codes if c in crown_set and c not in priority_set
+        ]
+        others = [
+            c for c in codes if c not in crown_set and c not in priority_set
+        ]
+        return priority_codes + crown_rest + others, ""
 
     def _hr_row(self, code: str) -> Mapping[str, Any]:
         epoch = time.time()
@@ -847,7 +989,6 @@ class Strategy06Engine:
             return
         price = point["price"]
         name = self.names.get(code, code)
-        hr = self._hr_row(code)
 
         # 수급 이력: 저점 직전 3분 역전과 최근 10초 재가속 판정에 함께 사용한다.
         epoch_now = point["ts"].timestamp()
@@ -860,14 +1001,19 @@ class Strategy06Engine:
             while flow and epoch_now - flow[0][0] > 360:
                 flow.popleft()
 
-        # 기준가 = 실황판의 첫 관측가(시가 근사). 실황판이 없으면 자체 첫 관측가.
+        # ★[공통배관 2026-08-07 친구님 "시가 대비 저점을 실시간으로 알고 있어야 돼"]
+        #   기준가·저점을 공통 모듈(실황판→거래소 스냅샷 op/lo)에서 받는다.
+        #   실황판 30종목은 종전 동작 그대로, 명단 밖 종목만 구멍이 메워진다
+        #   (8/7 "눈은 늘렸는데 자를 잘못 줬다" 수리 — 기준가가 시가 아닌 관측 시점 가격이 되던 것).
+        anchor = day_anchor(code, today=now.strftime("%Y%m%d"),
+                            hr_state_path=self.config.hr_state_path,
+                            snapshot_path=self.config.snapshot_path)
+        # 기준가 = 실황판 첫 관측가 → 거래소 시가 → 자체 첫 관측가
         if chase.first_price <= 0:
-            first = number(hr.get("first_price"))
-            chase.first_price = first if first > 0 else price
-        # 저점 = 실황판 누적저점과 자체 관측의 최소값
-        hr_low = number(hr.get("low"))
+            chase.first_price = anchor.open if anchor.open > 0 else price
+        # 저점 = 공통배관 저점(실황판→거래소 저가)과 자체 관측의 최소값
         seen_low = min(
-            value for value in (hr_low, chase.low, price) if value > 0
+            value for value in (anchor.low, chase.low, price) if value > 0
         )
         new_low = chase.low <= 0 or seen_low < chase.low
         if new_low:
@@ -921,6 +1067,8 @@ class Strategy06Engine:
             return                          # 포기된 저점 — 신저점만 기다린다
 
         rebound_floor = chase.low * (1.0 + self.config.rebound_pct / 100.0)
+        early_entry_ceiling = chase.low * (
+            1.0 + self.config.early_entry_cap_pct / 100.0)
         chase_ceiling = chase.low * (1.0 + self.config.chase_cap_pct / 100.0)
         entry_floor = chase.low * (1.0 + self.config.entry_floor_pct / 100.0)
         higher_low_floor = chase.low * (
@@ -947,6 +1095,25 @@ class Strategy06Engine:
                                     che_now=point["che_str"],
                                     vol_rate_now=vol_rate if vol_rate is not None else -1.0,
                                     flow=self._flow_metrics(chase, point))
+                if (
+                    self.config.early_entry_cap_pct > 0
+                    and price <= early_entry_ceiling
+                ):
+                    self._entry_wait_epoch[code] = time.time()
+                    self._signal_record(
+                        code, name, "BUY_READY", chase, price=price,
+                        reason="FIRST_REBOUND_EARLY_ENTRY",
+                        che_now=point["che_str"],
+                        vol_rate_now=vol_rate if vol_rate is not None else -1.0,
+                        flow=self._flow_metrics(chase, point),
+                    )
+                    self._save_chase(code, chase)
+                    result = self._try_entry(
+                        code, name, point, chase, now,
+                        entry_reason="FIRST_REBOUND_EARLY_ENTRY",
+                    )
+                    self._finalize_entry_attempt(code, chase, result)
+                    return
             self._save_chase(code, chase)
             return
 
@@ -977,6 +1144,29 @@ class Strategy06Engine:
                                 flow=self._flow_metrics(chase, point))
             self._clear_retest(chase)
             self._save_chase(code, chase)
+            return
+
+        # First-rebound entry can retry after a transient broker/slot wait while
+        # the live price remains inside the deliberately narrower 1.8% band.
+        if (
+            self.config.early_entry_cap_pct > 0
+            and rebound_floor <= price <= early_entry_ceiling
+            and time.time() - self._entry_wait_epoch.get(code, 0.0) >= 10.0
+        ):
+            self._entry_wait_epoch[code] = time.time()
+            self._signal_record(
+                code, name, "BUY_READY", chase, price=price,
+                reason="FIRST_REBOUND_EARLY_ENTRY_RETRY",
+                che_now=point["che_str"],
+                vol_rate_now=vol_rate if vol_rate is not None else -1.0,
+                flow=self._flow_metrics(chase, point),
+            )
+            self._save_chase(code, chase)
+            result = self._try_entry(
+                code, name, point, chase, now,
+                entry_reason="FIRST_REBOUND_EARLY_ENTRY",
+            )
+            self._finalize_entry_attempt(code, chase, result)
             return
 
         if not chase.pullback_seen:
@@ -1066,6 +1256,14 @@ class Strategy06Engine:
                             flow=fm)
         self._save_chase(code, chase)
         result = self._try_entry(code, name, point, chase, now)
+        self._finalize_entry_attempt(code, chase, result)
+
+    def _finalize_entry_attempt(
+        self,
+        code: str,
+        chase: ChaseState,
+        result: str,
+    ) -> None:
         if result == "STOP":
             chase.phase = "DONE"
             self._save_chase(code, chase)
@@ -1090,6 +1288,8 @@ class Strategy06Engine:
         point: Dict[str, Any],
         chase: ChaseState,
         now: datetime,
+        *,
+        entry_reason: str = "CRASH_LOW_CHASE_CONFIRMED",
     ) -> str:
         """'BOUGHT'=주문 제출 / 'STOP'=오늘 이 종목 끝 / 'RETRY'=잠시 후 재시도.
         ★[2026-08-01] 재무장 2회 — 같은 종목 2번째 진입은 별도 포지션 칸(code:2)."""
@@ -1128,7 +1328,27 @@ class Strategy06Engine:
                         reason="CAPITAL_WAIT")
             return "RETRY"
 
+        slot_reserved = False
         if getattr(self.broker, "real_session", False):
+
+            bars_payload = read_json_cached(self.config.bars_path, {})
+
+            if ma3_rows(code, bars_payload) is None:
+
+                ma3_request_missing_history(code, "S06_CRASH_LOW_CHASE:ENTRY")
+
+                self.state["last_error"] = f"MA3_SEED_NOT_READY:{code}"
+
+                self._event(
+
+                    "BUY_WAIT", code=code, name=name,
+
+                    reason="MA3_SEED_NOT_READY",
+
+                )
+
+                return "RETRY"
+
             if not getattr(self.broker, "buy_allowed", False):
                 self._event("BUY_BLOCKED", code=code, name=name,
                             reason="APPROVAL_OR_OFF_FLAG")
@@ -1160,6 +1380,59 @@ class Strategy06Engine:
                 self.config.fills_dir, code, "매수", day=str(self.state["date"])))
             known.update(open_buy)
             known_orders = sorted(known)
+            try:
+                slot_reserved = bool(self.slots.acquire(
+                    code, STRATEGY_TAG, str(self.state["date"])
+                ))
+            except Exception as exc:
+                self.state["last_error"] = f"SHARED_SLOT:{exc}"
+                slot_reserved = False
+            if not slot_reserved:
+                self._event(
+                    "BUY_WAIT", code=code, name=name,
+                    reason="SHARED_SLOT_OR_DUPLICATE",
+                )
+                return "RETRY"
+
+            # Broker checks can take seconds. Re-read the production snapshot
+            # immediately before creating/submitting the order and preserve the
+            # absolute 2% no-chase guard.
+            latest_payload = read_json(self.config.snapshot_path, {})
+            latest_raw = (latest_payload.get("codes") or {}).get(code) or {}
+            latest_text = str(latest_raw.get("ts") or "").strip()
+            latest_price = abs(number(latest_raw.get("cur")))
+            decision_at = kst_now()
+            latest_at = parse_dt(latest_text, decision_at)
+            latest_age = (decision_at - latest_at).total_seconds()
+            order_floor = chase.low * (1.0 + self.config.entry_floor_pct / 100.0)
+            order_ceiling = chase.low * (1.0 + self.config.chase_cap_pct / 100.0)
+            order_recheck_reason = ""
+            if not latest_text or not -2.0 <= latest_age <= self.config.snapshot_max_age_sec:
+                order_recheck_reason = "ORDER_RECHECK_SNAPSHOT_STALE"
+            elif latest_price < order_floor or latest_price > order_ceiling:
+                order_recheck_reason = "ORDER_RECHECK_PRICE_OUTSIDE_1_TO_2PCT"
+            if order_recheck_reason:
+                try:
+                    self.slots.release(code, str(self.state["date"]))
+                except Exception:
+                    pass
+                self._event(
+                    "BUY_WAIT", code=code, name=name, price=latest_price,
+                    reason=order_recheck_reason,
+                )
+                return "RETRY"
+            price = latest_price
+            required = int(Decimal(str(price)) * self.config.quantity)
+            if self._active_capital_krw() + required > self.config.capital_krw:
+                try:
+                    self.slots.release(code, str(self.state["date"]))
+                except Exception:
+                    pass
+                self._event(
+                    "BUY_WAIT", code=code, name=name, price=price,
+                    reason="ORDER_RECHECK_CAPITAL_WAIT",
+                )
+                return "RETRY"
         else:
             known_orders = []
 
@@ -1183,7 +1456,7 @@ class Strategy06Engine:
             "cancel_requested": False,
             "cancel_epoch": 0.0,
             "last_status": "PREPARED",
-            "reason": "CRASH_LOW_CHASE_CONFIRMED",
+            "reason": entry_reason,
         }
         position = {
             "phase": "BUY_PENDING",
@@ -1200,8 +1473,10 @@ class Strategy06Engine:
             "dip_low_at": chase.low_at,
             "dip_low_reset_steps": chase.reset_steps,
             "dip_first_price": chase.first_price,
+            "entry_reason": entry_reason,
             "che_at_observe": chase.che_at_observe,
             "reserved_capital_krw": required,
+            "slot_reserved": slot_reserved,
             "pending": pending,
             "sell_retries": 0,
             "retry_after_epoch": 0.0,
@@ -1433,7 +1708,7 @@ class Strategy06Engine:
         except OSError:
             return 0.0
         if self._bars_cache[0] != mtime:
-            payload = read_json(self.config.bars_path, {})
+            payload = read_json_cached(self.config.bars_path, {})
             source = payload.get("m") if isinstance(payload, dict) and isinstance(
                 payload.get("m"), dict) else payload
             self._bars_cache = (mtime, source if isinstance(source, dict) else {})
@@ -1444,15 +1719,43 @@ class Strategy06Engine:
         return max(highs) if len(highs) == 3 else 0.0
 
     def _morning_daily_ma_permit(self, code: str, price: float, today: str) -> bool:
-        ma = self._daily_ma_rows(today).get(str(code).zfill(6))
-        if not ma:
-            return False
-        reference = self._recent_3min_high(code) or price
-        return bool(
-            ma["ma5"] > ma["ma10"]
-            and ma["ma20"] > ma["ma20_prev"]
-            and reference >= ma["ma5"]
+        """★[MA3-COMMON 2026-08-03] 3분봉 5/10/20선 + 매수세 우위로 통일(S01~S06 공통).
+
+        종전은 일봉 5선>10선·20선 우상향 + 3분봉 고가≥일봉 5선. 일봉 5선이 장중
+        가격보다 한참 아래인 종목은 상승보유가 영구 참이 되어 트레일을 막았다.
+        today 인자는 호출부 호환을 위해 남긴다(3분봉 판정에는 쓰지 않는다).
+        되돌리기: backup\\strategy_06_crash_low_chase_v1_20260803_ma3wire.py
+        """
+        return ma3_rider_permit(
+            code, price,
+            buy_side=self._morning_buy_side(code, time.time()),
         )
+
+    def _morning_buy_side(self, code: str, epoch_now: float):
+        """S06 매수세 우위 — self.flows 의 거래대금 누적으로 10s/30s 속도를 낸다.
+
+        S06 은 공용코어를 상속하지 않아 FlowWindows 가 없다. 같은 자료(누적 매수/
+        매도 대금)를 자체 flows 에서 뽑아 쓴다. 자료 부족이면 None(판정 불가)
+        → 상승보유 없음 → 트레일 정상 작동.
+        """
+        flow = self.flows.get(str(code).zfill(6))
+        if not flow or len(flow) < 2:
+            return None
+
+        def rate(window_sec: float):
+            rows = [r for r in flow if epoch_now - r[0] <= window_sec]
+            if len(rows) < 2:
+                return None
+            span = rows[-1][0] - rows[0][0]
+            if span < 3.0:
+                return None
+            return (max(0.0, rows[-1][1] - rows[0][1]) / span,
+                    max(0.0, rows[-1][2] - rows[0][2]) / span)
+
+        recent, base = rate(10.0), rate(30.0)
+        if not recent or not base:
+            return None
+        return ma3_buy_side_alive(recent[0], base[0], recent[1], base[1])
 
     @staticmethod
     def _morning_trail_drop(entry: float, peak: float) -> float:
@@ -1631,10 +1934,13 @@ class Strategy06Engine:
             return
         known.update(open_sell)
         retry = int(position.get("sell_retries") or 0) + 1
+        recovery_cycle = int(position.get("sell_recovery_cycle") or 0)
         key = (
             f"{self.config.strategy_slug}:"
             f"{self.state['date']}:sell:{position['code']}:"
-            f"e{int(position.get('entry_no') or 1)}:{retry}"
+            f"e{int(position.get('entry_no') or 1)}:"
+            + (f"recovery{recovery_cycle}:" if recovery_cycle else "")
+            + str(retry)
         )
         position["sell_retries"] = retry
         position["phase"] = "SELL_PENDING"
@@ -1819,8 +2125,50 @@ class Strategy06Engine:
             return
         actual = holdings.get(code) or {}
         actual_qty = int(actual.get("qty") or 0)
+        available_qty = int(actual.get("available") or 0)
         pending = position.get("pending") or {}
         if actual_qty > 0:
+            sell_exhausted = (
+                int(position.get("sell_retries") or 0)
+                >= self.config.max_sell_retries
+                and bool(position.get("entry_at"))
+            )
+            if sell_exhausted:
+                open_sell = self.broker.open_orders(code, buy=False)
+                if open_sell is None:
+                    return
+                if open_sell or available_qty <= 0:
+                    self._event(
+                        "RECOVERY_SELL_REARM_WAIT",
+                        code=code,
+                        reason=(
+                            f"open_sell={open_sell} available={available_qty}"
+                        ),
+                    )
+                    return
+                position["qty"] = min(
+                    int(position.get("qty") or actual_qty), actual_qty)
+                position["pending"] = None
+                position["sell_retries"] = 0
+                position["sell_recovery_cycle"] = (
+                    int(position.get("sell_recovery_cycle") or 0) + 1
+                )
+                position["retry_after_epoch"] = (
+                    time.time() + max(5.0, self.config.fill_wait_sec)
+                )
+                position["phase"] = "HOLD"
+                self.state["last_error"] = ""
+                self._event(
+                    "RECOVERY_SELL_REARMED",
+                    code=code,
+                    quantity=position["qty"],
+                    reason=(
+                        "broker holdings present, available qty positive, "
+                        "no open sell order"
+                    ),
+                )
+                self._refresh_recovery_blocked()
+                return
             if position.get("entry_at"):
                 position["qty"] = min(
                     int(position.get("qty") or actual_qty), actual_qty)

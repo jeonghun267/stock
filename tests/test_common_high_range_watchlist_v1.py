@@ -134,6 +134,44 @@ class HighRangeWatchlistTests(unittest.TestCase):
         self.assertEqual(state["codes"]["000001"]["status"], "STALE")
         self.assertNotIn("low", state["codes"]["000001"])
 
+    def test_observation_features_do_not_emit_an_order(self):
+        candidate = {
+            "code": "000001",
+            "name": "관찰",
+            "rank": 1,
+            "crown": True,
+            "prev_close": 100.0,
+            "avg_5d_value_eok": 390.0,
+        }
+        state = {}
+        for minute in range(35):
+            now = datetime(2026, 7, 27, 9, 0) + timedelta(minutes=minute)
+            price = 100.0 + minute * 0.2
+            snapshot = {
+                "codes": {
+                    "000001": {
+                        "cur": price,
+                        "ts": now.isoformat(),
+                        "cum_vol": 20_000 + minute * 10_000,
+                        "buy_money_cum": 60_000_000 + minute * 60_000_000,
+                        "sell_money_cum": 40_000_000 + minute * 40_000_000,
+                        "che_str": 120,
+                    }
+                }
+            }
+            state = update_live_state(
+                [candidate], snapshot, state, now,
+                listed_shares={"000001": 1_000_000},
+            )
+        live = state["codes"]["000001"]
+        self.assertEqual(len(live["minute_closes"]), 35)
+        self.assertIsNotNone(live["bb_width_pct"])
+        self.assertIsNotNone(live["macd_hist"])
+        self.assertGreater(live["listed_turnover_pct"], 0)
+        self.assertGreater(live["feature_score"], 0)
+        self.assertNotIn("order", state)
+        self.assertNotIn("buy_signal", live)
+
     def test_run_once_writes_large_desktop_board_without_orders(self):
         now = datetime(2026, 7, 27, 9, 1)
         build_and_publish(self.base, self.eod, now)
@@ -160,6 +198,16 @@ class HighRangeWatchlistTests(unittest.TestCase):
         self.assertIn("전일대금", board)
         self.assertIn("실시간대금", board)
         self.assertIn("주문 0 관찰모드", board)
+        shadow_state = json.loads(
+            (self.base / "data" / "high_range_top5_low_shadow_state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            [row["code"] for row in shadow_state["universe"]],
+            ["000001", "000002"],
+        )
+        self.assertNotIn("order", shadow_state)
 
     def test_html_identifies_crown_as_observation_not_buy_signal(self):
         payload = build_and_publish(

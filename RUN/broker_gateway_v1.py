@@ -30,6 +30,9 @@ STEP-1 금지 (집행):
 import sys
 import os
 import json
+import hashlib
+import math
+import shutil
 import time
 import csv as _csv          # [FILL-REC 2026-07-13] 체결가 누적 CSV 기록용
 import ctypes
@@ -44,6 +47,10 @@ from logging.handlers import RotatingFileHandler
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import QEventLoop, QTimer
+
+from ipc_order_auth_v1 import NonceStore, verify_order_request
+import capital_config
+import position_budget
 
 # ═══════════════════════════════════════════════════════════════
 # [TR-THROTTLE 2026-06-24] broker 송출 TR도 공유 레이트리미터 적용.
@@ -86,6 +93,20 @@ LOG_DIR   = BASE_DIR / "LOG"
 LOG_FILE  = LOG_DIR / "broker_journal.log"
 # [Z2 2026-05-14] reconnect/state replay — SetRealReg 등록 상태 영속 저장
 STATE_FILE = DATA_DIR / "broker_state.json"
+# ★[SEC-DAILYCAP-PERSIST 2026-08-05] 일일 매수 건수를 프로세스 밖에 둔다.
+#   메모리 변수뿐이던 탓에 브로커를 다시 띄우면 0 이 됐고, 워치독이 자동으로
+#   재기동하므로 BROKER_MAX_DAILY_BUY 는 '하루 상한'이 아니라 '브로커 수명당 상한'이었다.
+BUY_COUNT_FILE = DATA_DIR / "broker_buy_count.json"
+SENDORDER_IDEMPOTENCY_FILE = DATA_DIR / "broker_sendorder_idempotency.json"
+IPC_AUTH_NONCE_FILE = DATA_DIR / "ipc_auth_nonces.json"
+MANUAL_BUY_BLOCK_FILE = BASE_DIR / "config" / "manual_buy_block.flag"
+ONLY_MONEYFLOW_FLAG = BASE_DIR / "config" / "only_moneyflow.flag"
+KOSDAQ_INDEX_FILE = BASE_DIR / "data" / "kosdaq_index.json"
+US_OVERNIGHT_FILE = BASE_DIR / "data" / "us_overnight.json"
+SHARES_OUTSTANDING_FILE = DATA_DIR / "shares_outstanding.csv"
+
+_GATEWAY_SHARES_CACHE = {}
+_GATEWAY_SHARES_MTIME = None
 
 # [REAL-MICRO 2026-06-24] ★실시간 마이크로구조 구독 — 친구님 설계: broker만 키움 실시간구독(SetRealReg)
 #   → 체결강도(FID228)·호가총잔량(121/125) 수신 → IPC snapshot 1파일 batched broadcast → 봇은 파일만 읽음.
@@ -204,13 +225,200 @@ _ORDER_CAP_BUY_SIDES = (1, 5)
 
 
 def _order_cap_env(name, default):
-    """MICRO_CAP 과 같은 관례 — 숫자가 아니면 기본값으로 진행."""
+    """MICRO_CAP 과 같은 관례 — 숫자가 아니면 기본값으로 진행.
+
+    ★[SEC-CAP-POSITIVE 2026-08-05 친구님 지시 "나머지 4개도 다 해줘"] 0 이하도
+      기본값으로 되돌린다. 검사부가 `if _max > 0 and ...` 라서 그 전에는
+      BROKER_MAX_ORDER_QTY=0 한 줄이면 수량 빗장이 로그 한 줄 없이 사라졌다.
+      지금 이 함수를 쓰는 네 자리(수량·금액·일일건수·주문TTL)는 전부 양수여야
+      뜻이 통한다 — 0 을 '무제한'으로 쓰는 자리가 하나도 없다.
+      ⚠️정말로 상한을 없애야 할 일이 생기면 이 함수가 아니라 호출부에서
+        눈에 보이는 이름으로 만들 것(조용히 0 으로 끄는 길은 다시 열지 말 것).
+    """
+    raw = os.environ.get(name, default)
     try:
-        return int(str(os.environ.get(name, default)).strip())
+        value = int(str(raw).strip())
     except Exception:
         logger.error("[SEC] %s 값이 숫자가 아님(%r) — 기본 %s 로 진행",
-                     name, os.environ.get(name), default)
+                     name, raw, default)
         return int(default)
+    if value <= 0:
+        logger.critical(
+            "[SEC] %s=%r 은 상한을 끄는 값 — 무시하고 기본 %s 로 진행", name, raw, default)
+        return int(default)
+    return value
+
+
+def _is_blanket_real_remove(req) -> bool:
+    """SET_REAL_REMOVE 가 '싹 지우기'인가.
+
+    ⚠️[SCOPED-REMOVE 2026-08-07] 이 함수는 더 이상 관문이 아니다. SET_REAL_REMOVE 는
+      형태와 무관하게 전부 서명 필수로 올렸다(친구님 지시 "그것도 서명 대상으로 올려").
+      기록·진단용으로만 남긴다. **다시 관문으로 쓰지 말 것** — 아래 fail-open 이
+      아니라 fail-closed 로 보이지만, screen_no="ALL\\x00" 이나 전각 "ＡＬＬ" 은
+      .strip() 이 못 벗겨 blanket=False 가 되어 무인증으로 새어 나갔다(보안검사 실측).
+      관문이 필요하면 형태를 따지지 말고 전부 서명을 요구하는 쪽이 맞다.
+
+    ★[IPC-AUTH-BLANKET 2026-08-05 친구님 승인 ⓐ] screen_no/code 중 하나라도
+      "ALL" 이면 참이다.
+        · ("ALL", "ALL")   전 종목 실시간 해제 = SET_REAL_REMOVE_ALL 과 같은 일
+        · (screen, "ALL")  그 화면 통째 — 화면 번호를 돌리면 위와 결과가 같다
+        · ("ALL", code)    그 종목을 전 화면에서
+      승인은 "ALL/ALL 만"이었으나 두 번째 형태로 화면을 순회하면 결과가 똑같아서
+      한쪽만 ALL 이어도 서명을 요구한다. 종목 하나짜리 해제
+      (screen=9001, code=005930)는 거짓이라 종전대로 무인증으로 지나간다.
+      ⚠️읽을 수 없으면 참을 돌려준다 — 판단 불가일 때 열어 두면 그게 구멍이다.
+    """
+    try:
+        screen_no = str(req.get("screen_no", "")).strip().upper()
+        code = str(req.get("code", "")).strip().upper()
+    except Exception:
+        return True
+    return screen_no == "ALL" or code == "ALL"
+
+
+# ★[IPC-HARDEN 2026-08-07] DISCONNECT_SCR 조건부 관문.
+#   이 명령은 무인증인데 화면 하나를 끊으면 그 화면의 실시간이 통째로 죽는다.
+#   9xxx 는 전략·브로커의 실시간 구독 화면(엔진의 눈)이고, 2000~2049 는 1분봉
+#   수집기의 TR 풀이다(collect_prices_1m_...:576-577 SCR_BASE=2000·POOL=50).
+#   수집기는 BrokerClient 를 안 거치고 IPC json 을 직접 쓰므로 자동 서명이 안 된다
+#   → PROTECTED_TYPES 에 그냥 넣으면 1분봉 수집이 깨진다. 그래서 "수집기 풀이면
+#   종전대로 통과, 그 밖(=엔진의 눈)이면 서명 요구" 로 나눈다.
+#   ⚠️읽을 수 없으면 참(=서명 요구)을 돌려준다. 판단 불가일 때 열어 두면 그게 구멍이다.
+DISCONNECT_SCR_FREE_MIN = 2000
+DISCONNECT_SCR_FREE_MAX = 2049
+
+
+def _is_protected_screen(req) -> bool:
+    """DISCONNECT_SCR 이 서명을 요구하는 화면인가(수집기 TR 풀 밖인가)."""
+    try:
+        raw = str(req.get("screen_no", "")).strip()
+        if not raw.isdigit():
+            return True
+        number = int(raw)
+    except Exception:
+        return True
+    return not (DISCONNECT_SCR_FREE_MIN <= number <= DISCONNECT_SCR_FREE_MAX)
+
+
+_IPC_REQUEST_PRIORITY = {
+    # 신규·정정·취소는 모두 SENDORDER_REAL/order_type으로 들어온다.
+    "SENDORDER_REAL": 0,
+    # 주문 전후 브로커 진실 대조가 일반 조회보다 먼저다.
+    "BALANCE_TR": 1,
+    "ACCOUNT_INFO": 1,
+    "STATE": 1,
+    # 브로커/실시간 안전 제어.
+    "SHUTDOWN": 2,
+    "SET_REAL_REMOVE": 2,
+    "SET_REAL_REMOVE_ALL": 2,
+    "SETREAL_REG": 2,
+    "DISCONNECT_SCR": 2,
+    # 장시간 일괄 조회는 항상 마지막.
+    "BATCH_TR": 9,
+}
+
+
+def _ipc_request_sort_key(path: Path) -> tuple[int, int, str]:
+    """주문 우선, 같은 중요도 안에서는 오래된 요청 우선."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        request_type = str(payload.get("type") or "").strip().upper()
+        rqname = str(payload.get("rqname") or "").strip().upper()
+    except Exception:
+        request_type = ""
+        rqname = ""
+    try:
+        modified = path.stat().st_mtime_ns
+    except OSError:
+        modified = 0
+    priority = _IPC_REQUEST_PRIORITY.get(request_type, 5)
+    # [EOD-CLOSE-PRIORITY 2026-08-12 owner approved]
+    # 종가매수의 당일 거래대금 보드는 일반 장중 수급 TR보다 먼저 처리한다.
+    # 주문/잔고 우선순위(0/1)는 그대로 보존한다.
+    if request_type == "TR" and rqname.startswith("EODGAP_"):
+        priority = 2
+    return (priority, modified, path.name)
+
+
+def _pending_real_order_paths(request_dir: Path | None = None) -> list[Path]:
+    """현재 도착한 실주문·정정·취소 요청만 오래된 순서로 반환한다."""
+    root = request_dir or IPC_REQ
+    pending = [
+        path for path in root.glob("*.json")
+        if _ipc_request_sort_key(path)[0] == 0
+    ]
+    return sorted(pending, key=_ipc_request_sort_key)
+
+
+def _pending_safety_query_paths(request_dir: Path | None = None) -> list[Path]:
+    """Return queued broker-truth queries that must not wait behind BATCH_TR."""
+    root = request_dir or IPC_REQ
+    pending = [
+        path for path in root.glob("*.json")
+        if _ipc_request_sort_key(path)[0] == 1
+    ]
+    return sorted(pending, key=_ipc_request_sort_key)
+
+
+def _process_snapshot_win32():
+    """지금 살아있는 프로세스 목록 — 외부 실행파일에 의존하지 않는다.
+
+    ★[SHUTDOWN-ORIGIN-FIX 2026-08-05 친구님 승인 ⓐ] wmic 이 실전에서 조용히
+      빈손으로 돌아왔다(8/5 19:00:02 진짜 종료에서 payload·mtime 은 찍혔는데
+      "프로세스 0건"만 남았다. 같은 명령을 셸에서 돌리면 24줄이 나온다).
+      예외가 아니라 빈 출력이라 실패로도 안 보였다 = 감시 사각.
+      이 경로는 같은 프로세스 안에서 OS 에 직접 물으므로 PATH·인코딩·콘솔 유무와
+      무관하다. 명령줄은 못 얻지만 PID/부모PID/이름은 확실히 남는다.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class _PE32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    rows = []
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # ⚠️argtypes 를 안 주면 64비트에서 HANDLE 이 잘려 스냅샷이 깨진다.
+        k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k32.Process32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PE32)]
+        k32.Process32First.restype = wintypes.BOOL
+        k32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PE32)]
+        k32.Process32Next.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)   # TH32CS_SNAPPROCESS
+        if not snap or snap == ctypes.c_void_p(-1).value:
+            return rows
+        try:
+            entry = _PE32()
+            entry.dwSize = ctypes.sizeof(_PE32)
+            ok = k32.Process32First(snap, ctypes.byref(entry))
+            while ok:
+                rows.append("pid=%d ppid=%d %s" % (
+                    entry.th32ProcessID,
+                    entry.th32ParentProcessID,
+                    entry.szExeFile.decode("cp949", "replace"),
+                ))
+                ok = k32.Process32Next(snap, ctypes.byref(entry))
+        finally:
+            k32.CloseHandle(snap)
+    except Exception as e:                      # 진단이 종료를 막으면 안 된다
+        logger.info("[SHUTDOWN-ORIGIN] OS 스냅샷 실패: %s", e)
+    return rows
 
 
 # [SEC-ACCTMASK 2026-07-30] 로그 계좌번호 마스킹.
@@ -221,10 +429,168 @@ def _mask_acct(a):
     return (s[:4] + "**") if len(s) >= 4 else "**"
 
 
+def _gateway_buy_safety(rqname: str, qty: int) -> tuple[bool, int, str]:
+    """직접 IPC도 BrokerClient와 같은 격리·시장레짐 관문을 통과시킨다."""
+    name = str(rqname or "").upper()
+    try:
+        only_moneyflow = ONLY_MONEYFLOW_FLAG.exists()
+    except OSError as exc:
+        return False, int(qty), f"only_moneyflow check unavailable: {exc}"
+    if only_moneyflow:
+        allowed = tuple(
+            p.strip().upper()
+            for p in os.environ.get("ONLY_MF_ALLOW", "MFLOW").split(",")
+            if p.strip()
+        )
+        if not (allowed and name.startswith(allowed)):
+            return False, int(qty), "only_moneyflow(flag): gateway 전략매수 차단"
+
+    if os.environ.get("MARKET_REGIME_GATE", "NO").strip().upper() != "YES":
+        return True, int(qty), ""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        reduce_at = float(os.environ.get("MARKET_DROP_REDUCE", "-2.0"))
+        stop_at = float(os.environ.get("MARKET_DROP_STOP", "-3.0"))
+        cut = float(os.environ.get("REGIME_CUT", "0.5"))
+        if not (stop_at < reduce_at < 0):
+            return False, int(qty), (
+                "MARKET_REGIME_CONFIG_INVALID: "
+                f"stop({stop_at}) < reduce({reduce_at}) < 0 필요"
+            )
+        if not (0 < cut < 1):
+            return False, int(qty), (
+                f"MARKET_REGIME_CONFIG_INVALID: 0 < REGIME_CUT({cut}) < 1 필요"
+            )
+        kchg = None
+        try:
+            market = json.loads(KOSDAQ_INDEX_FILE.read_text(encoding="utf-8-sig"))
+            if str(market.get("ts", ""))[:10] == today:
+                kchg = float(market.get("chg"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            kchg = None
+
+        exempt = tuple(
+            p.strip().upper()
+            for p in os.environ.get("REGIME_STOP_EXEMPT", "").split(",")
+            if p.strip()
+        )
+        if (kchg is not None and stop_at < 0 and kchg <= stop_at
+                and not (exempt and name.startswith(exempt))):
+            return False, int(qty), f"레짐스탑: 코스닥 {kchg:+.2f}%"
+
+        bad = kchg is not None and kchg <= reduce_at
+        if (not bad
+                and os.environ.get("US_DANGER_BLOCK", "YES").strip().upper() == "YES"):
+            try:
+                us = json.loads(US_OVERNIGHT_FILE.read_text(encoding="utf-8-sig"))
+                bad = (str(us.get("ts", ""))[:10] == today
+                       and str(us.get("risk", "")).upper() == "DANGER"
+                       and (kchg is None or kchg <= 0))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        adjusted = max(1, int(round(int(qty) * cut))) if bad and 0 < cut < 1 else int(qty)
+        return True, adjusted, ""
+    except (TypeError, ValueError) as exc:
+        return False, int(qty), f"MARKET_REGIME_CONFIG_INVALID: {exc}"
+
+
+def _gateway_load_shares() -> dict:
+    """Gateway 최종 매수관문용 발행주식수 캐시."""
+    global _GATEWAY_SHARES_CACHE, _GATEWAY_SHARES_MTIME
+    try:
+        mtime = SHARES_OUTSTANDING_FILE.stat().st_mtime
+        if mtime == _GATEWAY_SHARES_MTIME and _GATEWAY_SHARES_CACHE:
+            return _GATEWAY_SHARES_CACHE
+        rows = {}
+        with SHARES_OUTSTANDING_FILE.open(encoding="utf-8-sig", newline="") as stream:
+            reader = _csv.DictReader(stream)
+            for row in reader:
+                code = str(row.get("code") or "").strip().zfill(6)
+                try:
+                    shares = float(row.get("shares") or 0)
+                except (TypeError, ValueError):
+                    shares = 0.0
+                if len(code) == 6 and shares > 0:
+                    rows[code] = shares
+        if rows:
+            _GATEWAY_SHARES_CACHE = rows
+            _GATEWAY_SHARES_MTIME = mtime
+        return _GATEWAY_SHARES_CACHE
+    except (OSError, TypeError, ValueError):
+        return _GATEWAY_SHARES_CACHE
+
+
+def _gateway_buy_universe_safety(
+    rqname: str, code: str, current_price: float,
+) -> tuple[bool, str]:
+    """직접 IPC도 BrokerClient와 같은 가격·시총 하한을 적용한다."""
+    name = str(rqname or "").upper()
+    if name.startswith("EODGAP_LOWBUY"):
+        return True, ""
+    try:
+        if name.startswith("MFLOW"):
+            min_price = float(
+                os.environ.get("MF_MIN_PRICE")
+                or os.environ.get("SAFEPLUS_MIN_PRICE", "1000")
+            )
+            min_marketcap = float(
+                os.environ.get("MF_MIN_MARKETCAP")
+                or os.environ.get("SAFEPLUS_MIN_MARKETCAP", "0")
+            )
+        else:
+            min_price = float(os.environ.get("SAFEPLUS_MIN_PRICE", "1000"))
+            min_marketcap = float(os.environ.get("SAFEPLUS_MIN_MARKETCAP", "0"))
+    except (TypeError, ValueError) as exc:
+        return False, f"BUY_UNIVERSE_CONFIG_INVALID: {exc}"
+
+    if (not math.isfinite(min_price) or min_price < 0
+            or not math.isfinite(min_marketcap) or min_marketcap < 0):
+        return False, (
+            "BUY_UNIVERSE_CONFIG_INVALID: 가격·시총 하한은 0 이상의 유한한 숫자 필요"
+        )
+
+    price = abs(float(current_price or 0))
+    if not math.isfinite(price):
+        return False, "BUY_UNIVERSE_PRICE_INVALID: 현재가가 유한한 숫자가 아님"
+    if price <= 0 and (min_price > 0 or min_marketcap > 0):
+        return False, "BUY_UNIVERSE_PRICE_UNAVAILABLE: 신뢰 가능한 현재가 없음"
+    if price > 0 and price < min_price:
+        return False, f"price_floor: {price:.0f}<{min_price:.0f} (gateway)"
+    if min_marketcap > 0 and price > 0:
+        shares = float(_gateway_load_shares().get(str(code).zfill(6), 0) or 0)
+        if shares <= 0:
+            return False, "BUY_UNIVERSE_SHARES_UNAVAILABLE: 발행주식수 없음"
+        marketcap = shares * price
+        if shares > 0 and marketcap < min_marketcap:
+            return False, (
+                f"mcap_floor: {marketcap/1e8:.0f}억<{min_marketcap/1e8:.0f}억 (gateway)"
+            )
+    return True, ""
+
+
 # [GHOST-WIN 2026-07-30] 유령 주문 창 그림자 스위치.
 #   클라 10초 포기 후 게이트웨이가 15초까지 실행하던 5초 창 문제 —
-#   오늘 밤은 YES(그림자·로그만). 7/31 age_sec 데이터 보고 setx BROKER_GHOST_SHADOW NO 로 실거부 전환.
-_GHOST_SHADOW = str(os.environ.get("BROKER_GHOST_SHADOW", "YES")).strip().upper() != "NO"
+#   7/30 밤은 YES(그림자·로그만)로 두고 age_sec 데이터를 보기로 했었다.
+#
+# ★[GHOST-BLOCK-ON 2026-08-05 친구님 지시 "유령주문 차단도 켜줘"] 기본값 YES -> NO.
+#   그 "7/31 에 보기로 한 데이터"를 아무도 안 봤고, 그래서 7/30 부터 8/5 까지
+#   차단이 계속 꺼진 채였다. 환경변수는 User·Machine·런처 어디에도 없었다
+#   = 코드 기본값 하나가 실제 동작을 정하고 있었는데 그게 '안 막음'이었다.
+#
+#   실측 근거(LOG\event_journal_*.jsonl, 실주문 48건 / 7·31·8·3·8·4·8·5):
+#     age_sec 중앙 0.33s · p90 0.52s · 최대 1.05s · 8초 초과 0건
+#     -> 문턱(min(클라 ttl, BROKER_ORDER_MAX_TTL_SEC=8))까지 7.6배 여유.
+#        지난 48건 중 단 한 건도 이 차단에 걸리지 않았다.
+#
+#   ⚠️이 차단은 매도에도 걸린다(검사 위치가 매수한정 블록보다 앞이다).
+#     거부되면 엔진은 포지션을 그대로 두고 5초 뒤 다시 판다
+#     (strategy_01_rotation_engine_v2.py:1775-1781 SELL_REJECTED).
+#     8/4 처럼 "팔지도 않고 장부에서 지우는" 경로가 아님을 확인하고 켰다.
+#
+#   🔑되돌리기는 코드 수정 없이:  setx BROKER_GHOST_SHADOW YES  (재기동 후 적용)
+#     스위치를 코드 기본값으로 옮긴 이유 = 환경변수는 눈에 안 보이고 백업도 안 돼서
+#     조용히 사라진다. 실제로 그렇게 6일을 꺼져 있었다.
+_GHOST_SHADOW = str(os.environ.get("BROKER_GHOST_SHADOW", "NO")).strip().upper() == "YES"
 
 
 _console = logging.StreamHandler(sys.stdout)
@@ -503,7 +869,13 @@ class BrokerGateway:
     TR_TIMEOUT_SEC        = 20
     HEARTBEAT_INTERVAL_MS = 5_000
     POLL_INTERVAL_MS      = 500
+    # Real orders must be able to enter while an ordinary TR owns the nested
+    # Qt event loop. The normal poll is intentionally non-reentrant, so a
+    # separate order-only timer handles this safety-critical exception.
+    URGENT_ORDER_POLL_INTERVAL_MS = 50
     DEFAULT_TTL_SEC       = 30
+    MAX_REQUEST_TTL_SEC   = 300
+    MAX_FUTURE_SKEW_SEC   = 5.0
 
     def __init__(self):
         self.app: QApplication = None
@@ -523,20 +895,34 @@ class BrokerGateway:
         self.tr_data_buffer = {}
         # [STEP-2A] 현재 TR 요청에서 추출할 컬럼 목록 (OnReceiveTrData 콜백이 참조)
         self.tr_output_fields: list = []
+        # 현재 OCX TR 한 건의 고유 식별자. 지연 응답이 다음 요청을 깨우거나
+        # 다음 종목 데이터로 섞이지 않도록 callback 에서 정확히 대조한다.
+        self._active_tr: dict | None = None
+        self._tr_wire_seq: int = 0
         # [Phase 1.2 2026-05-14] rqname → request_id mapping (관측/진단 + 미래 worker thread 확장 base).
         # 현재 single-thread 라 race 0 — 본 dict 는 observability 용도 (log + 향후 buffer key 마이그레이션 기반).
         # 동시 동일 rqname 두 요청 발생 시 후순위 가 선순위 덮어씀 (현 broker single-thread 라 발생 불가).
         self.tr_pending_rqname: dict = {}  # rqname → {"request_id": str, "start_ts": float}
 
+        # ★[IPC-HARDEN 2026-08-07] 서명 재생 방지. 서명은 30초 유효라, 정당한 요청
+        #   파일을 복사해 다시 넣으면 같은 명령이 한 번 더 집행됐다(실주문이면 중복 주문).
+        #   재기동 직후에도 아직 유효한 nonce 재사용을 막기 위해 원자적으로 저장한다.
+        self._nonce_store = NonceStore(state_path=IPC_AUTH_NONCE_FILE)
+        self._sendorder_idempotency_cache = self._load_sendorder_idempotency()
+        self._buy_count_persist_failed = False
+
         self._heartbeat_timer = None
         self._poll_timer      = None
+        self._urgent_order_timer = None
         # QEventLoop.exec_() 중에도 Qt timer가 다시 발화한다. 이때 poll_requests가
         # 재진입하면 뒤 TR이 self.tr_loop/output_fields를 덮어써 앞 TR 응답을
         # 유실시킨다. 한 번의 IPC poll pass가 끝날 때까지 중첩 poll을 막는다.
         self._poll_in_progress = False
+        self._urgent_order_poll_in_progress = False
         # [Z2 2026-05-14] state replay — SetRealReg 등록 상태 영속화
         # key = screen_no, value = {"code_list": "035720;...", "fid_list": "10;13;...", "real_type": "0", "ts": ...}
         self._realreg_state: dict = {}
+        self._realreg_load_ok: bool = True
 
     # ───────────────────────────────────────────────────────────
     # State transition
@@ -665,6 +1051,23 @@ class BrokerGateway:
             "OnReceiveTrData rqname=%s tr_code=%s screen_no=%s",
             rqname, tr_code, screen_no,
         )
+        active = getattr(self, "_active_tr", None)
+        if not active:
+            logger.warning(
+                "OnReceiveTrData 대기 요청 없음 — 지연 응답 무시 rqname=%s tr_code=%s screen=%s",
+                rqname, tr_code, screen_no,
+            )
+            return
+        if (str(rqname) != str(active.get("rqname"))
+                or str(tr_code).lower() != str(active.get("tr_code")).lower()
+                or str(screen_no) != str(active.get("screen_no"))):
+            logger.warning(
+                "OnReceiveTrData 현재 요청 불일치 - 지연 응답 무시 "
+                "got=(%s,%s,%s) expected=(%s,%s,%s)",
+                rqname, tr_code, screen_no,
+                active.get("rqname"), active.get("tr_code"), active.get("screen_no"),
+            )
+            return
         try:
             record_count_raw = self.ocx.dynamicCall(
                 "GetRepeatCnt(QString, QString)", tr_code, rqname
@@ -675,7 +1078,8 @@ class BrokerGateway:
             #   - multi-record TR (record_count > 0): record_count 만큼 row
             #   - single-record TR (record_count == 0): 1 row (index=0) 추출 시도
             records: list = []
-            fields = list(self.tr_output_fields or [])
+            # 전역 필드가 아니라 이 요청을 발사할 때 고정한 필드를 사용한다.
+            fields = list(active.get("output_fields") or [])
             if fields:
                 iter_count = record_count if record_count > 0 else 1
                 for i in range(iter_count):
@@ -905,8 +1309,14 @@ class BrokerGateway:
     _micro_snapshot: dict = {}        # code -> {ts, che_str, ask_tot, bid_tot, imb, cur, cum_vol}
     # [OB-FIX 2026-07-13] set → list. 등록 순서(우선순위)가 화면 분할에 그대로 쓰이므로 순서를 잃으면 안 됨.
     _micro_watch_codes: list = []
+    # Watch files are rewritten by several producers while the broker reads
+    # them. A read can briefly see a truncated JSON document. Keep the last
+    # valid value so a partial write cannot churn every real-time subscription
+    # and starve the TR/order queue.
+    _micro_watch_file_cache: dict = {}
     _hr_watch_codes: list = []      # ★[2026-07-30] 고저폭 전용 통로 등록 상태
     _micro_screens: list = []         # 현재 실시간 등록에 쓰고 있는 화면번호(줄었을 때 해제용)
+    _micro_screen_codes: dict = {}    # screen -> 실제 등록 코드; 증감분 갱신/검증용
     _micro_last_upd: dict = {}        # code -> last update epoch ms (per-code throttle)
     _micro_verify_logged: int = 0
     # ★[REAL-SIDE 2026-07-22 친구님 승인] 부호 있는 체결량(FID15: +매수/-매도) 실체결 누계.
@@ -964,8 +1374,16 @@ class BrokerGateway:
                 if today_only and watch_date != datetime.now().strftime("%Y%m%d"):
                     logger.warning("[MICRO] stale watch ignored: %s watch_date=%s", name, watch_date)
                     return []
-                return [str(c).zfill(6) for c in (d.get("codes") or [])]
-            except Exception:
+                codes = [str(c).zfill(6) for c in (d.get("codes") or [])]
+                self._micro_watch_file_cache[name] = codes
+                return codes
+            except Exception as exc:
+                cached = self._micro_watch_file_cache.get(name)
+                if cached is not None:
+                    logger.debug(
+                        "[MICRO] transient watch read failed; cached list retained: %s (%s)",
+                        name, type(exc).__name__)
+                    return list(cached)
                 return []
         out, seen = [], set()
         def _add(lst):
@@ -1060,13 +1478,18 @@ class BrokerGateway:
             size    = max(1, MICRO_CHUNK)
             chunks  = [ordered[i:i + size] for i in range(0, len(ordered), size)] or [[]]
             used    = []
+            registered = {}
             for i, ch in enumerate(chunks):
                 scr = str(int(MICRO_SCREEN) + i)
                 # optType "0" = 그 화면의 기존등록 교체(마이크로 전용 화면이라 타 등록 무간섭)
                 ret = self.ocx.dynamicCall(
                     "SetRealReg(QString, QString, QString, QString)",
                     scr, ";".join(ch), MICRO_FIDS, "0")
+                if ret is not None and int(ret) < 0:
+                    raise RuntimeError(
+                        f"SetRealReg rejected screen={scr} ret={ret}")
                 used.append(scr)
+                registered[scr] = list(ch)
                 # ★[7/17 진단] 반환값 로그 — 0=성공, 음수=키움 거부(지금까지 버려져서 거부도 성공처럼 보였음)
                 logger.info("[MICRO] SetRealReg %d종목 (screen=%s) ret=%s", len(ch), scr, ret)
             # 종목수가 줄어 안 쓰게 된 화면은 해제(잔여 실시간 스트림 정리)
@@ -1077,10 +1500,97 @@ class BrokerGateway:
                 except Exception:
                     pass
             self._micro_screens = used
+            self._micro_screen_codes = registered
             logger.info("[MICRO] 등록 합계 %d종목 / 화면 %d개 (chunk=%d)",
                         len(ordered), len(used), size)
         except Exception as e:
             logger.error("[MICRO] SetRealReg 실패: %s", e)
+
+    def _micro_sync_delta(self, codes):
+        """Apply membership changes without replacing every 200-code screen.
+
+        The in-memory screen map is verified against the requested set after
+        every update. Any rejected/failed delta triggers one full rebuild so a
+        bad incremental call can never leave a silent quote-subscription hole.
+        """
+        target = list(dict.fromkeys(str(code).zfill(6) for code in codes))
+        target_set = set(target)
+        screens = self._micro_screen_codes
+        if not screens:
+            self._micro_register(target)
+            return
+
+        removed = 0
+        added = 0
+        delta_failed = False
+        for screen, current in list(screens.items()):
+            for code in list(current):
+                if code in target_set:
+                    continue
+                try:
+                    self.ocx.dynamicCall(
+                        "SetRealRemove(QString, QString)", screen, code)
+                    current.remove(code)
+                    removed += 1
+                except Exception as exc:
+                    delta_failed = True
+                    logger.error(
+                        "[MICRO-DELTA] remove 실패 screen=%s code=%s: %s",
+                        screen, code, exc)
+
+        registered_set = {
+            code for current in screens.values() for code in current
+        }
+        size = max(1, MICRO_CHUNK)
+        for code in target:
+            if code in registered_set:
+                continue
+            screen = next(
+                (key for key in sorted(screens, key=int)
+                 if len(screens[key]) < size),
+                None,
+            )
+            if screen is None:
+                screen = str(int(MICRO_SCREEN) + len(screens))
+                screens[screen] = []
+            option = "1" if screens[screen] else "0"
+            try:
+                ret = self.ocx.dynamicCall(
+                    "SetRealReg(QString, QString, QString, QString)",
+                    screen, code, MICRO_FIDS, option)
+                if ret is not None and int(ret) < 0:
+                    raise RuntimeError(f"SetRealReg ret={ret}")
+                screens[screen].append(code)
+                registered_set.add(code)
+                added += 1
+            except Exception as exc:
+                delta_failed = True
+                logger.error(
+                    "[MICRO-DELTA] add 실패 screen=%s code=%s: %s",
+                    screen, code, exc)
+
+        for screen in list(screens):
+            if screens[screen]:
+                continue
+            try:
+                self.ocx.dynamicCall("DisconnectRealData(QString)", screen)
+            except Exception:
+                pass
+            screens.pop(screen, None)
+
+        self._micro_screens = sorted(screens, key=int)
+        actual_set = {
+            code for current in screens.values() for code in current
+        }
+        if delta_failed or actual_set != target_set:
+            logger.error(
+                "[MICRO-DELTA] integrity mismatch target=%d actual=%d; full rebuild",
+                len(target_set), len(actual_set))
+            self._micro_register(target)
+            return
+        logger.info(
+            "[MICRO-DELTA] add=%d remove=%d total=%d screens=%d",
+            added, removed, len(actual_set), len(self._micro_screens))
 
     def _micro_update(self, code, real_type):
         code = str(code)
@@ -1158,6 +1668,23 @@ class BrokerGateway:
             op = _num(_g("16"))
             if op:  # 0/None 은 기록하지 않는다 — 거짓 시가가 판정을 오염시키면 안 된다
                 rec["op"] = op
+            # ★[LOW-FID 2026-08-05 친구님 지시 "계약서에 넣어놓으면 공통으로 모든
+            #   전략들이 사용 가능하지 않니?"] 당일 고가(17)·저가(18)도 같이 실는다.
+            #   왜 — 전략이 각자 자기가 본 틱으로 저점을 만들면 (ㄱ)구독 이전 저점을
+            #   못 보고 (ㄴ)엔진 사정으로 리셋된다. 실제로 S02 의 anchor_low 는 새 고점이
+            #   찍힐 때마다 통째로 리셋돼서, 문턱을 조일수록 "저점 대비 %"는 좋아 보이는데
+            #   실제 매수가는 올라갔다(8/5 원익IPS 실증: 계약서 1.439% vs 진짜 3.785%,
+            #   착시폭 2.347%p). 거래소가 주는 공식 저가를 한 자리에서 실어주면
+            #   S01~S06 이 전부 같은 진짜 저점을 무수정으로 쓴다.
+            #   FID 16 과 같은 방식 — MICRO_FIDS(등록 목록)는 손대지 않는다. 주식체결
+            #   실시간에 원래 실려 오는지 먼저 보고, 빈 값이면 등록 추가를 재판단한다.
+            #   실패해도 무해: 안 실리면 소비자는 종전과 똑같이 동작한다(전부 폴백 보유).
+            hi = _num(_g("17"))
+            if hi:
+                rec["hi"] = hi
+            lo = _num(_g("18"))
+            if lo:
+                rec["lo"] = lo
             # ★[LAT-PROBE 2026-08-01] 지연 실측 ① — 체결 이벤트에만. 기록 전용, 전체 try 격리.
             if LAT_PROBE_ON:
                 try:
@@ -1260,6 +1787,9 @@ class BrokerGateway:
     def _micro_flush(self):
         if not self._micro_snapshot:
             return
+        tmp = MICRO_SNAPSHOT_FILE.with_name(
+            f"{MICRO_SNAPSHOT_FILE.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+        )
         try:
             # ★[REAL-SIDE 2026-07-22] flush 직전 부호체결 누계를 스냅샷 rec에 병합(1초 1회, 저비용)
             for _c, _acc in self._micro_acc.items():
@@ -1270,20 +1800,42 @@ class BrokerGateway:
                     _rec["buy_money_cum"] = _acc["bm"]
                     _rec["sell_money_cum"] = _acc["sm"]
             snap = {"ts": datetime.now().isoformat(), "codes": self._micro_snapshot}
-            tmp = MICRO_SNAPSHOT_FILE.with_suffix(".tmp")
             tmp.write_text(json.dumps(snap, ensure_ascii=False), encoding="utf-8")
-            os.replace(str(tmp), str(MICRO_SNAPSHOT_FILE))
+            for attempt in range(6):
+                try:
+                    os.replace(str(tmp), str(MICRO_SNAPSHOT_FILE))
+                    break
+                except PermissionError:
+                    if attempt == 5:
+                        raise
+                    time.sleep(0.02)
         except Exception as e:
             logger.error("[MICRO] flush 실패: %s", e)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _micro_tick(self):
         if not REAL_MICRO_ON:
             return
         try:
             codes = self._read_micro_watch()
-            if codes and codes != self._micro_watch_codes:
-                self._micro_register(codes)
-                self._micro_watch_codes = codes
+            # SetRealReg only cares about membership once every chunk fits.
+            # Producer rankings can reorder the same codes every second; that
+            # must not tear down and recreate all three subscription screens.
+            membership_changed = (
+                len(codes) != len(self._micro_watch_codes)
+                or set(codes) != set(self._micro_watch_codes)
+            )
+            if codes and membership_changed:
+                self._micro_sync_delta(codes)
+                self._micro_watch_codes = [
+                    code
+                    for screen in self._micro_screens
+                    for code in self._micro_screen_codes.get(screen, [])
+                ]
             # ★[2026-07-30 친구님 승인 "고저폭 보강 ②"] 고저폭 전용 통로 등록 — 공용 경로와 독립.
             #   실패해도 공용 구독·flush 에 영향이 없게 자체 try 로 격리. optType "0" =
             #   그 화면의 기존등록 교체(전용 화면이라 타 등록 무간섭). 목록이 바뀔 때만 재등록.
@@ -1452,6 +2004,60 @@ class BrokerGateway:
     # ───────────────────────────────────────────────────────────
     # IPC: Request 처리
     # ───────────────────────────────────────────────────────────
+    def _ipc_auth_ok(self, request_id, req, expected_type, tag) -> bool:
+        """서명 통과면 True. 실패면 거부 응답까지 쓰고 False.
+
+        ★[IPC-AUTH-BLANKET 2026-08-05] 잠글 분기가 넷이 되면서 같은 12줄을 네 번
+          쓰게 돼 한 곳으로 모았다.
+        ★[IPC-HARDEN 2026-08-07] 재생 방지를 여기에 넣었다. 이제 실주문 경로
+          (SENDORDER_REAL·SET_REAL_REMOVE_ALL)도 이 함수를 쓴다 — 재생 방지가
+          가장 필요한 게 바로 그 둘이라 더는 예외로 둘 이유가 없다.
+        """
+        auth_ok, auth_error = verify_order_request(req, expected_type=expected_type)
+        # 저장소가 없으면 여기서 만든다. __init__ 을 거치지 않고 만들어진 인스턴스에서
+        # 방어가 조용히 빠지는 것을 막는다(그런 경로가 실제로 있다 — 시험이 그렇게 만든다).
+        store = getattr(self, "_nonce_store", None)
+        if store is None:
+            store = self._nonce_store = NonceStore()
+        if auth_ok and not store.consume(str(req.get("auth_nonce") or "")):
+            auth_ok, auth_error = False, "auth nonce already used (replay)"
+        if auth_ok:
+            return True
+        logger.error(
+            "[%s] rejected request_id=%s caller=%s reason=%s",
+            tag, request_id, str(req.get("caller") or "")[:40], auth_error,
+        )
+        self._write_response(
+            request_id, status="ERROR",
+            error=f"{expected_type} authentication rejected: {auth_error}",
+        )
+        return False
+
+    def _next_tr_rqname(self, prefix: str = "T") -> str:
+        """OCX 송신용 20자 이하 고유 rqname. 논리 rqname 재사용과 지연응답을 격리한다."""
+        seq = (int(getattr(self, "_tr_wire_seq", 0)) + 1) & 0xFFFFFF
+        self._tr_wire_seq = seq
+        tick = time.monotonic_ns() & 0xFFFFFFFF
+        safe_prefix = "B" if str(prefix).upper().startswith("B") else "T"
+        return f"{safe_prefix}{seq:06X}{tick:08X}"
+
+    def _wire_tr_rqname(self, logical_rqname: str, *, stable: bool = False) -> str:
+        """Return the OCX wire rqname.
+
+        Ordinary market-data TRs keep unique names so delayed callbacks cannot
+        wake a later request.  Kiwoom account TR ``opw00018`` behaves
+        differently: on a reused strategy screen it keeps returning the first
+        rqname registered for that screen.  Balance requests therefore retain
+        their authenticated strategy-specific logical name.
+        """
+        if not stable:
+            return self._next_tr_rqname("T")
+        safe = "".join(
+            ch for ch in str(logical_rqname or "")
+            if ch.isascii() and (ch.isalnum() or ch in "_-")
+        )[:20]
+        return safe or self._next_tr_rqname("T")
+
     def process_request(self, req_path: Path):
         """단일 IPC request 처리 (TTL 검사 → dispatch → 삭제)."""
         request_id = req_path.stem
@@ -1462,20 +2068,40 @@ class BrokerGateway:
             ts_str     = req.get("ts", "")
             ttl        = int(req.get("ttl_sec", self.DEFAULT_TTL_SEC))
 
+            if not (1 <= ttl <= self.MAX_REQUEST_TTL_SEC):
+                self._write_response(
+                    request_id, status="ERROR",
+                    error=(f"INVALID_TTL ttl={ttl}; allowed "
+                           f"1..{self.MAX_REQUEST_TTL_SEC}s"),
+                )
+                req_path.unlink(missing_ok=True)
+                return
+
             # TTL 검사
             try:
                 req_ts = datetime.fromisoformat(ts_str)
-                age = (datetime.now() - req_ts).total_seconds()
-            except Exception:
-                age = 0.0
+                now_dt = datetime.now(req_ts.tzinfo) if req_ts.tzinfo else datetime.now()
+                age = (now_dt - req_ts).total_seconds()
+            except Exception as exc:
+                self._write_response(
+                    request_id, status="ERROR",
+                    error=f"INVALID_REQUEST_TIME: {exc}",
+                )
+                req_path.unlink(missing_ok=True)
+                return
 
-            # [N26 2026-05-14] 시계 skew 보호 — req.ts 가 미래 (-ttl 이하) 시 의심 로그 + 0 reset
-            if age < -ttl:
+            # 같은 PC 안의 IPC이므로 큰 미래 시각은 시계차가 아니라 잘못된 요청이다.
+            if age < -self.MAX_FUTURE_SKEW_SEC:
                 logger.warning(
-                    "REQ %s 시계 skew 의심 (req.ts 미래): age=%.1fs — 0 으로 reset 후 진행",
+                    "REQ %s 미래 시각 거부: age=%.1fs",
                     request_id, age,
                 )
-                age = 0.0
+                self._write_response(
+                    request_id, status="ERROR",
+                    error=f"FUTURE_REQUEST_TIME age={age:.1f}s",
+                )
+                req_path.unlink(missing_ok=True)
+                return
 
             if age > ttl:
                 logger.warning(
@@ -1496,45 +2122,102 @@ class BrokerGateway:
                     data={"pong": True, "state": self.state.value},
                 )
             elif req_type == "TR":
+                # * [TR-ROLLBACK 2026-08-11 chingu approved] signature enforcement lifted
                 self._handle_tr_request(request_id, req)
             elif req_type == "SHUTDOWN":
-                self._handle_shutdown_request(request_id)
+                # ★[IPC-AUTH-SHUTDOWN 2026-08-06 친구님 지시 "지금해"] 서명 필수로 전환.
+                #   무인증이면 IPC\requests 에 쓸 수 있는 코드가 브로커를 꺼 엔진 전체를
+                #   눈멀게 한다(워치독은 하트비트/프리징만 보므로 못 잡는다). 유일 발신자
+                #   broker_night_stop.ps1 은 broker_client 경유라 PROTECTED_TYPES 추가만으로
+                #   자동 서명된다 — 야간정지 스크립트는 무수정. SHUTDOWN 분기는 장중 미발동
+                #   (19:00 야간정지에만) 이라 이 변경이 장중 매매에 닿는 경로는 없다.
+                if self._ipc_auth_ok(request_id, req, "SHUTDOWN",
+                                     "SEC-SHUTDOWN-AUTH"):
+                    self._handle_shutdown_request(request_id, req, req_path)
             elif req_type == "DISCONNECT_SCR":
-                self._handle_disconnect_scr_request(request_id, req)
+                # ★[IPC-HARDEN 2026-08-07] 수집기 TR 풀(2000~2049)은 종전대로 무인증,
+                #   그 밖의 화면(9xxx = 전략 실시간 구독 = 엔진의 눈)은 서명 필수.
+                #   _is_protected_screen 주석 참조.
+                if (not _is_protected_screen(req)) or self._ipc_auth_ok(
+                        request_id, req, "DISCONNECT_SCR",
+                        "SEC-DISCONNECTSCR-AUTH"):
+                    self._handle_disconnect_scr_request(request_id, req)
             elif req_type == "STATE":
                 self._handle_state_request(request_id)
             elif req_type == "ACCOUNT_INFO":
+                # * [TR-ROLLBACK 2026-08-11 chingu approved] signature enforcement lifted
                 self._handle_account_info_request(request_id, req)
             elif req_type == "BALANCE_TR":
+                # * [TR-ROLLBACK 2026-08-11 chingu approved] signature enforcement lifted
                 self._handle_balance_tr_request(request_id, req)
             elif req_type == "MASTER_INFO":
                 # [STEP-3.4 MASTER_INFO 2026-05-14] read-only 마스터 함수 위임 (collect_eod_daily_bars 용)
                 self._handle_master_info_request(request_id, req)
             elif req_type == "SETREAL_REG":
                 # [B1 2026-05-14] SetRealReg 위임 (실시간 시세 등록)
-                self._handle_setreal_reg_request(request_id, req)
+                # ★[IPC-AUTH-BLANKET 2026-08-05 친구님 승인 ⓐ] 서명 필수로 전환.
+                #   이 명령은 성공하면 _realreg_state 에 남아 broker_state.json 으로
+                #   디스크에 적히고(:1897 _save_realreg_state), 재기동 때
+                #   _replay_realreg() 가 되살린다. 남의 화면 번호를 덮어쓰면
+                #   껐다 켜도 안 돌아온다 — 실시간 해제보다 오래 가는 공격이다.
+                #   정당한 호출자는 0건(구독은 브로커가 자체 OCX 로 한다).
+                if self._ipc_auth_ok(request_id, req, "SETREAL_REG",
+                                     "SEC-SETREALREG-AUTH"):
+                    self._handle_setreal_reg_request(request_id, req)
             elif req_type == "SET_REAL_REMOVE":
                 # [E1 2026-05-14] SetRealRemove 위임 (실시간 시세 해제)
-                self._handle_set_real_remove_request(request_id, req)
+                # ★[IPC-AUTH-BLANKET 2026-08-05 친구님 승인 ⓐ] 전면 해제만 서명 필수였다.
+                # ★[SCOPED-REMOVE 2026-08-07 친구님 지시 "그것도 서명 대상으로 올려"]
+                #   종목 하나짜리 해제까지 전부 서명 필수로 올린다.
+                #   8/5 에는 "종목 하나는 무해하다"고 봤는데, 보안검사가 반례를 냈다:
+                #   구독 종목 목록은 IPC\live_micro_snapshot.json 에서 그냥 읽히고,
+                #   poll 한 번이 발견한 요청을 전부 순차 처리하므로 수백 건을 수 초에
+                #   넣으면 전면 해제와 결과가 같다. 그러면 스냅샷 갱신이 멈춰
+                #   매수뿐 아니라 매도·손절 판정까지 신선도 관문에 걸려 멈추는데,
+                #   브로커는 살아 있고 하트비트도 정상이라 워치독이 못 잡는다.
+                #   = 8/4·8/5 잠금이 겨냥한 바로 그 사고가 옆문으로 성립한다.
+                #   정당한 호출자는 실전 코드에 0건이다(전수 확인: 보내는 곳은
+                #   broker_client.set_real_remove 하나뿐이고 그것을 부르는 실전 코드가
+                #   없다). BrokerClient 경유 호출자는 자동 서명되므로 손댈 것이 없다.
+                #   되돌리기: 아래 한 줄을 `if (not _is_blanket_real_remove(req)) or
+                #   self._ipc_auth_ok(...)` 로 되돌리고 백업의 판정 함수를 복원한다.
+                if self._ipc_auth_ok(request_id, req, "SET_REAL_REMOVE",
+                                     "SEC-REALREMOVE-AUTH"):
+                    self._handle_set_real_remove_request(request_id, req)
             elif req_type == "GET_COMM_REAL_DATA":
                 # [D1 2026-05-14] GetCommRealData 위임 (실시간 데이터 추출)
                 self._handle_get_comm_real_data_request(request_id, req)
+            elif req_type == "BATCH_GET_COMM_REAL_DATA":
+                # [YOUTUBE-EOD-SHADOW] 주문 없는 전 종목 실시간 FID 묶음 읽기.
+                self._handle_batch_get_comm_real_data_request(request_id, req)
             elif req_type == "GET_REAL_REG_GRP":
                 # [B2 2026-05-14] GetRealRegGroup 위임 (실시간 등록 그룹 조회)
                 self._handle_get_real_reg_grp_request(request_id, req)
             elif req_type == "SET_REAL_REMOVE_ALL":
-                # [B3 2026-05-14] SetRealRemove("ALL","ALL") 명시 단축 (EOD 정리)
-                self._handle_set_real_remove_all_request(request_id, req)
+                # ★[IPC-AUTH-SCOPE 2026-08-04] 전 종목 실시간 해제는 서명된 요청만.
+                #   브로커를 살려 둔 채 엔진 전체를 눈멀게 하는 명령이라 워치독
+                #   (하트비트·프리징 감시)이 절대 못 잡는다. 정당한 호출자는 0건이다.
+                # ★[IPC-HARDEN 2026-08-07] 재생 방지 포함(_ipc_auth_ok).
+                if self._ipc_auth_ok(request_id, req, "SET_REAL_REMOVE_ALL",
+                                     "SEC-REALREMOVE-AUTH"):
+                    # [B3 2026-05-14] SetRealRemove("ALL","ALL") 명시 단축 (EOD 정리)
+                    self._handle_set_real_remove_all_request(request_id, req)
             elif req_type == "KOA_FUNCTIONS":
                 # [F1 2026-05-14] KOA_Functions 위임 (자동로그인 설정 등 키움 확장 함수)
                 self._handle_koa_functions_request(request_id, req)
             elif req_type == "SENDORDER_SHADOW":
                 self._handle_sendorder_shadow_request(request_id, req)
             elif req_type == "SENDORDER_REAL":
-                # [Z1 2026-05-14] 실 SendOrder 집행 + idempotency
-                self._handle_sendorder_real_request(request_id, req)
+                # 실주문은 공유 비밀키 HMAC가 일치하는 최신 요청만 집행한다.
+                # ★[IPC-HARDEN 2026-08-07] 재생 방지 포함(_ipc_auth_ok). 서명 사본을
+                #   30초 안에 다시 넣으면 같은 주문이 두 번 나가던 구멍을 막는다.
+                if self._ipc_auth_ok(request_id, req, "SENDORDER_REAL",
+                                     "SEC-ORDER-AUTH"):
+                    # [Z1 2026-05-14] 실 SendOrder 집행 + idempotency
+                    self._handle_sendorder_real_request(request_id, req)
             elif req_type == "BATCH_TR":
                 # [Phase 1.1 BATCH_TR 2026-05-14] 다종목 TR 일괄 처리 (collector opt10080 throughput 영구 해결 기반)
+                # * [TR-ROLLBACK 2026-08-11 chingu approved] signature enforcement lifted
                 self._handle_batch_tr_request(request_id, req)
             else:
                 logger.warning("REQ %s UNKNOWN TYPE: %s", request_id, req_type)
@@ -1676,7 +2359,18 @@ class BrokerGateway:
                 "origin_order_no":    origin_order_no,
                 "note":               "broker_did_not_send (shadow_only)",
             }
-            shadow_path = IPC_ORDER_SHADOW_DIR / f"{request_id}.json"
+            # ★[SEC-PATHTRAV 2026-08-07 보안검사 지적] 7/30 에 _write_response 는
+            #   막았는데 이 분기만 원본 request_id 를 그대로 이어붙였다. 무인증
+            #   SENDORDER_SHADOW 로 request_id="..\..\..\어딘가\파일" 을 보내면
+            #   실측상 C:\PROOF.json 까지 나간다. 브로커는 Highest(관리자)로 뜨므로
+            #   UAC 창 없는 관리자 권한 파일 쓰기가 된다 — 오늘 파이썬을 RX 로
+            #   강등한 조치를 우회하는 경로다.
+            _shadow_rid = self._safe_request_id(request_id)
+            if _shadow_rid is None:
+                logger.warning("[SEC] SENDORDER_SHADOW request_id 형식 위반 — 격리: %r",
+                               str(request_id)[:120])
+                _shadow_rid = "rejected_request_id"
+            shadow_path = IPC_ORDER_SHADOW_DIR / f"{_shadow_rid}.json"
             tmp = shadow_path.with_suffix(".tmp")
             tmp.write_text(
                 json.dumps(shadow, ensure_ascii=False, indent=2),
@@ -1741,7 +2435,9 @@ class BrokerGateway:
             return
         # 기존 TR 흐름으로 위임 — SetInputValue/CommRqData/OnReceiveTrData
         try:
-            self._handle_tr_request(request_id, req)
+            self._handle_tr_request(
+                request_id, req, stable_wire_rqname=True,
+            )
         except Exception as e:
             logger.error("BALANCE_TR 위임 예외 tr_code=%s: %s", tr_code, e, exc_info=True)
             self._write_response(
@@ -1828,21 +2524,50 @@ class BrokerGateway:
                 error="SETREAL_REG required: screen_no, code_list, fid_list",
             )
             return
+        if real_type not in {"0", "1"}:
+            self._write_response(
+                request_id, status="ERROR",
+                error=f"SETREAL_REG real_type must be 0 or 1 (got {real_type!r})",
+            )
+            return
         try:
             ret = self.ocx.dynamicCall(
                 "SetRealReg(QString, QString, QString, QString)",
                 screen_no, code_list, fid_list, real_type,
             )
             ret_int = int(ret) if ret is not None else -1
-            if ret_int == 0:
-                # [Z2] state replay — 성공한 등록 영속 저장
-                self._realreg_state[screen_no] = {
-                    "code_list": code_list,
-                    "fid_list":  fid_list,
-                    "real_type": real_type,
-                    "ts":        datetime.now().isoformat(),
-                }
-                self._save_realreg_state()
+            if ret_int != 0:
+                self._write_response(
+                    request_id, status="ERROR",
+                    error=f"SetRealReg ret={ret_int}",
+                    data={"screen_no": screen_no, "ret": ret_int},
+                )
+                return
+
+            # 추가등록(real_type=1)은 현재 화면의 종목/FID와 합친다. 재기동 때는
+            # 빈 화면에 복원하므로 저장값은 항상 신규등록(real_type=0)이어야 한다.
+            previous = self._realreg_state.get(screen_no) or {}
+            if real_type == "1" and isinstance(previous, dict):
+                saved_codes = self._merge_realreg_tokens(
+                    previous.get("code_list", ""), code_list)
+                saved_fids = self._merge_realreg_tokens(
+                    previous.get("fid_list", ""), fid_list)
+            else:
+                saved_codes = self._merge_realreg_tokens("", code_list)
+                saved_fids = self._merge_realreg_tokens("", fid_list)
+            self._realreg_state[screen_no] = {
+                "code_list": saved_codes,
+                "fid_list": saved_fids,
+                "real_type": "0",
+                "ts": datetime.now().isoformat(),
+            }
+            if not self._save_realreg_state():
+                self._write_response(
+                    request_id, status="ERROR",
+                    error="SetRealReg succeeded but state persistence failed",
+                    data={"screen_no": screen_no, "ret": ret_int},
+                )
+                return
             self._write_response(
                 request_id, status="OK",
                 data={"screen_no": screen_no, "code_list": code_list,
@@ -1858,9 +2583,96 @@ class BrokerGateway:
     # ───────────────────────────────────────────────────────────
     # [Z2 2026-05-14] state replay — broker reconnect 시 SetRealReg 자동 재등록
     # ───────────────────────────────────────────────────────────
-    def _save_realreg_state(self):
-        """SetRealReg 등록 상태를 디스크에 영속 저장 (atomic write)."""
+    def _load_buy_count(self, today: str):
+        """오늘 이미 몇 건 샀는지 디스크에서 복원해 (날짜, 건수) 로 돌려준다.
+
+        ★[SEC-DAILYCAP-PERSIST 2026-08-05 친구님 지시 "나머지 4개도 다 해줘"]
+          _buy_count 가 메모리 변수뿐이라 브로커를 다시 띄우면 0 이 됐다.
+          워치독이 자동 재기동하므로 BROKER_MAX_DAILY_BUY=100 은 '하루 100건'이
+          아니라 '브로커 수명당 100건'이었다.
+          ⚠️읽기 실패는 0 으로 시작한다(fail-open). 파일 하나 깨졌다고 그날 매수를
+            통째로 막는 쪽이 더 위험하다 — 대신 CRITICAL 로 남겨 아침에 보이게 한다.
+        """
         try:
+            if not BUY_COUNT_FILE.exists():
+                return today, self._buy_count_from_idempotency(today)
+            saved = json.loads(BUY_COUNT_FILE.read_text(encoding="utf-8-sig"))
+            if str(saved.get("date") or "") != today:
+                return today, 0             # 어제 파일 — 오늘은 0 부터
+            restored = max(0, int(saved.get("count") or 0))
+            if restored:
+                logger.warning(
+                    "[SEC-ORDERCAP] 오늘 매수 %d건을 디스크에서 복원 — "
+                    "재기동해도 일일 상한이 초기화되지 않는다", restored)
+            return today, restored
+        except Exception as e:
+            logger.critical(
+                "[SEC-ORDERCAP] 일일 매수 카운트 복원 실패 — 신규매수 차단: %s", e)
+            return today, _order_cap_env("BROKER_MAX_DAILY_BUY", 100)
+
+    def _buy_count_from_idempotency(self, today: str) -> int:
+        """카운트 파일 유실 시 성공한 당일 신규매수를 멱등성 장부에서 복원한다."""
+        count = 0
+        for key, value in getattr(self, "_sendorder_idempotency_cache", {}).items():
+            if str(key).startswith("__"):
+                continue
+            try:
+                response = value[1]
+                data = response.get("data") or {}
+                if (response.get("status") == "OK"
+                        and int(data.get("order_type", 0)) == 1
+                        and str(data.get("ts", ""))[:10].replace("-", "") == today):
+                    count += 1
+            except (AttributeError, TypeError, ValueError, IndexError):
+                continue
+        if count:
+            logger.critical(
+                "[SEC-ORDERCAP] 카운트 파일 없음 — 멱등성 장부에서 당일 매수 %d건 복원",
+                count,
+            )
+        return count
+
+    def _save_buy_count(self):
+        """현재 카운트를 원자적으로 기록하고 성공 여부를 돌려준다."""
+        try:
+            BUY_COUNT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = BUY_COUNT_FILE.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps({"date": self._buy_count_date,
+                            "count": int(self._buy_count),
+                            "ts": datetime.now().isoformat()},
+                           ensure_ascii=False),
+                encoding="utf-8",
+            )
+            for attempt in range(6):
+                try:
+                    os.replace(str(tmp), str(BUY_COUNT_FILE))
+                    return True
+                except PermissionError:
+                    if attempt == 5:
+                        raise
+                    time.sleep(0.2)
+        except Exception as e:
+            logger.error("[SEC-ORDERCAP] 일일 매수 카운트 저장 실패: %s", e)
+            return False
+
+    @staticmethod
+    def _merge_realreg_tokens(existing, added) -> str:
+        """세미콜론 목록을 순서 보존·중복 제거해 합친다."""
+        merged = []
+        seen = set()
+        for raw in (existing, added):
+            for token in str(raw or "").split(";"):
+                item = token.strip()
+                if item and item not in seen:
+                    seen.add(item)
+                    merged.append(item)
+        return ";".join(merged)
+
+    def _save_realreg_state(self) -> bool:
+        """SetRealReg 등록 상태를 원자적으로 저장하고 성공 여부를 반환한다."""
+        try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             tmp = STATE_FILE.with_suffix(".tmp")
             tmp.write_text(
                 json.dumps({"realreg": self._realreg_state,
@@ -1868,55 +2680,101 @@ class BrokerGateway:
                            ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            os.replace(str(tmp), str(STATE_FILE))
+            for attempt in range(6):
+                try:
+                    os.replace(str(tmp), str(STATE_FILE))
+                    return True
+                except PermissionError:
+                    if attempt == 5:
+                        raise
+                    time.sleep(0.2)
         except Exception as e:
             logger.error("[Z2] _save_realreg_state 실패: %s", e)
+            return False
 
-    def _load_realreg_state(self):
-        """broker 시작 시 이전 state 로드. 단 _replay_realreg() 호출 전 까지 등록 안 함."""
+    def _load_realreg_state(self) -> bool:
+        """broker 시작 시 이전 state 로드. 정상 스키마일 때만 True."""
+        self._realreg_load_ok = True
         try:
             if not STATE_FILE.exists():
                 self._realreg_state = {}
-                return
+                return True
             data = json.loads(STATE_FILE.read_text(encoding="utf-8-sig"))
-            self._realreg_state = data.get("realreg") or {}
+            realreg = data.get("realreg", {})
+            if realreg is None:
+                realreg = {}
+            if not isinstance(realreg, dict):
+                raise ValueError("realreg must be an object")
+            cleaned = {}
+            for screen_no, info in realreg.items():
+                if not isinstance(info, dict):
+                    raise ValueError(f"screen {screen_no!r} state must be an object")
+                codes = self._merge_realreg_tokens("", info.get("code_list", ""))
+                fids = self._merge_realreg_tokens("", info.get("fid_list", ""))
+                if not str(screen_no).strip() or not codes or not fids:
+                    raise ValueError(f"screen {screen_no!r} state is incomplete")
+                cleaned[str(screen_no).strip()] = {
+                    "code_list": codes,
+                    "fid_list": fids,
+                    "real_type": "0",
+                    "ts": str(info.get("ts") or ""),
+                }
+            self._realreg_state = cleaned
             logger.info("[Z2] state 로드: %d 개 화면 등록 이력", len(self._realreg_state))
+            return True
         except Exception as e:
-            logger.error("[Z2] _load_realreg_state 실패: %s", e)
+            logger.critical("[Z2] _load_realreg_state 실패 - 복구 불가: %s", e)
             self._realreg_state = {}
+            self._realreg_load_ok = False
+            return False
 
-    def _replay_realreg(self):
-        """LOGIN 성공 후 이전 SetRealReg 등록 자동 재실행.
+    def _replay_realreg(self) -> bool:
+        """LOGIN 성공 후 이전 SetRealReg 등록 자동 재실행. 전부 성공해야 True.
 
         sub-process 가 broker 재시작 알아챌 필요 없이 broker 가 스스로 복원.
         """
+        if not getattr(self, "_realreg_load_ok", True):
+            return False
         if not self._realreg_state:
-            return
+            return True
         if self.state != BrokerState.CONNECTED:
             logger.warning("[Z2-REPLAY] state %s — replay 보류", self.state.value)
-            return
+            return False
         logger.info("[Z2-REPLAY] %d 개 화면 SetRealReg 재등록 시작", len(self._realreg_state))
         ok_count = 0
         fail_count = 0
         for screen_no, info in self._realreg_state.items():
-            try:
-                ret = self.ocx.dynamicCall(
-                    "SetRealReg(QString, QString, QString, QString)",
-                    screen_no, info.get("code_list", ""), info.get("fid_list", ""),
-                    info.get("real_type", "0"),
+            last_error = ""
+            restored = False
+            for attempt in range(1, 4):
+                try:
+                    ret = self.ocx.dynamicCall(
+                        "SetRealReg(QString, QString, QString, QString)",
+                        screen_no, info.get("code_list", ""), info.get("fid_list", ""),
+                        "0",
+                    )
+                    ret_int = int(ret) if ret is not None else -1
+                    if ret_int == 0:
+                        restored = True
+                        break
+                    last_error = f"ret={ret_int}"
+                except Exception as e:
+                    last_error = str(e)
+                logger.warning(
+                    "[Z2-REPLAY] RETRY screen=%s attempt=%d/3 reason=%s",
+                    screen_no, attempt, last_error,
                 )
-                ret_int = int(ret) if ret is not None else -1
-                if ret_int == 0:
-                    ok_count += 1
-                    logger.info("[Z2-REPLAY] OK screen=%s codes=%s", screen_no,
-                                (info.get("code_list", "")[:40] + "...") if len(info.get("code_list", "")) > 40 else info.get("code_list", ""))
-                else:
-                    fail_count += 1
-                    logger.warning("[Z2-REPLAY] FAIL screen=%s ret=%d", screen_no, ret_int)
-            except Exception as e:
+                if attempt < 3:
+                    time.sleep(0.25)
+            if restored:
+                ok_count += 1
+                logger.info("[Z2-REPLAY] OK screen=%s codes=%s", screen_no,
+                            (info.get("code_list", "")[:40] + "...") if len(info.get("code_list", "")) > 40 else info.get("code_list", ""))
+            else:
                 fail_count += 1
-                logger.error("[Z2-REPLAY] screen=%s 예외: %s", screen_no, e)
+                logger.error("[Z2-REPLAY] FAIL screen=%s reason=%s", screen_no, last_error)
         logger.info("[Z2-REPLAY] 완료 ok=%d fail=%d", ok_count, fail_count)
+        return fail_count == 0
 
     def _handle_set_real_remove_request(self, request_id, req):
         """[E1 2026-05-14] SetRealRemove 위임.
@@ -1942,11 +2800,39 @@ class BrokerGateway:
             self.ocx.dynamicCall(
                 "SetRealRemove(QString, QString)", screen_no, code,
             )
-            # [Z2] state 갱신 — screen_no/code 완전 제거 시 state 에서도 제거
+            # [Z2] 실제 해제와 재기동 복구 목록을 동일하게 유지한다.
             if code.upper() == "ALL":
-                # 화면 전체 해제
-                self._realreg_state.pop(screen_no, None)
-                self._save_realreg_state()
+                if screen_no.upper() == "ALL":
+                    self._realreg_state = {}
+                elif screen_no in self._realreg_state:
+                    self._realreg_state.pop(screen_no, None)
+            else:
+                targets = (list(self._realreg_state)
+                           if screen_no.upper() == "ALL" else [screen_no])
+                for target in targets:
+                    info = self._realreg_state.get(target)
+                    if not isinstance(info, dict):
+                        continue
+                    old_codes = [item for item in
+                                 self._merge_realreg_tokens("", info.get("code_list", "")).split(";")
+                                 if item]
+                    new_codes = [item for item in old_codes if item != code]
+                    if new_codes == old_codes:
+                        continue
+                    if new_codes:
+                        info["code_list"] = ";".join(new_codes)
+                        info["real_type"] = "0"
+                        info["ts"] = datetime.now().isoformat()
+                    else:
+                        self._realreg_state.pop(target, None)
+            # 이전 저장 실패 뒤 같은 해제 요청이 재시도돼도 디스크를 다시 맞춘다.
+            if not self._save_realreg_state():
+                self._write_response(
+                    request_id, status="ERROR",
+                    error="SetRealRemove succeeded but state persistence failed",
+                    data={"screen_no": screen_no, "code": code},
+                )
+                return
             self._write_response(
                 request_id, status="OK",
                 data={"screen_no": screen_no, "code": code, "removed": True},
@@ -1996,6 +2882,77 @@ class BrokerGateway:
                 error=f"GetCommRealData exception: {e}",
             )
 
+    def _handle_batch_get_comm_real_data_request(self, request_id, req):
+        """등록된 종목의 현재가/누적거래량을 한 번에 읽는 그림자 전용 배관.
+
+        허용 FID는 현재가(10), 누적거래량(13)뿐이다. 처리 도중 실주문 요청이
+        발견되면 즉시 중단하여 주문 경로를 지연시키지 않는다.
+        """
+        if self.state != BrokerState.CONNECTED:
+            self._write_response(
+                request_id, status="ERROR",
+                error=f"Not connected (state={self.state.value})",
+            )
+            return
+        codes = req.get("codes") or []
+        fids = req.get("fids") or []
+        if not isinstance(codes, list) or not isinstance(fids, list):
+            self._write_response(
+                request_id, status="ERROR",
+                error="BATCH_GET_COMM_REAL_DATA: codes/fids must be lists",
+            )
+            return
+        codes = [str(code).strip().zfill(6) for code in codes if str(code).strip()]
+        try:
+            fids = [int(fid) for fid in fids]
+        except Exception:
+            fids = []
+        allowed_fids = {10, 13}
+        if not codes or len(codes) > 2000:
+            self._write_response(
+                request_id, status="ERROR",
+                error=f"BATCH_GET_COMM_REAL_DATA: code count must be 1..2000 ({len(codes)})",
+            )
+            return
+        if not fids or any(fid not in allowed_fids for fid in fids):
+            self._write_response(
+                request_id, status="ERROR",
+                error="BATCH_GET_COMM_REAL_DATA: allowed fids are 10,13",
+            )
+            return
+
+        records = []
+        aborted = False
+        started = time.time()
+        try:
+            for index, code in enumerate(codes):
+                if index and index % 100 == 0 and _pending_real_order_paths():
+                    aborted = True
+                    break
+                values = {}
+                for fid in fids:
+                    value = self.ocx.dynamicCall(
+                        "GetCommRealData(QString, int)", code, fid,
+                    )
+                    values[str(fid)] = str(value).strip() if value else ""
+                records.append({"code": code, "fid_data": values})
+            self._write_response(
+                request_id, status="OK",
+                data={
+                    "records": records,
+                    "processed": len(records),
+                    "requested": len(codes),
+                    "aborted_for_order": aborted,
+                    "elapsed_sec": round(time.time() - started, 4),
+                },
+            )
+        except Exception as e:
+            logger.error("Batch GetCommRealData 오류: %s", e)
+            self._write_response(
+                request_id, status="ERROR",
+                error=f"Batch GetCommRealData exception: {e}",
+            )
+
     # ───────────────────────────────────────────────────────────
     # [Z1 2026-05-14] SendOrder 실 집행 + idempotency dedup
     # ───────────────────────────────────────────────────────────
@@ -2003,18 +2960,135 @@ class BrokerGateway:
     # 같은 key 의 후속 호출 = cache 에서 직전 응답 즉시 반환.
     # 이유: client timeout 후 재요청 시 중복 주문 방지 (자산 손실 차단).
     _sendorder_idempotency_cache: dict = {}  # idempotency_key → (ts, response_dict)
-    _SENDORDER_IDEMPOTENCY_TTL_SEC = 300  # 5분 dedup 윈도우
+    _SENDORDER_IDEMPOTENCY_TTL_SEC = 86_400  # 같은 거래일 재시도 차단
+
+    def _load_sendorder_idempotency(self) -> dict:
+        try:
+            if not SENDORDER_IDEMPOTENCY_FILE.exists():
+                return {}
+            payload = json.loads(
+                SENDORDER_IDEMPOTENCY_FILE.read_text(encoding="utf-8-sig")
+            )
+            entries = payload.get("entries")
+            if not isinstance(entries, dict):
+                raise ValueError("entries must be an object")
+            now = time.time()
+            restored = {}
+            for key, item in entries.items():
+                if not isinstance(item, dict):
+                    raise ValueError("entry must be an object")
+                ts = float(item.get("ts") or 0.0)
+                response = item.get("response")
+                if not isinstance(response, dict):
+                    raise ValueError("response must be an object")
+                age = now - ts
+                if age < -300:
+                    raise ValueError("entry timestamp is in the future")
+                critical_state = (
+                    str(key) == "__LOAD_FAILED__"
+                    or response.get("error") in {
+                        "SENDORDER_IN_FLIGHT_RECONCILE_REQUIRED",
+                        "SENDORDER_IDEMPOTENCY_LOAD_FAILED",
+                    }
+                )
+                if key and (critical_state
+                            or age <= self._SENDORDER_IDEMPOTENCY_TTL_SEC):
+                    restored[str(key)] = (ts, response)
+            return restored
+        except Exception as exc:
+            logger.critical(
+                "[SENDORDER-DEDUP] 영속 기록 복원 실패 — 신규 주문 차단 필요: %s",
+                exc,
+            )
+            return {"__LOAD_FAILED__": (
+                time.time(),
+                {"status": "ERROR", "data": None,
+                 "error": "SENDORDER_IDEMPOTENCY_LOAD_FAILED"},
+            )}
+
+    def _save_sendorder_idempotency(self) -> bool:
+        try:
+            SENDORDER_IDEMPOTENCY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            if ("__LOAD_FAILED__" in self._sendorder_idempotency_cache
+                    and SENDORDER_IDEMPOTENCY_FILE.exists()):
+                backup = SENDORDER_IDEMPOTENCY_FILE.with_suffix(".load_failed.bak")
+                if not backup.exists():
+                    shutil.copy2(SENDORDER_IDEMPOTENCY_FILE, backup)
+            payload = {
+                "entries": {
+                    str(key): {"ts": float(value[0]), "response": value[1]}
+                    for key, value in self._sendorder_idempotency_cache.items()
+                },
+                "updated_at": datetime.now().isoformat(),
+            }
+            tmp = SENDORDER_IDEMPOTENCY_FILE.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            for attempt in range(6):
+                try:
+                    os.replace(str(tmp), str(SENDORDER_IDEMPOTENCY_FILE))
+                    return True
+                except PermissionError:
+                    if attempt == 5:
+                        raise
+                    time.sleep(0.2)
+        except Exception as exc:
+            logger.critical("[SENDORDER-DEDUP] 영속 기록 저장 실패: %s", exc)
+            return False
 
     def _purge_sendorder_idempotency(self):
         """idempotency cache 의 TTL 초과 항목 청소."""
         try:
             now = time.time()
             expired = [k for k, v in self._sendorder_idempotency_cache.items()
-                       if (now - v[0]) > self._SENDORDER_IDEMPOTENCY_TTL_SEC]
+                       if k != "__LOAD_FAILED__"
+                       and not (
+                           isinstance(v[1], dict)
+                           and v[1].get("error")
+                           == "SENDORDER_IN_FLIGHT_RECONCILE_REQUIRED"
+                       )
+                       and (now - v[0]) > self._SENDORDER_IDEMPOTENCY_TTL_SEC]
             for k in expired:
                 self._sendorder_idempotency_cache.pop(k, None)
+            if expired:
+                self._save_sendorder_idempotency()
         except Exception:
             pass
+
+    @staticmethod
+    def _sendorder_fingerprint(req) -> str | None:
+        """같은 멱등성 키가 같은 경제적 주문에만 쓰였는지 확인한다."""
+        try:
+            canonical = {
+                "account": str(req.get("account", "")).strip().replace("-", ""),
+                "code": str(req.get("code", "")).strip(),
+                "order_type": int(req.get("order_type", 0)),
+                "qty": int(req.get("qty", 0)),
+                "price": int(req.get("price", 0)),
+                "hoga_gb": str(req.get("hoga_gb", "")).strip(),
+                "origin_order_no": str(req.get("origin_order_no", "")).strip(),
+            }
+            raw = json.dumps(
+                canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            return hashlib.sha256(raw).hexdigest()
+        except (TypeError, ValueError):
+            return None
+
+    def _unresolved_sendorder_keys(self) -> list[str]:
+        """실제 접수 여부를 브로커 장부와 대조해야 하는 주문 키 목록."""
+        unresolved = []
+        for key, value in self._sendorder_idempotency_cache.items():
+            if str(key).startswith("__"):
+                continue
+            try:
+                response = value[1]
+                if response.get("error") == "SENDORDER_IN_FLIGHT_RECONCILE_REQUIRED":
+                    unresolved.append(str(key))
+            except (IndexError, TypeError, AttributeError):
+                unresolved.append(str(key))
+        return unresolved
 
     # SendOrder 화이트리스트 — order_type 정수만 허용 (1=매수, 2=매도, 3=매수취소, 4=매도취소, 5=매수정정, 6=매도정정)
     SENDORDER_TYPE_WHITELIST = {1, 2, 3, 4, 5, 6}
@@ -2022,6 +3096,7 @@ class BrokerGateway:
     # [SEC-ORDERCAP 2026-07-30] 일일 매수 건수 카운터 (브로커가 매일 재기동되므로 메모리로 충분)
     _buy_count_date: str = ""
     _buy_count: int = 0
+    _buy_count_persist_failed: bool = False
 
     def _handle_sendorder_real_request(self, request_id, req):
         """[Z1 2026-05-14] 실 SendOrder 집행. idempotency 보장.
@@ -2042,7 +3117,40 @@ class BrokerGateway:
         """
         self._purge_sendorder_idempotency()
 
-        if self.state != BrokerState.CONNECTED:
+        try:
+            requested_order_type = int(req.get("order_type", 0))
+        except (TypeError, ValueError):
+            requested_order_type = 0
+
+        if ("__LOAD_FAILED__" in self._sendorder_idempotency_cache
+                and requested_order_type in _ORDER_CAP_BUY_SIDES):
+            self._write_response(
+                request_id, status="ERROR",
+                error="SENDORDER_IDEMPOTENCY_LOAD_FAILED: 신규매수/매수정정 차단",
+            )
+            return
+
+        unresolved_keys = self._unresolved_sendorder_keys()
+        if unresolved_keys and requested_order_type in _ORDER_CAP_BUY_SIDES:
+            self._write_response(
+                request_id, status="ERROR",
+                data={"unresolved_keys": unresolved_keys[:20]},
+                error="SENDORDER_RECONCILE_REQUIRED: 미확정 주문 존재, 신규매수/매수정정 차단",
+            )
+            return
+
+        if self.state == BrokerState.RATE_LIMIT:
+            try:
+                rate_limit_order_type = int(req.get("order_type", 0))
+            except (TypeError, ValueError):
+                rate_limit_order_type = 0
+            if rate_limit_order_type not in {2, 3, 4, 6}:
+                self._write_response(
+                    request_id, status="ERROR",
+                    error="BROKER_RATE_LIMIT: 신규매수/매수정정 차단",
+                )
+                return
+        elif self.state != BrokerState.CONNECTED:
             self._write_response(request_id, status="ERROR",
                 error=f"Not connected (state={self.state.value})")
             return
@@ -2052,11 +3160,37 @@ class BrokerGateway:
             self._write_response(request_id, status="ERROR",
                 error="SENDORDER_REAL: idempotency_key required (중복 주문 차단)")
             return
+        allowed_key_chars = "-_.:"
+        if (len(idempotency_key) > 128 or not idempotency_key.isascii()
+                or any(not (ch.isalnum() or ch in allowed_key_chars)
+                       for ch in idempotency_key)):
+            self._write_response(
+                request_id, status="ERROR",
+                error="SENDORDER_REAL: idempotency_key must be 1~128 safe ASCII characters",
+            )
+            return
 
         # idempotency check — 같은 key 이전 응답 있으면 그대로 재반환
         cached = self._sendorder_idempotency_cache.get(idempotency_key)
         if cached:
             _, prev_res = cached
+            stored_fingerprint = str(
+                (prev_res.get("data") or {}).get("order_fingerprint") or ""
+            )
+            request_fingerprint = self._sendorder_fingerprint(req)
+            if not stored_fingerprint:
+                self._write_response(
+                    request_id, status="ERROR",
+                    data=prev_res.get("data"),
+                    error="SENDORDER_IDEMPOTENCY_LEGACY_RECONCILE_REQUIRED",
+                )
+                return
+            if request_fingerprint != stored_fingerprint:
+                self._write_response(
+                    request_id, status="ERROR",
+                    error="SENDORDER_IDEMPOTENCY_PAYLOAD_MISMATCH: 같은 키의 주문내용 불일치",
+                )
+                return
             logger.warning(
                 "[SENDORDER-DEDUP] idempotency_key=%s 재요청 — cache 응답 반환 (실 SendOrder 미호출)",
                 idempotency_key,
@@ -2091,22 +3225,166 @@ class BrokerGateway:
             return
         if not account or not code or qty <= 0:
             self._write_response(request_id, status="ERROR",
-                error=f"SENDORDER_REAL required: account/code/qty (got account={account} code={code} qty={qty})")
+                error=("SENDORDER_REAL required: account/code/qty "
+                       f"(got account={_mask_acct(account)} code={code} qty={qty})"))
             return
+        if price < 0:
+            self._write_response(
+                request_id, status="ERROR",
+                error=f"SENDORDER_REAL: price must be >= 0 (got {price})",
+            )
+            return
+        if order_type in {3, 4, 5, 6} and not origin_order_no:
+            self._write_response(
+                request_id, status="ERROR",
+                error="SENDORDER_REAL: 취소/정정은 origin_order_no 필수",
+            )
+            return
+        if (order_type in {3, 4, 5, 6}
+                and (len(origin_order_no) > 20
+                     or not origin_order_no.isascii()
+                     or not origin_order_no.isdigit())):
+            self._write_response(
+                request_id, status="ERROR",
+                error="SENDORDER_REAL: origin_order_no must be 1~20 ASCII digits",
+            )
+            return
+        if not (len(code) == 6 and code.isascii() and code.isdigit()):
+            self._write_response(
+                request_id, status="ERROR",
+                error=f"SENDORDER_REAL: invalid stock code {code!r}",
+            )
+            return
+        if not (len(screen_no) == 4 and screen_no.isascii()
+                and screen_no.isdigit()):
+            self._write_response(
+                request_id, status="ERROR",
+                error=f"SENDORDER_REAL: invalid screen_no {screen_no!r}",
+            )
+            return
+        if (not rqname or len(rqname) > 40
+                or any(ord(ch) < 32 for ch in rqname)):
+            self._write_response(
+                request_id, status="ERROR",
+                error="SENDORDER_REAL: invalid rqname",
+            )
+            return
+        if order_type in _ORDER_CAP_BUY_SIDES:
+            try:
+                manual_buy_blocked = MANUAL_BUY_BLOCK_FILE.exists()
+            except OSError as exc:
+                self._write_response(
+                    request_id, status="ERROR",
+                    error=f"manual_buy_block check unavailable: {exc}",
+                )
+                return
+            if manual_buy_blocked:
+                self._write_response(
+                    request_id, status="ERROR",
+                    error="manual_buy_block(flag): gateway 신규매수/매수정정 차단",
+                )
+                return
+        if order_type in _ORDER_CAP_BUY_SIDES:
+            gate_ok, adjusted_qty, gate_error = _gateway_buy_safety(rqname, qty)
+            if not gate_ok:
+                self._write_response(
+                    request_id, status="ERROR", error=gate_error,
+                )
+                return
+            qty = adjusted_qty
+        try:
+            raw_accounts = str(
+                self.ocx.dynamicCall("GetLoginInfo(QString)", "ACCNO")
+            ).strip()
+            logged_accounts = {
+                item.strip().replace("-", "")
+                for item in raw_accounts.split(";") if item.strip()
+            }
+        except Exception as exc:
+            self._write_response(
+                request_id, status="ERROR",
+                error=f"SENDORDER_REAL account verification unavailable: {exc}",
+            )
+            return
+        if not logged_accounts:
+            self._write_response(
+                request_id, status="ERROR",
+                error="SENDORDER_REAL account verification unavailable: no login account",
+            )
+            return
+        if account.replace("-", "") not in logged_accounts:
+            logger.critical(
+                "[SEC-ORDER-ACCOUNT] login account mismatch requested=%s",
+                _mask_acct(account),
+            )
+            self._write_response(
+                request_id, status="ERROR",
+                error="SENDORDER_REAL account mismatch",
+            )
+            return
+        if order_type in _ORDER_CAP_BUY_SIDES:
+            try:
+                current_price = abs(float(
+                    (self._micro_snapshot.get(code) or {}).get("cur") or 0
+                ))
+            except (TypeError, ValueError, AttributeError):
+                current_price = 0.0
+            if current_price <= 0:
+                try:
+                    current_price = abs(float(str(self.ocx.dynamicCall(
+                        "GetMasterLastPrice(QString)", code
+                    )).replace(",", "").strip() or 0))
+                except (TypeError, ValueError):
+                    current_price = 0.0
+            universe_ok, universe_error = _gateway_buy_universe_safety(
+                rqname, code, current_price,
+            )
+            if not universe_ok:
+                self._write_response(
+                    request_id, status="ERROR", error=universe_error,
+                )
+                return
         if hoga_gb not in ("00", "03", "05", "06", "07", "10", "13", "16", "20", "23", "26", "61", "62", "81"):
             # 키움 표준 호가구분 화이트리스트 (00=지정가, 03=시장가, ...)
             self._write_response(request_id, status="ERROR",
                 error=f"SENDORDER_REAL: hoga_gb '{hoga_gb}' 허용 외")
             return
+        if order_type in {1, 2, 5, 6}:
+            zero_price_hoga = {"03", "06", "07", "13", "16", "23", "26", "61", "81"}
+            positive_price_hoga = {"00", "05", "10", "20", "62"}
+            if hoga_gb in zero_price_hoga and price != 0:
+                self._write_response(
+                    request_id, status="ERROR",
+                    error=f"SENDORDER_REAL: hoga_gb {hoga_gb} requires price=0",
+                )
+                return
+            if hoga_gb in positive_price_hoga and price <= 0:
+                self._write_response(
+                    request_id, status="ERROR",
+                    error=f"SENDORDER_REAL: hoga_gb {hoga_gb} requires price>0",
+                )
+                return
 
         # [GHOST-WIN 2026-07-30] 주문 유예 상한 — 클라 값이 더 커도 이 값으로 자른다.
         #   상한 검사보다 앞: 낡아서 버릴 주문이 일일 매수 카운트를 소모하면 안 된다.
-        #   ts 없음/깨짐 = 나이 판정 불가 → 차단하지 않는다(fail-open·주문 경로 보수).
-        _eff_ttl = min(int(req.get("ttl_sec", 15)), _order_cap_env("BROKER_ORDER_MAX_TTL_SEC", 8))
         try:
+            _eff_ttl = min(
+                max(1, int(req.get("ttl_sec", 15))),
+                _order_cap_env("BROKER_ORDER_MAX_TTL_SEC", 8),
+            )
             _req_age = (datetime.now() - datetime.fromisoformat(str(req.get("ts", "")))).total_seconds()
-        except Exception:
-            _req_age = -1.0
+        except Exception as exc:
+            self._write_response(
+                request_id, status="ERROR",
+                error=f"ORDER_TTL_INVALID: 주문시각/유효시간 확인 불가 ({exc})",
+            )
+            return
+        if _req_age < -1.0:
+            self._write_response(
+                request_id, status="ERROR",
+                error=f"ORDER_TTL_FUTURE: 미래 주문시각 {_req_age:.2f}s",
+            )
+            return
         if _req_age > _eff_ttl:
             if _GHOST_SHADOW:          # 그림자 모드 — 로그만 남기고 통과
                 logger.warning("[GHOST-SHADOW] 실거부였으면 차단됐을 주문 age=%.2fs > %ds code=%s",
@@ -2120,20 +3398,35 @@ class BrokerGateway:
 
         # [SEC-ORDERCAP 2026-07-30] 주문 상한 — 매수 계열만 검사
         if order_type in _ORDER_CAP_BUY_SIDES:
-            _max_qty   = _order_cap_env("BROKER_MAX_ORDER_QTY", 5)
-            _max_krw   = _order_cap_env("BROKER_MAX_ORDER_KRW", 1000000)
+            if getattr(self, "_buy_count_persist_failed", False):
+                self._write_response(
+                    request_id, status="ERROR",
+                    error="BUY_COUNT_RECONCILE_REQUIRED: 저장 실패 상태, 신규매수 차단",
+                )
+                return
+            # Final common sizing gate: a strategy-specific environment
+            # variable can no longer silently exceed the owner's SSOT.
+            _max_qty   = capital_config.get_order_quantity()
+            _max_krw   = capital_config.get_limit("order_max")
             _max_daily = _order_cap_env("BROKER_MAX_DAILY_BUY", 100)
             _today = datetime.now().strftime("%Y%m%d")
             if self._buy_count_date != _today:
-                self._buy_count_date = _today
-                self._buy_count = 0
+                # ★[SEC-DAILYCAP-PERSIST 2026-08-05] 여기 한 곳이 두 경우를 다 덮는다.
+                #   · 프로세스가 방금 떴다(_buy_count_date="")  -> 디스크에서 복원
+                #   · 날짜가 바뀌었다                          -> 파일 날짜가 달라 0
+                #   그 전에는 무조건 0 이라 재기동이 곧 상한 초기화였다.
+                self._buy_count_date, self._buy_count = self._load_buy_count(_today)
 
             _deny = None
             if _max_qty > 0 and qty > _max_qty:
                 _deny = f"수량 상한 초과 (qty={qty} > {_max_qty})"
             elif _max_krw > 0 and price > 0 and qty * price > _max_krw:
                 _deny = f"금액 상한 초과 (qty*price={qty * price} > {_max_krw})"
-            elif _max_daily > 0 and self._buy_count >= _max_daily:
+            elif (order_type == 1 and current_price > 0
+                  and not position_budget.can_open_krw(qty * current_price)):
+                _deny = "공통 운용자금 상한 초과"
+            elif (order_type == 1 and _max_daily > 0
+                  and self._buy_count >= _max_daily):
                 _deny = f"일일 매수 건수 상한 초과 ({self._buy_count} >= {_max_daily})"
 
             # ★[2026-07-31 친구님 승인 #4] 시장가·최유리(price=0)는 위 금액 검사를
@@ -2178,7 +3471,54 @@ class BrokerGateway:
                 self._write_response(request_id, status="ERROR",
                     error=f"ORDER_CAP: {_deny}")
                 return
+        # 신규매수 일일 건수부터 영속화한다. 이 단계가 실패하면 IN_FLIGHT를
+        # 남기지 않아 재기동 뒤 존재하지 않는 주문으로 막히는 일을 피한다.
+        buy_count_reserved = order_type == 1
+        if buy_count_reserved:
             self._buy_count += 1
+            if not self._save_buy_count():
+                self._buy_count = max(0, self._buy_count - 1)
+                self._write_response(
+                    request_id, status="ERROR",
+                    error="BUY_COUNT_PERSIST_FAILED: 주문 차단",
+                )
+                return
+
+        order_fingerprint = self._sendorder_fingerprint(req)
+        inflight_response = {
+            "status": "ERROR",
+            "data": {
+                "state": "IN_FLIGHT",
+                "account_masked": _mask_acct(account),
+                "code": code,
+                "qty": qty,
+                "price": price,
+                "order_type": order_type,
+                "hoga_gb": hoga_gb,
+                "origin_order_no": origin_order_no,
+                "rqname": rqname,
+                "screen_no": screen_no,
+                "request_id": request_id,
+                "created_at": datetime.now().isoformat(),
+                "order_fingerprint": order_fingerprint,
+            },
+            "error": "SENDORDER_IN_FLIGHT_RECONCILE_REQUIRED",
+        }
+        inflight_entry = (time.time(), inflight_response)
+        self._sendorder_idempotency_cache[idempotency_key] = inflight_entry
+        if not self._save_sendorder_idempotency():
+            self._sendorder_idempotency_cache.pop(idempotency_key, None)
+            error = "SENDORDER_IDEMPOTENCY_PERSIST_FAILED: 주문 차단"
+            if buy_count_reserved:
+                self._buy_count = max(0, self._buy_count - 1)
+                if not self._save_buy_count():
+                    self._buy_count_persist_failed = True
+                    error += "; BUY_COUNT_RECONCILE_REQUIRED"
+            self._write_response(
+                request_id, status="ERROR",
+                error=error,
+            )
+            return
 
         logger.info(
             "[SENDORDER-REAL] key=%s account=%s code=%s qty=%d price=%d type=%d hoga=%s rqname=%s",
@@ -2222,11 +3562,30 @@ class BrokerGateway:
             response_dict = {
                 "status": "OK" if ok else "ERROR",
                 "data":   {"ret": ret_int, "code": code, "qty": qty, "order_type": order_type,
-                           "rqname": rqname, "screen_no": screen_no, "ts": datetime.now().isoformat()},
+                           "rqname": rqname, "screen_no": screen_no,
+                           "order_fingerprint": order_fingerprint,
+                           "ts": datetime.now().isoformat()},
                 "error":  None if ok else f"SendOrder ret={ret_int}",
             }
+            if not ok and buy_count_reserved:
+                self._buy_count = max(0, self._buy_count - 1)
+                if not self._save_buy_count():
+                    self._buy_count_persist_failed = True
+                    response_dict["error"] = (
+                        f"{response_dict['error']}; BUY_COUNT_RECONCILE_REQUIRED"
+                    )
             # idempotency cache 저장 (성공/실패 모두 — 재시도 시 같은 응답 반환)
             self._sendorder_idempotency_cache[idempotency_key] = (time.time(), response_dict)
+            if not self._save_sendorder_idempotency():
+                # 디스크에는 직전 IN_FLIGHT 가 남아 있다. 메모리도 같은 상태로 되돌려
+                # 재요청 및 뒤 주문을 모두 브로커 장부 대조 전까지 차단한다.
+                self._sendorder_idempotency_cache[idempotency_key] = inflight_entry
+                self._write_response(
+                    request_id, status="ERROR",
+                    data=response_dict.get("data"),
+                    error="SENDORDER_RESULT_PERSIST_FAILED_RECONCILE_REQUIRED",
+                )
+                return
             self._write_response(request_id, **{k: response_dict[k] for k in ("status", "data", "error")})
         except Exception as e:
             logger.critical("[SENDORDER-REAL] dynamicCall 예외 key=%s code=%s: %s",
@@ -2236,7 +3595,20 @@ class BrokerGateway:
                 "data":   None,
                 "error":  f"SendOrder exception: {e}",
             }
+            if buy_count_reserved:
+                self._buy_count = max(0, self._buy_count - 1)
+                if not self._save_buy_count():
+                    self._buy_count_persist_failed = True
+                    response_dict["error"] += "; BUY_COUNT_RECONCILE_REQUIRED"
             self._sendorder_idempotency_cache[idempotency_key] = (time.time(), response_dict)
+            if not self._save_sendorder_idempotency():
+                self._sendorder_idempotency_cache[idempotency_key] = inflight_entry
+                self._write_response(
+                    request_id, status="ERROR",
+                    data=None,
+                    error="SENDORDER_RESULT_PERSIST_FAILED_RECONCILE_REQUIRED",
+                )
+                return
             self._write_response(request_id, **{k: response_dict[k] for k in ("status", "data", "error")})
 
     # ───────────────────────────────────────────────────────────
@@ -2277,6 +3649,21 @@ class BrokerGateway:
     #     → 권장: batch 안에서도 매 N개 종목 처리 후 write_heartbeat() 강제 호출 (구현 포함)
     BATCH_TR_HB_INTERVAL = 5  # 매 5개 종목 처리 후 heartbeat 강제 갱신
 
+    # ★[IPC-HARDEN 2026-08-07] BATCH_TR 상한. 무인증 명령인데 종목수·시간이 무제한이라
+    #   한 번의 요청으로 브로커를 몇 시간 붙잡을 수 있었다. 그동안 매도 주문이 전부
+    #   밀리는데 하트비트는 batch 안에서 강제 갱신되므로(위 HB_INTERVAL) 워치독이
+    #   "정상"으로 본다 = 감시 사각. 정당한 사용은 수집기의 CHUNK_SIZE=15·60초뿐
+    #   (collect_prices_1m_...:3063). 3배 여유를 두고 막는다.
+    #   종목수는 자르지 않고 거부한다 — 조용히 자르면 부분 결과가 정상으로 보인다.
+    BATCH_TR_MAX_CODES = 50
+    BATCH_TR_MAX_BATCH_SEC = 120.0
+    BATCH_TR_MAX_PER_REQ_SEC = 15.0
+    # A single poll pass processes every request file synchronously.  Bound the
+    # aggregate BATCH_TR work as well as each individual request so order IPC
+    # cannot sit behind a backlog for minutes or hours.
+    BATCH_TR_MAX_PER_POLL = 2
+    BATCH_TR_MAX_POLL_SEC = 120.0
+
     def _handle_batch_tr_request(self, request_id, req):
         """[Phase 1.1 2026-05-14] BATCH_TR — 다종목 일괄 TR 위임."""
         if self.state != BrokerState.CONNECTED:
@@ -2302,6 +3689,59 @@ class BrokerGateway:
             self._write_response(request_id, status="ERROR",
                 error="BATCH_TR: codes must be list")
             return
+        # ★[IPC-HARDEN 2026-08-07] 상한 검사. 위 주석 참조.
+        if len(codes) > self.BATCH_TR_MAX_CODES:
+            logger.error("[SEC-BATCHTR-CAP] rejected request_id=%s codes=%d > %d caller=%s",
+                         request_id, len(codes), self.BATCH_TR_MAX_CODES,
+                         str(req.get("caller") or "")[:40])
+            self._write_response(request_id, status="ERROR",
+                error=(f"BATCH_TR: codes {len(codes)} exceeds cap "
+                       f"{self.BATCH_TR_MAX_CODES}"))
+            return
+        # ⚠️[NaN 2026-08-07 보안검사 지적] 부등호를 뒤집어 쓴다.
+        #   `if x > MAX` 로 쓰면 x 가 NaN 일 때 비교가 거짓이라 상한을 그냥 지나간다.
+        #   json.loads 는 JSON 리터럴 NaN 도, 문자열 "nan" 도 float('nan') 으로 받는다.
+        #   그 뒤 루프 중단 조건(경과 > batch_to)도 NaN 비교라 영원히 거짓 = 배치가
+        #   안 멈춘다. 실측: "Infinity"·999999 는 정상 절단되는데 NaN 만 뚫렸다.
+        #   `not (x <= MAX)` 는 NaN 에서 참이 되므로 이상값이 전부 상한으로 눌린다.
+        if not (batch_to <= self.BATCH_TR_MAX_BATCH_SEC):
+            logger.warning("[SEC-BATCHTR-CAP] batch_timeout %r -> %.1f (request_id=%s)",
+                           batch_to, self.BATCH_TR_MAX_BATCH_SEC, request_id)
+            batch_to = self.BATCH_TR_MAX_BATCH_SEC
+        if not (per_request_to <= self.BATCH_TR_MAX_PER_REQ_SEC):
+            logger.warning("[SEC-BATCHTR-CAP] per_request_timeout %r -> %.1f (request_id=%s)",
+                           per_request_to, self.BATCH_TR_MAX_PER_REQ_SEC, request_id)
+            per_request_to = self.BATCH_TR_MAX_PER_REQ_SEC
+
+        # ★[SEC-BATCHTR-POLLCAP 2026-08-10] poll_requests takes one snapshot and
+        # processes it serially.  Per-request limits alone therefore allow an
+        # accumulated backlog to delay SENDORDER_REAL.  Reject excess work with
+        # an explicit response; never return a silently truncated normal result.
+        poll_count = getattr(self, "_batch_tr_poll_count", 0)
+        poll_elapsed = getattr(self, "_batch_tr_poll_sec", 0.0)
+        poll_remaining = self.BATCH_TR_MAX_POLL_SEC - poll_elapsed
+        if (not (poll_count < self.BATCH_TR_MAX_PER_POLL)
+                or not (poll_remaining > 0.0)):
+            logger.error(
+                "[SEC-BATCHTR-POLLCAP] rejected request_id=%s "
+                "poll_count=%d poll_sec=%.3f caller=%s",
+                request_id, poll_count, poll_elapsed,
+                str(req.get("caller") or "")[:40],
+            )
+            self._write_response(
+                request_id,
+                status="ERROR",
+                error=(f"BATCH_TR: poll budget exhausted "
+                       f"(count={poll_count}/{self.BATCH_TR_MAX_PER_POLL}, "
+                       f"sec={poll_elapsed:.3f}/{self.BATCH_TR_MAX_POLL_SEC:.1f})"),
+            )
+            return
+        self._batch_tr_poll_count = poll_count + 1
+        # The second request may use only the time left by the first one.
+        if not (batch_to <= poll_remaining):
+            batch_to = poll_remaining
+        if not (per_request_to <= poll_remaining):
+            per_request_to = poll_remaining
 
         results: list = []
         summary = {"total": len(codes), "ok": 0, "timeout": 0, "error": 0,
@@ -2309,6 +3749,46 @@ class BrokerGateway:
         batch_start = time.time()
 
         for i, code in enumerate(codes):
+            # ★[ORDER-PREEMPT 2026-08-10] poll 시작 뒤 도착한 주문은 최초 정렬에
+            # 없으므로 배치 종목 사이에서 다시 본다. 발견하면 주문을 즉시 처리하고
+            # 남은 수집 배치는 명시적으로 중단한다.
+            urgent_orders = _pending_real_order_paths()
+            if urgent_orders:
+                summary["aborted"] = True
+                logger.warning(
+                    "[BATCH_TR] pending real order preempts batch — %d/%d processed, urgent=%d",
+                    i, len(codes), len(urgent_orders),
+                )
+                for urgent_path in urgent_orders:
+                    if urgent_path.exists():
+                        self.process_request(urgent_path)
+                for j in range(i, len(codes)):
+                    results.append({
+                        "code": str(codes[j]),
+                        "status": "ERROR",
+                        "data": None,
+                        "error": "batch preempted by pending real order",
+                    })
+                    summary["error"] += 1
+                break
+
+            # Safety-critical broker truth (holdings/open orders/account state)
+            # must be answered between batch symbols.  The outer poll already
+            # prioritizes these requests, but a BATCH_TR handler can own the Qt
+            # loop for many seconds after the poll has begun.  Processing them
+            # here prevents a fresh pre-buy check from timing out behind an
+            # already-running market-data batch.
+            safety_queries = _pending_safety_query_paths()
+            if safety_queries:
+                logger.info(
+                    "[BATCH_TR] safety query preempts batch slice — "
+                    "%d/%d processed, safety=%d",
+                    i, len(codes), len(safety_queries),
+                )
+                for safety_path in safety_queries:
+                    if safety_path.exists():
+                        self.process_request(safety_path)
+
             # batch 전체 timeout 검사
             if time.time() - batch_start > batch_to:
                 summary["aborted"] = True
@@ -2330,6 +3810,7 @@ class BrokerGateway:
 
             # screen_no rotate
             scr = str(screen_no_rotate[i % len(screen_no_rotate)])
+            wire_rqname = self._next_tr_rqname("B")
 
             # input dict 에 {CODE} 치환
             inputs = {}
@@ -2340,6 +3821,7 @@ class BrokerGateway:
                     inputs[k] = v
 
             # 단일 TR 호출 (기존 _handle_tr_request 로직 인라인 — response 작성 대신 results 에 추가)
+            active = None
             try:
                 self.tr_output_fields = list(output_fields)
                 # SetInputValue
@@ -2359,7 +3841,7 @@ class BrokerGateway:
 
                 # [BATCH-FIX-2 2026-05-15] stale tr_data_buffer 청소 —
                 # 이전 code timeout 후 delayed OnReceiveTrData 응답이 이번 code 결과로 섞이는 corruption 차단
-                self.tr_data_buffer.pop(rqname_template, None)
+                self.tr_data_buffer.pop(wire_rqname, None)
 
                 # tr_loop + timer
                 self.tr_loop = QEventLoop()
@@ -2368,10 +3850,20 @@ class BrokerGateway:
                 _timer.timeout.connect(self.tr_loop.quit)
                 _timer.start(int(per_request_to * 1000))
 
+                active = {
+                    "rqname": wire_rqname,
+                    "tr_code": tr_code,
+                    "screen_no": scr,
+                    "output_fields": list(output_fields),
+                    "request_id": str(request_id),
+                    "logical_rqname": rqname_template,
+                    "code": str(code),
+                }
+                self._active_tr = active
                 _tr_limiter.acquire()  # [TR-THROTTLE 2026-06-24] 키움 2/sec 공유예산 준수
                 ret = self.ocx.dynamicCall(
                     "CommRqData(QString, QString, int, QString)",
-                    rqname_template, tr_code, next_flag, scr,
+                    wire_rqname, tr_code, next_flag, scr,
                 )
                 if ret != 0:
                     _timer.stop()
@@ -2382,8 +3874,10 @@ class BrokerGateway:
 
                 self.tr_loop.exec_()
                 _timer.stop()
+                if getattr(self, "_active_tr", None) is active:
+                    self._active_tr = None
 
-                data = self.tr_data_buffer.pop(rqname_template, None)
+                data = self.tr_data_buffer.pop(wire_rqname, None)
                 if data:
                     results.append({"code": str(code), "status": "OK",
                                     "data": data, "error": None})
@@ -2400,8 +3894,15 @@ class BrokerGateway:
                 results.append({"code": str(code), "status": "ERROR",
                                 "data": None, "error": f"exception: {e}"})
                 summary["error"] += 1
+            finally:
+                if active is not None and getattr(self, "_active_tr", None) is active:
+                    self._active_tr = None
 
         summary["elapsed_sec"] = round(time.time() - batch_start, 3)
+        self._batch_tr_poll_sec = (
+            getattr(self, "_batch_tr_poll_sec", 0.0)
+            + summary["elapsed_sec"]
+        )
         logger.info(
             "[BATCH_TR] tr_code=%s total=%d ok=%d timeout=%d error=%d elapsed=%.2fs aborted=%s",
             tr_code, summary["total"], summary["ok"], summary["timeout"],
@@ -2443,7 +3944,13 @@ class BrokerGateway:
             self.ocx.dynamicCall("SetRealRemove(QString, QString)", "ALL", "ALL")
             # [Z2] state 전체 초기화
             self._realreg_state = {}
-            self._save_realreg_state()
+            if not self._save_realreg_state():
+                self._write_response(
+                    request_id, status="ERROR",
+                    error="SetRealRemoveAll succeeded but state persistence failed",
+                    data={"removed": "ALL"},
+                )
+                return
             logger.info("[B3-REAL-REMOVE-ALL] 전체 실시간 등록 해제 완료")
             self._write_response(request_id, status="OK",
                 data={"removed": "ALL"})
@@ -2457,7 +3964,10 @@ class BrokerGateway:
     KOA_FUNCTIONS_WHITELIST = {
         "GetServerGubun",          # 서버 구분 ("1"=모의, ""=실)
         "GetCodeListByMarket",     # 시장별 종목 (MASTER_INFO 와 중복 가능)
-        "ShowAccountWindow",       # 계좌비밀번호 저장 창 호출 (사용자 K1 우회 시도)
+        # ★[IPC-HARDEN 2026-08-07] ShowAccountWindow 삭제.
+        #   read-only 가 아니라 계좌비밀번호 저장 창을 브로커 화면에 띄우는 명령이라
+        #   무인증 IPC 로 계좌 설정 UI 를 열 수 있었다. 코드베이스 호출자 0건
+        #   (문서 2곳에만 언급). 다시 필요하면 그때 서명 대상으로 넣을 것.
         "GetMasterStockState",     # 종목 상태 (정상/거래정지 등)
         "GetUpjongCode",           # 업종 코드
         "GetAPIModulePath",        # OpenAPI 설치 경로
@@ -2532,7 +4042,71 @@ class BrokerGateway:
                 error=f"DisconnectRealData exception: {e}",
             )
 
-    def _handle_shutdown_request(self, request_id):
+    def _log_shutdown_origin(self, request_id, req=None, req_path=None):
+        """[SHUTDOWN-ORIGIN 2026-08-04] 정지명령 발신자 흔적 기록.
+
+        8/3 10:40:58 정지명령으로 27초 시세 공백이 났는데 저널에 request_id 밖에 없어
+        누가 보냈는지 끝내 못 찾았다(7/17 에 이어 두 번째). 종료 직전 1회만 찍는다.
+        IPC 가 파일 기반이라 발신자를 OS 로 역추적할 수 없다 — 요청 내용과
+        "그때 살아있던 프로세스" 목록이 다음 조사의 유일한 단서가 된다.
+        어떤 단계가 실패해도 종료 자체는 막지 않는다.
+        """
+        try:
+            payload = json.dumps(req, ensure_ascii=False) if req is not None else "(없음)"
+            logger.info("[SHUTDOWN-ORIGIN] payload=%s", payload[:1000])
+        except Exception as e:
+            logger.info("[SHUTDOWN-ORIGIN] payload 기록 실패: %s", e)
+
+        try:
+            if req_path is not None:
+                mtime = datetime.fromtimestamp(
+                    req_path.stat().st_mtime
+                ).isoformat(timespec="seconds")
+                logger.info(
+                    "[SHUTDOWN-ORIGIN] file=%s mtime=%s", req_path, mtime,
+                )
+        except Exception:
+            pass
+
+        # ★[SHUTDOWN-ORIGIN-FIX 2026-08-05 친구님 승인 ⓐ] wmic 이 실전에서 빈손이었다.
+        #   8/5 19:00:02 진짜 종료(uuid·실제 파일경로)에서 payload·mtime 은 남았는데
+        #   "프로세스 0건"만 찍혔다. 브로커 자신이 python 인데 0건 = 출력이 비어서 왔다.
+        #   예외가 아니라 빈 출력이라 실패로 보이지도 않았다 — 8/4 에 만든 이 추적기가
+        #   그동안 아무것도 안 남기고 있었다는 뜻이다(감시 사각).
+        #   ① 명령줄이 남는 wmic 은 그대로 시도하고 ② 빈손이면 OS 에 직접 묻는
+        #   경로로 반드시 한 번 더 남긴다. 0건은 이제 결론이 아니라 경고다.
+        keys = ("python", "powershell", "cmd.exe", "wscript", "cscript")
+        keep = []
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["wmic", "process", "get",
+                 "ProcessId,ParentProcessId,Name,CommandLine", "/format:csv"],
+                # ★[SHUTDOWN-ORIGIN-ORDER 2026-08-04] 5 -> 3초. 종료가 그만큼
+                #   늦어지고, wmic 은 Windows 가 걷어내는 중이라 언젠가 그냥
+                #   실패한다(그때도 아래 except 로 삼키고 종료는 진행한다).
+                capture_output=True, text=True, timeout=3,
+                encoding="cp949", errors="replace",
+                creationflags=0x08000000,   # CREATE_NO_WINDOW - 콘솔 창 튀는 것 방지
+            ).stdout or ""
+            keep = [ln.strip() for ln in out.splitlines()
+                    if ln.strip() and any(k in ln.lower() for k in keys)]
+            logger.info("[SHUTDOWN-ORIGIN] wmic %d건", len(keep))
+        except Exception as e:
+            logger.info("[SHUTDOWN-ORIGIN] wmic 실패: %s", e)
+
+        if not keep:
+            rows = _process_snapshot_win32()
+            keep = [r for r in rows if any(k in r.lower() for k in keys)]
+            logger.warning(
+                "[SHUTDOWN-ORIGIN] wmic 이 빈손 — OS 스냅샷으로 대체 (전체 %d개 중 %d개)",
+                len(rows), len(keep),
+            )
+        logger.info("[SHUTDOWN-ORIGIN] 그때 살아있던 프로세스 %d건", len(keep))
+        for line in keep[:40]:
+            logger.info("[SHUTDOWN-ORIGIN]   %s", line[:400])
+
+    def _handle_shutdown_request(self, request_id, req=None, req_path=None):
         """IPC SHUTDOWN command — graceful shutdown via IPC (Windows 호환)."""
         logger.info("IPC shutdown command received (request_id=%s)", request_id)
         # 1. 응답 먼저 작성 (client 가 확인 가능하도록)
@@ -2540,6 +4114,16 @@ class BrokerGateway:
             request_id, status="OK",
             data={"shutdown": True, "state": self.state.value},
         )
+        # ★[SHUTDOWN-ORIGIN-ORDER 2026-08-04] 발신자 추적을 응답 뒤로 옮겼다.
+        #   원래 이 줄이 _write_response 앞에 있어서, wmic 이 걸리는 시간만큼
+        #   client 를 붙잡았다(바로 위 주석 "응답 먼저 작성"과도 어긋났다).
+        #   프로세스 목록은 몇 ms 뒤에 찍어도 내용이 같으므로 추적 가치는 그대로다.
+        #   진단이 종료를 막으면 안 되므로 여기서 한 번 더 감싼다(내부에도 try 가 있지만
+        #   그건 _log_shutdown_origin 안에서만 보장된다).
+        try:
+            self._log_shutdown_origin(request_id, req, req_path)
+        except Exception as e:
+            logger.info("[SHUTDOWN-ORIGIN] 발신자 추적 건너뜀: %s", e)
         # 2. 상태 SHUTDOWN 기록
         self.set_state(BrokerState.SHUTDOWN)
         self.write_heartbeat()
@@ -2549,7 +4133,9 @@ class BrokerGateway:
         if self.app is not None:
             QTimer.singleShot(100, self.app.quit)
 
-    def _handle_tr_request(self, request_id, req):
+    def _handle_tr_request(
+        self, request_id, req, *, stable_wire_rqname: bool = False,
+    ):
         """TR 1건 처리 skeleton.
 
         payload:
@@ -2572,7 +4158,10 @@ class BrokerGateway:
             return
 
         tr_code   = req.get("tr_code", "")
-        rqname    = req.get("rqname") or f"REQ_{request_id}"
+        logical_rqname = req.get("rqname") or f"REQ_{request_id}"
+        rqname    = self._wire_tr_rqname(
+            logical_rqname, stable=stable_wire_rqname,
+        )
         screen_no = str(req.get("screen_no", "0001"))
         inputs    = req.get("input", {}) or {}
         output_fields = req.get("output_fields", []) or []
@@ -2628,6 +4217,16 @@ class BrokerGateway:
             # [N2 2026-05-14] prev_next 연속 조회 지원. payload 의 next_flag (0=첫, 2=연속) 사용.
             # 미지정 시 default 0 = 기존 client 하위 호환.
             next_flag = int(req.get("next_flag", 0))
+            active = {
+                "rqname": rqname,
+                "tr_code": str(tr_code),
+                "screen_no": screen_no,
+                "output_fields": list(output_fields),
+                "request_id": str(request_id),
+                "logical_rqname": str(logical_rqname),
+            }
+            self.tr_data_buffer.pop(rqname, None)
+            self._active_tr = active
             _tr_limiter.acquire()  # [TR-THROTTLE 2026-06-24] 키움 2/sec 공유예산 준수
             ret = self.ocx.dynamicCall(
                 "CommRqData(QString, QString, int, QString)",
@@ -2641,6 +4240,8 @@ class BrokerGateway:
                 return
 
             self.tr_loop.exec_()
+            if getattr(self, "_active_tr", None) is active:
+                self._active_tr = None
 
             data = self.tr_data_buffer.pop(rqname, None)
             if data:
@@ -2671,6 +4272,9 @@ class BrokerGateway:
                 request_id, status="ERROR", error=str(e)
             )
         finally:
+            active_now = getattr(self, "_active_tr", None)
+            if active_now and active_now.get("rqname") == rqname:
+                self._active_tr = None
             # [Phase 1.2 2026-05-14] mapping 정리 — 본 request 의 pending 만 제거
             if rqname in self.tr_pending_rqname and \
                self.tr_pending_rqname[rqname].get("request_id") == request_id:
@@ -2725,23 +4329,53 @@ class BrokerGateway:
     # ───────────────────────────────────────────────────────────
     # IPC polling
     # ───────────────────────────────────────────────────────────
+    def poll_urgent_orders(self):
+        """Process real orders even while a TR waits in a nested QEventLoop.
+
+        ``poll_requests`` cannot re-enter because a second TR would overwrite
+        the active TR context. SendOrder does not use that context, so this
+        order-only poll prevents sells from expiring behind a congested queue.
+        """
+        if self._urgent_order_poll_in_progress:
+            return
+        if self.state not in {BrokerState.CONNECTED, BrokerState.RATE_LIMIT}:
+            return
+        self._urgent_order_poll_in_progress = True
+        try:
+            for path in _pending_real_order_paths():
+                if path.exists():
+                    self.process_request(path)
+        except Exception as exc:
+            logger.error("urgent order poll 오류: %s", exc)
+        finally:
+            self._urgent_order_poll_in_progress = False
+
     def poll_requests(self):
         if self._poll_in_progress:
             return
         self._poll_in_progress = True
         try:
-            files = sorted(IPC_REQ.glob("*.json"))
+            self._batch_tr_poll_count = 0
+            self._batch_tr_poll_sec = 0.0
+            # ★[ORDER-FIRST 2026-08-10] 파일명 순서는 요청 중요도와 무관하다.
+            # 같은 poll에 BATCH_TR와 실주문·취소가 함께 있으면 주문부터 처리한다.
+            files = sorted(IPC_REQ.glob("*.json"), key=_ipc_request_sort_key)
             if not files:
                 return
 
             logger.info("REQ POLL: %d request(s)", len(files))
             for f in files:
+                # The order-only timer may have processed and removed a path
+                # from this earlier snapshot while a nested TR loop was active.
+                if not f.exists():
+                    continue
                 if self.state == BrokerState.SHUTDOWN:
                     break
                 if self.state == BrokerState.RATE_LIMIT:
-                    logger.warning("RATE_LIMIT — skipping %s", f.name)
-                    continue
-                if self.state != BrokerState.CONNECTED:
+                    if _ipc_request_sort_key(f)[0] != 0:
+                        logger.warning("RATE_LIMIT — skipping %s", f.name)
+                        continue
+                elif self.state != BrokerState.CONNECTED:
                     # [N6 2026-05-14] startup race / 비CONNECTED 상태에서 request 도착 시
                     # 기존: continue → request 파일 잔존 → client timeout 12s 대기 → fallback 진입 지연.
                     # 변경: 즉시 NOT_READY ERROR 응답 작성 → client 즉시 fallback (대기 0초).
@@ -2805,8 +4439,15 @@ class BrokerGateway:
             return
 
         # [Z2 2026-05-14] LOGIN 성공 후 이전 SetRealReg 상태 자동 재등록
-        self._load_realreg_state()
-        self._replay_realreg()
+        load_ok = self._load_realreg_state()
+        replay_ok = load_ok and self._replay_realreg()
+        if not replay_ok:
+            logger.critical(
+                "[Z2-REPLAY] 실시간 구독 복구 실패 — CONNECTED 운영을 시작하지 않음")
+            self.set_state(BrokerState.DISCONNECTED,
+                           reason="real-time subscription recovery failed")
+            self.write_heartbeat()
+            return
 
         # [J5 2026-05-14] SetRealReg 처리 완료 대기 (OCX 내부 race 보호).
         # 다수 화면 등록 시 키움 OCX 가 등록 처리 중인 상태에서 sub-process IPC 진입 가능 → 1s 안전 마진.
@@ -2824,6 +4465,12 @@ class BrokerGateway:
         self._poll_timer = QTimer()
         self._poll_timer.timeout.connect(self.poll_requests)
         self._poll_timer.start(self.POLL_INTERVAL_MS)
+
+        # This timer may fire inside a nested TR QEventLoop and handles only
+        # authenticated SENDORDER_REAL requests.
+        self._urgent_order_timer = QTimer()
+        self._urgent_order_timer.timeout.connect(self.poll_urgent_orders)
+        self._urgent_order_timer.start(self.URGENT_ORDER_POLL_INTERVAL_MS)
 
         # [REAL-MICRO 2026-06-24] 마이크로구조(체결강도/호가총잔량) 구독·flush 타이머 — env REAL_MICRO=ON 시만
         if REAL_MICRO_ON:

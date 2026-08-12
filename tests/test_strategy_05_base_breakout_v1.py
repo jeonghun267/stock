@@ -445,10 +445,22 @@ class Strategy05Tests(unittest.TestCase):
             row.get("side") == "BUY" for row in broker.submissions))
         self.assertFalse(broker.real_session)
 
+        # ★[RISING-HOLD 단일화 2026-08-05] 잠금 시험 — 지우기 전에 읽을 것.
+        #   종전에는 여기서 phase=="HOLD" 와 history==[] 를 기대했다. rising_support
+        #   는 '일봉' 21일치 상승 종가만 넣는 스위치이고, S05 만 남아 있던
+        #   _daily_ma_permit_legacy(일봉 5/10/20선)가 그걸 읽어 상승보유를 켰다.
+        #   일봉 5일선은 장중에 안 움직이는 고정값이라, 일봉 정배열 종목을 잡으면
+        #   매도세가 압도해도(아래 대본 끝: 매수 3,750만 vs 매도 5,400만) 하루 종일
+        #   안 팔았다 — 8/3 에스피지 사고가 그것이다.
+        #   지금은 상승보유 판정이 3분봉(ma3_common_v1) 하나로 통일됐고, 이 대본은
+        #   3분봉 완성봉이 1개뿐이라 상승보유가 애초에 안 켜진다 → 정상 매도된다.
+        #   일봉 경로가 되살아나면 아래가 터진다.
         engine, broker = run_case(rising_support=True)
         self.assertEqual(
-            engine._active_positions()["123456"]["phase"], "HOLD")
-        self.assertEqual(engine.state["history"], [])
+            engine._active_positions(), {},
+            "일봉 상승만으로 매도가 다시 막혔다 — legacy 일봉 경로가 되살아났다",
+        )
+        self.assertTrue(engine.state["history"])
         self.assertFalse(broker.real_session)
     def test_contract_and_common_rotation_identity(self) -> None:
         now = datetime(2026, 7, 27, 13, 20)
@@ -471,6 +483,7 @@ class Strategy05Tests(unittest.TestCase):
         selected = select_fresh_signals(payload, now=now, max_age_sec=5)
         self.assertEqual(selected[0]["strategy_id"], "S05_BASE_BREAKOUT")
         config = build_config()
+        # ★[2026-08-06 친구님 지시 "QTY 2주 원래대로 1주로 돌려줘"] 2 -> 1.
         self.assertEqual(config.quantity, 1)
         self.assertEqual(config.max_daily_codes, 6)
         self.assertEqual(config.max_cycles_per_code, 2)

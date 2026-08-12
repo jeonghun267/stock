@@ -31,12 +31,24 @@ if str(RUN_DIR) not in sys.path:
 
 from strategy_03_signal_contract_v1 import (
     ALGORITHM,
+    EARLY_LOW_ALGORITHM,
+    EARLY_LOW_CAPTURE_END,
+    EARLY_LOW_CAPTURE_START,
+    EARLY_LOW_LANE,
+    EarlyLowAuditChain,
+    production_file_sha256,
+    EARLY_LOW_MAX_REBOUND_PCT,
+    EARLY_LOW_MIN_REBOUND_PCT,
     FIRST_REBOUND_PCT,
     INTRADAY_CRASH_LANE,
     MIN_HIGHER_LOW_PCT,
     MIN_OBSERVE_SEC,
     MIN_PULLBACK_PCT,
     MIN_SECOND_REBOUND_PCT,
+    EXPRESS_DEPTH_PCT,
+    EXPRESS_FAST_DROP_PCT,
+    EXPRESS_FAST_WINDOW_SEC,
+    EXPRESS_NEAR_LOW_PCT,
     OPEN_ARM_DROP_PCT,
     OPEN_HANDOFF_DROP_PCT,
     OPEN_MAX_REBOUND_PCT,
@@ -45,6 +57,7 @@ from strategy_03_signal_contract_v1 import (
     SIGNAL_MODE,
     SIGNAL_SCHEMA,
 )
+from strategy_03_intraday_rebound_v1 import IntradayReboundDetector
 
 KST = ZoneInfo("Asia/Seoul")
 # ★[2026-07-31 친구님 지시 "3번 급락이 9시 2분부터 하자 · 매수 매도는 똑같이"]
@@ -135,6 +148,7 @@ class MicroPoint:
     #   밀려, 방금 걷어낸 관찰 60초를 다시 넣는 꼴이 된다.
     #   0 이면(자료 없음) 종전처럼 틱 가격으로 판정한다 — 되돌림 안전.
     minute_low: float = 0.0
+    broker_day_low: float = 0.0
     che_str: float = 0.0
     buy_volume_cum: float = 0.0
     sell_volume_cum: float = 0.0
@@ -154,6 +168,94 @@ class MicroPoint:
     @property
     def spread(self) -> float:
         return self.best_ask_px - self.best_bid_px if self.book_valid else 0.0
+
+
+@dataclass
+class EarlyLowState:
+    anchor_low: float = 0.0
+    anchor_low_ts: datetime | None = None
+    chase_blocked: bool = False
+    emitted: bool = False
+
+
+class EarlyLowDetector:
+    """전략 3 장초 레인: 최초 1분 당일저가 뒤 1~2% 반등만 본다."""
+
+    def __init__(self) -> None:
+        self.state = EarlyLowState()
+
+    def restore(self, anchor_low: float, anchor_low_ts: datetime | None,
+                *, chase_blocked: bool = False, emitted: bool = False) -> None:
+        if anchor_low > 0 and anchor_low_ts is not None:
+            self.state.anchor_low = float(anchor_low)
+            self.state.anchor_low_ts = anchor_low_ts
+        self.state.chase_blocked = bool(chase_blocked)
+        self.state.emitted = bool(emitted)
+
+    def _row(self, point: MicroPoint, action: str, reason: str) -> dict[str, Any]:
+        state = self.state
+        rebound = (
+            (point.price / state.anchor_low - 1.0) * 100.0
+            if state.anchor_low > 0 else 0.0
+        )
+        return {
+            "mode": SIGNAL_MODE,
+            "algorithm": EARLY_LOW_ALGORITHM,
+            "entry_lane": EARLY_LOW_LANE,
+            "action": action,
+            "reason": reason,
+            "ts": point.ts.isoformat(timespec="milliseconds"),
+            "price": point.price,
+            "open_price": point.open_price,
+            "anchor_low": state.anchor_low,
+            "anchor_low_ts": (
+                state.anchor_low_ts.isoformat(timespec="milliseconds")
+                if state.anchor_low_ts else ""
+            ),
+            "rebound_pct": round(rebound, 6),
+            "chase_blocked": state.chase_blocked,
+            "current_buy_money_cum": point.buy_money_cum,
+            "current_sell_money_cum": point.sell_money_cum,
+        }
+
+    def feed(self, point: MicroPoint, *, allow_signal: bool) -> dict[str, Any]:
+        state = self.state
+        point_time = point.ts.time()
+        if point_time < EARLY_LOW_CAPTURE_START:
+            return self._row(point, "WAIT", "EARLY_LOW_BEFORE_OPEN")
+
+        if point_time <= EARLY_LOW_CAPTURE_END:
+            if point.broker_day_low > 0 and (
+                state.anchor_low <= 0 or point.broker_day_low < state.anchor_low
+            ):
+                state.anchor_low = point.broker_day_low
+                state.anchor_low_ts = point.ts
+                state.chase_blocked = False
+            return self._row(
+                point,
+                "ARMED" if state.anchor_low > 0 else "WAIT",
+                "EARLY_LOW_60S_CAPTURING" if state.anchor_low > 0
+                else "EARLY_LOW_DAY_LOW_MISSING",
+            )
+
+        if state.emitted:
+            return self._row(point, "DONE", "EARLY_LOW_ALREADY_EMITTED")
+        if state.anchor_low <= 0 or state.anchor_low_ts is None:
+            return self._row(point, "WAIT", "EARLY_LOW_60S_ANCHOR_MISSING")
+        if state.chase_blocked:
+            return self._row(point, "DONE", "EARLY_LOW_REBOUND_CHASE_BLOCKED")
+
+        rebound = (point.price / state.anchor_low - 1.0) * 100.0
+        if rebound > EARLY_LOW_MAX_REBOUND_PCT:
+            state.chase_blocked = True
+            return self._row(point, "DONE", "EARLY_LOW_REBOUND_CHASE_LIMIT")
+        if not allow_signal:
+            return self._row(point, "WAIT", "ENTRY_TIME_CLOSED")
+        if rebound < EARLY_LOW_MIN_REBOUND_PCT:
+            return self._row(point, "WAIT", "EARLY_LOW_REBOUND_LT_1PCT")
+
+        state.emitted = True
+        return self._row(point, "BUY_READY", "S03_EARLY_60S_LOW_REBOUND")
 
 
 @dataclass
@@ -214,6 +316,9 @@ class DetectorState:
     speed_flip_seen: bool = False
     flow_points: list[MicroPoint] = field(default_factory=list)
     minute: FormingMinute = field(default_factory=FormingMinute)
+    # ★[S03-EXPRESS 2026-08-06] 당일 고점(시가 포함) — 급행 깊이(-7%)의 기준점.
+    #   자료공백 리셋에도 살아남는다(그날 찍힌 고점이 없던 일이 되지 않는다).
+    day_high: float = 0.0
 
 
 def microprice(point: MicroPoint) -> float | None:
@@ -280,7 +385,9 @@ class RapidReboundDetector:
         if points and (point.buy_money_cum < points[-1].buy_money_cum or point.sell_money_cum < points[-1].sell_money_cum):
             points.clear()
         points.append(point)
-        cutoff = point.ts.timestamp() - 360.0
+        # ★[S03-EXPRESS 2026-08-06] 보관 360→600초 — 급행의 '직전 10분 급락 속도' 검사용.
+        #   기존 소비자(_pre_rates 180초·_flow_acceleration 20초)는 자기 창만 봐서 동작 불변.
+        cutoff = point.ts.timestamp() - EXPRESS_FAST_WINDOW_SEC
         self.state.flow_points = [row for row in points if row.ts.timestamp() >= cutoff]
 
     def _pre_rates(self, point: MicroPoint) -> tuple[float, float]:
@@ -437,7 +544,8 @@ class RapidReboundDetector:
         old = self.state
         self.state = DetectorState(
             handoff_to_s06=old.handoff_to_s06, emitted=old.emitted,
-            emission_count=old.emission_count, minute=old.minute)
+            emission_count=old.emission_count, minute=old.minute,
+            day_high=old.day_high)
 
     def feed(self, point: MicroPoint, profile: PriorProfile, *, allow_signal: bool) -> dict[str, Any]:
         state = self.state
@@ -459,14 +567,18 @@ class RapidReboundDetector:
             state.last = point
             return self._row("WAIT", "OPEN_PRICE_MISSING", point, profile)
         self._record_flow(point)
+        # ★[S03-EXPRESS 2026-08-06] 당일 고점 갱신(시가 포함) — 급행 깊이의 기준점.
+        if point.price > state.day_high:
+            state.day_high = point.price
+        if point.open_price > state.day_high:
+            state.day_high = point.open_price
         arm_price = point.open_price * (1.0 + self.config.arm_drop_pct / 100.0)
-        handoff_price = point.open_price * (1.0 + self.config.handoff_drop_pct / 100.0)
-        if state.handoff_to_s06:
-            state.last = point
-            return self._row("DONE", "OPEN_DROP_LE_8PCT_HANDOFF_S06", point, profile)
-        if point.price <= handoff_price:
-            state.armed, state.phase, state.handoff_to_s06, state.last = False, "DONE", True, point
-            return self._row("DONE", "OPEN_DROP_LE_8PCT_HANDOFF_S06", point, profile)
+        # ★[S03-EXPRESS 2026-08-06 친구님 지시 "09:20까지만 급락을 잡고 이후는 6번"]
+        #   -8% S06 인계 폐지 — 창(09:02~09:20) 안에서는 깊이 제한 없이 3번이 잡는다.
+        #   근거: 8/6 씨어스(458870) 인계 구멍 — S06 감시망(고저폭30)에 없는 종목을
+        #   -8% 에서 넘겼더니 아무도 안 잡았다. 09:20 마감은 그대로라 이후는 6번 몫.
+        #   state.handoff_to_s06 플래그·복원 경로는 남기되 판정에는 더 안 쓴다.
+        #   되돌리기: backup\s03_express_20260806\ 복원.
         if not allow_signal:
             state.last = point
             return self._row("WAIT", "ENTRY_TIME_CLOSED", point, profile)
@@ -483,18 +595,63 @@ class RapidReboundDetector:
             state.last = point
             return self._row("RESET", "SECOND_CHANCE_DEEPER_LOW_RESET", point, profile)
         if not state.armed:
-            if point.price > arm_price:
+            # ★[S03-EXPRESS 2026-08-06] 시가 위에서 폭락한 종목(장초 급등 후 급락)도
+            #   급행 깊이(당일 고점 -7%↓)면 무장한다 — 무장은 저점 추적의 시작일 뿐이고,
+            #   4단계 매수는 기존 시가 띠 검사(-4~-8%)가 그대로 막아서 동작 불변.
+            #   실증: 7/29 376900 시가 28,000 → 33,500 급등 → -15% 폭락 — 시가 기준으론
+            #   무장 불가라 급행이 원천 봉쇄됐다(백테는 고점 기준이라 잡았던 종목).
+            express_deep = (
+                state.day_high > 0
+                and (point.price / state.day_high - 1.0) * 100.0 <= EXPRESS_DEPTH_PCT
+            )
+            if point.price > arm_price and not express_deep:
                 state.last = point
                 return self._row("WAIT", "OPEN_DROP_GT_4PCT", point, profile)
             self._reset_low(point)
             state.last = point
-            return self._row("ARMED", "OPEN_DROP_4_TO_8PCT_STAIRCASE_START", point, profile)
+            reason = (
+                "EXPRESS_DEPTH_STAIRCASE_START" if point.price > arm_price
+                else "OPEN_DROP_4_TO_8PCT_STAIRCASE_START"
+            )
+            return self._row("ARMED", reason, point, profile)
         # ★[MIN-LOW 2026-08-03 친구님 지시] 신저점은 1분봉 저가로 판정한다.
         #   틱 하나가 순간적으로 찍고 올라와도 계단이 흔들리지 않는다.
         if self._probe_low(point) < state.low_price:
             self._reset_low(point)
             state.last = point
             return self._row("RESET", "NEW_LOW_STAIRCASE_RESET", point, profile)
+        # ★[S03-EXPRESS 2026-08-06 친구님 지시 "칼날처럼 떨어질 때 속도가 줄어드는 사이에
+        #   역매수세가 일어나는 부분 … 이걸 잘 적용하면 급반등을 잡아낼 수 있을 것 같아"]
+        #   급행 매수: 깊은 급락(당일 고점 -7%↓) + 빠른 낙하 직후(10분 -3%↓) + 저점 +1.5% 안
+        #   + 매도 감속·매수 가속·매수 우위(flow_accel, 8/3 친구님 판정식 그대로) → 즉시 매수.
+        #   눌림·2차반등을 기다리지 않는다 — 진짜 급반등은 눌림을 안 준다(8/6 씨어스 실증).
+        #   닷새 캡처 전수: -8%↓ 구간 +0.74%, -10%↓ +1.67% (얕은 -6~-8% 는 -0.90% 라 -7 결정).
+        #   flow_accel 이 빈 값이면 그냥 안 쏜다(자료 부재 시 침묵 = 안전한 쪽).
+        if state.day_high > 0 and state.low_price > 0:
+            express_depth = (point.price / state.day_high - 1.0) * 100.0
+            if (
+                express_depth <= EXPRESS_DEPTH_PCT
+                and point.price <= state.low_price * (1.0 + EXPRESS_NEAR_LOW_PCT / 100.0)
+            ):
+                fast_high = max(
+                    (row.price for row in state.flow_points
+                     if (point.ts - row.ts).total_seconds() <= EXPRESS_FAST_WINDOW_SEC),
+                    default=0.0,
+                )
+                if (
+                    fast_high > 0
+                    and (point.price / fast_high - 1.0) * 100.0 <= EXPRESS_FAST_DROP_PCT
+                    and self._flow_acceleration(point).get("flow_accel") == "O"
+                ):
+                    state.emitted, state.emission_count = True, state.emission_count + 1
+                    state.dead_low = state.low_price * (1.0 - self.config.rearm_deeper_pct / 100.0)
+                    state.last = point
+                    row = self._row(
+                        "BUY_READY",
+                        "S03_EXPRESS_DEEP_CRASH+SELL_DECEL+BUY_FLIP",
+                        point, profile)
+                    row["express_depth_pct"] = round(express_depth, 3)
+                    return row
         rebound_floor = state.low_price * (1.0 + self.config.first_rebound_pct / 100.0)
         chase_ceiling = state.low_price * (1.0 + self.config.chase_cap_pct / 100.0)
         entry_floor = state.low_price * (1.0 + self.config.entry_floor_pct / 100.0)
@@ -586,6 +743,10 @@ class RapidReboundDetector:
             failures.append("PRICE_BELOW_ENTRY_FLOOR")
         if point.price > arm_price:
             failures.append("PRICE_OUTSIDE_S03_4_TO_8PCT_BAND")
+        # ★[S03-EXPRESS 2026-08-06] 종전 인계선(-8%) 아래에서 4단계 경로로 쏘면
+        #   신호 검사기(-8% 하한 유지)가 버려서 총알만 소진된다 — 깊은 곳은 급행 전용.
+        if point.price <= point.open_price * (1.0 + self.config.handoff_drop_pct / 100.0):
+            failures.append("DEEP_ZONE_EXPRESS_ONLY")
         # ★[SPEED-GATE 2026-08-03] flow_flip·flow_accel 은 기록만 한다(위 주석 참조).
         #   둘 다 저점 '전' 자료나 10초 구간 2개가 필요해 8/3 에 99%가 빈 값이었고,
         #   fail-closed 라 3번이 하루 종일 한 건도 못 샀다. 판정은 저점 후 속도로 한다.
@@ -609,6 +770,9 @@ class SignalConfig:
     shared_watch_path: Path = Path(os.environ.get(
         "S03_SHARED_WATCH",
         r"C:\stock_bot\IPC\micro_watch_strategy_shared.json"))
+    early_high_range_path: Path = Path(os.environ.get(
+        "S03_EARLY_HIGH_RANGE",
+        r"C:\stock_bot\data\common_high_range_top30.json"))
     minute_path: Path = Path(os.environ.get(
         "S03_MINUTE_PATH",
         r"C:\stock_bot\data\돈맥_1분봉.json"))
@@ -702,13 +866,39 @@ def load_prior_profiles(
     source_date: str,
     codes: set[str],
 ) -> dict[str, PriorProfile]:
-    output: dict[str, PriorProfile] = {}
+    universe = load_prior_profile_universe(
+        path,
+        source_dates={source_date},
+    )
+    return {
+        code: profile
+        for (row_date, code), profile in universe.items()
+        if row_date == source_date and code in codes
+    }
+
+
+def load_prior_profile_universe(
+    path: Path,
+    *,
+    source_dates: set[str],
+) -> dict[tuple[str, str], PriorProfile]:
+    """Load the requested trading dates in one EOD scan.
+
+    The shared watch list changes throughout the session.  Caching this
+    date-level universe prevents every small watch-list change from rescanning
+    the full EOD file and stalling live snapshot consumption.
+    """
+    wanted_dates = {str(value) for value in source_dates if str(value)}
+    if not wanted_dates:
+        return {}
+    output: dict[tuple[str, str], PriorProfile] = {}
     try:
         with path.open(encoding="utf-8-sig", newline="") as handle:
             for row in csv.DictReader(handle):
-                code = str(row.get("code") or "").zfill(6)
-                if code not in codes or str(row.get("date") or "") != source_date:
+                row_date = str(row.get("date") or "")
+                if row_date not in wanted_dates:
                     continue
+                code = str(row.get("code") or "").zfill(6)
                 op = _number(row.get("open"))
                 high = _number(row.get("high"))
                 low = _number(row.get("low"))
@@ -717,7 +907,7 @@ def load_prior_profiles(
                 if close <= 0 or high < low:
                     continue
                 span = high - low
-                output[code] = PriorProfile(
+                output[(row_date, code)] = PriorProfile(
                     previous_close=close,
                     previous_value=value,
                     previous_range_pct=(
@@ -732,7 +922,9 @@ def load_prior_profiles(
 
 class RapidReboundMonitor:
     def __init__(self) -> None:
-        self.detectors: dict[str, RapidReboundDetector] = {}
+        self.early_detectors: dict[str, EarlyLowDetector] = {}
+        self.open_detectors: dict[str, RapidReboundDetector] = {}
+        self.intraday_detectors: dict[str, IntradayReboundDetector] = {}
         self.emission_counts: dict[str, int] = {}
         self.latest: dict[str, dict[str, Any]] = {}
         self.signals: list[dict[str, Any]] = []
@@ -750,23 +942,70 @@ class RapidReboundMonitor:
             if len(code) != 6:
                 continue
             sequence = int(raw.get("signal_sequence") or 1)
-            detector = self.detectors.setdefault(code, RapidReboundDetector())
-            detector.restore_emitted(
-                sequence, float(raw.get("anchor_low") or 0))
-            self.emission_counts[code] = max(
-                self.emission_counts.get(code, 0), sequence)
+            lane = str(raw.get("entry_lane") or OPEN_CRASH_LANE)
+            if lane == EARLY_LOW_LANE:
+                detector = self.early_detectors.setdefault(code, EarlyLowDetector())
+                detector.restore(
+                    float(raw.get("anchor_low") or 0),
+                    _parse_dt(raw.get("anchor_low_ts"), datetime.now()),
+                    chase_blocked=bool(raw.get("chase_blocked")),
+                    emitted=True,
+                )
+            else:
+                detector = (
+                    self.intraday_detectors.setdefault(code, IntradayReboundDetector())
+                    if lane == INTRADAY_CRASH_LANE
+                    else self.open_detectors.setdefault(code, RapidReboundDetector())
+                )
+                detector.restore_emitted(
+                    sequence, float(raw.get("anchor_low") or 0))
+                self.emission_counts[code] = max(
+                    self.emission_counts.get(code, 0), sequence)
             self.signals.append(dict(raw))
 
         for raw in payload.get("candidates") or []:
             if not isinstance(raw, Mapping):
+                continue
+            lane = str(raw.get("entry_lane") or OPEN_CRASH_LANE)
+            if lane == EARLY_LOW_LANE:
+                code = str(raw.get("code") or "").zfill(6)
+                anchor_low = float(raw.get("anchor_low") or 0)
+                anchor_ts = _parse_dt(raw.get("anchor_low_ts"), datetime.now())
+                if len(code) == 6 and anchor_low > 0 and anchor_ts is not None:
+                    self.early_detectors.setdefault(code, EarlyLowDetector()).restore(
+                        anchor_low,
+                        anchor_ts,
+                        chase_blocked=bool(raw.get("chase_blocked")),
+                        emitted=bool(raw.get("action") == "BUY_READY"),
+                    )
                 continue
             if str(raw.get("reason") or "") != "OPEN_DROP_LE_8PCT_HANDOFF_S06":
                 continue
             code = str(raw.get("code") or "").zfill(6)
             if len(code) != 6 or not code.isdigit():
                 continue
-            detector = self.detectors.setdefault(code, RapidReboundDetector())
+            detector = self.open_detectors.setdefault(code, RapidReboundDetector())
             detector.restore_handoff_to_s06()
+
+    def process_early_point(
+        self,
+        code: str,
+        name: str,
+        point: MicroPoint,
+        *,
+        allow_signal: bool,
+    ) -> tuple[dict[str, Any], bool]:
+        detector = self.early_detectors.setdefault(code, EarlyLowDetector())
+        row = detector.feed(point, allow_signal=allow_signal)
+        row.update({"code": code, "name": name, "entry_lane": EARLY_LOW_LANE})
+        fired = row["action"] == "BUY_READY"
+        if fired:
+            row["signal_sequence"] = 1
+            row["anchor_id"] = (
+                f"{row.get('anchor_low_ts')}:"
+                f"{float(row.get('anchor_low') or 0):.4f}"
+            )
+        return row, fired
 
     def process_point(
         self,
@@ -777,15 +1016,20 @@ class RapidReboundMonitor:
         *,
         allow_signal: bool,
     ) -> tuple[dict[str, Any], bool]:
-        detector = self.detectors.setdefault(code, RapidReboundDetector())
         total = self.emission_counts.get(code, 0)
-        row = detector.feed(
-            point, profile, allow_signal=allow_signal and total < 2)
         lane = (
             OPEN_CRASH_LANE
             if point.ts.time() < INTRADAY_ENTRY_START
             else INTRADAY_CRASH_LANE
         )
+        if lane == OPEN_CRASH_LANE:
+            detector = self.open_detectors.setdefault(code, RapidReboundDetector())
+            row = detector.feed(
+                point, profile, allow_signal=allow_signal and total < 2)
+        else:
+            detector = self.intraday_detectors.setdefault(
+                code, IntradayReboundDetector())
+            row = detector.feed(point, allow_signal=allow_signal and total < 2)
         row.update({"code": code, "name": name, "entry_lane": lane})
         fired = row["action"] == "BUY_READY"
         if fired:
@@ -873,7 +1117,15 @@ def load_live_points(
         price = abs(_number(raw.get("cur")))
         buy_cum = _number(raw.get("buy_money_cum"), -1.0)
         sell_cum = _number(raw.get("sell_money_cum"), -1.0)
-        open_price = _number(opens.get(code))
+        # ★[OPEN-PRICE-FIX 2026-08-06 친구님 지시 "지금 문제된거 수정해"] 오늘 시가는
+        #   브로커 스냅샷의 op(FID16, 8/3 배선·결측 0.1%)를 우선한다. 종전에 쓰던
+        #   돈맥_1분봉의 op 는 전일 시가였다 — 8/6 실측: 049080 기가레인 돈맥 op=9790
+        #   (=8/5 시가) vs 실제 오늘 시가 10,990. 9790 이 최소가 1만원 밑이라 아래
+        #   min_price 관문에 걸려 그 종목이 평가에서 통째로 빠졌다(오늘 최대 낙폭
+        #   -10.7% = S03 가 잡아야 할 바로 그 종목인데 08:57 이후 평가 0건).
+        #   폴백은 종전 경로 그대로라 스냅샷에 op 가 없으면 동작이 종전과 같다.
+        #   되돌리기: backup\골짜기_급반등_20260806_before_open_price_fix.py
+        open_price = _number(raw.get("op")) or _number(opens.get(code))
         if price <= 0 or buy_cum < 0 or sell_cum < 0:
             continue
         if code in open_codes:
@@ -888,6 +1140,7 @@ def load_live_points(
             sell_money_cum=sell_cum,
             open_price=open_price,
             minute_low=_number((lows or {}).get(code)),
+            broker_day_low=abs(_number(raw.get("day_low"))),
             che_str=abs(_number(raw.get("che_str"))),
             buy_volume_cum=_number(raw.get("buy_vol_cum"), -1.0),
             sell_volume_cum=_number(raw.get("sell_vol_cum"), -1.0),
@@ -900,7 +1153,7 @@ def load_live_points(
     return output, ("LIVE" if output else "DATA_WAIT")
 
 
-def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -909,14 +1162,32 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     #   WinError 5(접근거부)로 죽어 신호기 전체가 정지하는 패턴(같은 날 S05 11:29 실제 사고).
     #   내일부터 CVD 기록기가 이 신호 JSON을 3초마다 읽어 충돌 확률이 커져 선제 배선.
     #   최초 1회 + 0.2초 간격 재시도 3회. 그래도 실패면 종전대로 예외(원인 은폐 방지). 롤백: 루프 제거.
-    for _attempt in range(4):
+    for _attempt in range(6):
         try:
             os.replace(temporary, path)
-            return
-        except PermissionError:
-            if _attempt == 3:
-                raise
+            return True
+        except PermissionError as exc:
+            if _attempt == 5:
+                print(
+                    f"ATOMIC_WRITE_RETRY_EXHAUSTED_CONTINUING path={path} error={exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False
             time_module.sleep(0.2)
+
+
+def _is_low_gauge_row(row: Mapping[str, Any]) -> bool:
+    # ★[2026-08-06 친구님 지시 "계기판 3종 그림자 기록 … 테스트 한번 해보고 배선하자"]
+    #   저점이 잡히는 순간(무장 ARMED · 계단 INTRADAY_NEW_LOW_RESET)만 하루 CSV 로 남긴다.
+    #   신호까지 못 간 '가짜 저점'의 계기판(dip_climax_mult·dip_book_imb·dip_sell_decel_10s)도
+    #   남아야 나중에 "먹힌 저점과 값이 갈리나"를 잴 수 있다(BUY_READY 는 기존 신호 CSV 에 남음).
+    #   INTRADAY 레인 전용 — OPEN_CRASH 검출기는 이 계기판을 아직 계산하지 않는다.
+    if str(row.get("entry_lane") or "") != INTRADAY_CRASH_LANE:
+        return False
+    if str(row.get("action") or "") == "ARMED":
+        return True
+    return str(row.get("reason") or "") == "INTRADAY_NEW_LOW_RESET"
 
 
 def _append_events(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
@@ -970,17 +1241,54 @@ def _current_watch_codes(
     }
 
 
+def _early_high_range_codes(
+    payload: Mapping[str, Any],
+    day: str,
+) -> set[str]:
+    if (
+        str(payload.get("for_date") or "").replace("-", "")[:8] != day
+        or payload.get("source_stale")
+        or int(payload.get("schema_version") or 0) < 2
+    ):
+        return set()
+    candidates = sorted(
+        (row for row in (payload.get("candidates") or []) if isinstance(row, Mapping)),
+        key=lambda row: int(row.get("rank") or 9999),
+    )[:40]
+    return {
+        str(row.get("code") or "").zfill(6)
+        for row in candidates
+        if str(row.get("code") or "").isdigit()
+    }
+
+
 def run(config: SignalConfig, *, once: bool = False) -> int:
     now = datetime.now(KST).replace(tzinfo=None)
     monitor = RapidReboundMonitor()
     monitor.restore(_read_json(config.output_path), now.strftime("%Y%m%d"))
     profile_key: tuple[Any, ...] | None = None
+    profile_universe: dict[tuple[str, str], PriorProfile] = {}
     profiles: dict[str, PriorProfile] = {}
+    # ★[EARLY-LOW-AUDIT 2026-08-12] 장초 레인 생산 감사 — 상태가 바뀐 순간의
+    #   원시 입력(브로커 당일저가·현재가·앵커)을 해시 사슬 JSONL 로 남긴다.
+    #   실전 활성화는 이 기록을 실제 생산 코드로 재생해 통과해야만 허용된다.
+    early_audit: EarlyLowAuditChain | None = None
+    early_audit_day = ""
+    early_audit_last: dict[str, tuple[str, str]] = {}
+    early_audit_sha = production_file_sha256([
+        Path(__file__),
+        RUN_DIR / "strategy_03_signal_contract_v1.py",
+    ])
     while True:
         now = datetime.now(KST).replace(tzinfo=None)
         day = now.strftime("%Y%m%d")
+        if day != early_audit_day:
+            early_audit = EarlyLowAuditChain("signal", day)
+            early_audit_day = day
+            early_audit_last = {}
         open_watch = _read_json(config.watch_path)
         shared_watch = _read_json(config.shared_watch_path)
+        early_watch = _read_json(config.early_high_range_path)
         # ★[MIN-LOW 2026-08-03] 1분봉을 한 번만 읽어 시가·저가를 함께 뽑는다(파일 I/O 동일).
         minute_payload = _read_json(config.minute_path)
         opens = _minute_opens(minute_payload, day)
@@ -988,28 +1296,50 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
         range_meta = _range_meta(open_watch, shared_watch)
         open_codes = _current_watch_codes(open_watch, day)
         intraday_codes = _current_watch_codes(shared_watch, day)
+        early_codes = _early_high_range_codes(early_watch, day)
+        open_source_date = str(open_watch.get("source_date") or "")
+        intraday_source_date = str(shared_watch.get("source_date") or "")
+        early_source_date = str(early_watch.get("source_date") or "")
+        try:
+            eod_stat = config.eod_path.stat()
+            eod_signature = (eod_stat.st_mtime_ns, eod_stat.st_size)
+        except OSError:
+            eod_signature = (0, 0)
         new_profile_key = (
-            str(open_watch.get("source_date") or ""),
-            tuple(sorted(open_codes)),
-            str(shared_watch.get("source_date") or ""),
-            tuple(sorted(intraday_codes)),
+            open_source_date,
+            intraday_source_date,
+            early_source_date,
+            eod_signature,
         )
         if new_profile_key != profile_key:
-            open_profiles = load_prior_profiles(
+            profile_universe = load_prior_profile_universe(
                 config.eod_path,
-                source_date=str(open_watch.get("source_date") or ""),
-                codes=open_codes,
+                source_dates={
+                    open_source_date, intraday_source_date, early_source_date,
+                },
             )
-            intraday_profiles = load_prior_profiles(
-                config.eod_path,
-                source_date=str(shared_watch.get("source_date") or ""),
-                codes=intraday_codes,
-            )
-            profiles = {**open_profiles, **intraday_profiles}
             profile_key = new_profile_key
+        profiles = {
+            code: profile_universe[(open_source_date, code)]
+            for code in open_codes
+            if (open_source_date, code) in profile_universe
+        }
+        profiles.update({
+            code: profile_universe[(intraday_source_date, code)]
+            for code in intraday_codes
+            if (intraday_source_date, code) in profile_universe
+        })
+        profiles.update({
+            code: profile_universe[(early_source_date, code)]
+            for code in early_codes
+            if (early_source_date, code) in profile_universe
+        })
 
-        union_codes = open_codes | intraday_codes
+        union_codes = open_codes | intraday_codes | early_codes
         combined_watch = {"for_date": day, "codes": sorted(union_codes)}
+        # The first EOD scan can take seconds.  Snapshot freshness must be
+        # measured against the decision time, not the stale loop-start time.
+        now = datetime.now(KST).replace(tzinfo=None)
         points, status = load_live_points(
             config, now=now, watch=combined_watch, profiles=profiles,
             opens=opens,
@@ -1018,7 +1348,88 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
         )
         open_signals: list[dict[str, Any]] = []
         intraday_signals: list[dict[str, Any]] = []
+        early_signals: list[dict[str, Any]] = []
+        low_gauge_rows: list[dict[str, Any]] = []  # ★[2026-08-06] 계기판 그림자
         for code, name, point, profile in points:
+            if code in early_codes:
+                # ★[EARLY-LOW-AUDIT 2026-08-12] 판정 전 상태를 떠서, 바뀐 순간만
+                #   기록한다(재생기는 pre_state 를 restore 한 뒤 같은 점을 feed 해
+                #   같은 판정이 나오는지 본다). 판정 로직 자체는 손대지 않는다.
+                _pre_detector = monitor.early_detectors.get(code)
+                _pre_state = {
+                    "anchor_low": (
+                        _pre_detector.state.anchor_low if _pre_detector else 0.0),
+                    "anchor_low_ts": (
+                        _pre_detector.state.anchor_low_ts.isoformat(
+                            timespec="milliseconds")
+                        if _pre_detector and _pre_detector.state.anchor_low_ts
+                        else ""),
+                    "chase_blocked": bool(
+                        _pre_detector.state.chase_blocked
+                        if _pre_detector else False),
+                    "emitted": bool(
+                        _pre_detector.state.emitted if _pre_detector else False),
+                }
+                _early_allow = (
+                    EARLY_LOW_CAPTURE_START <= point.ts.time() < ENTRY_END
+                )
+                early_row, early_fired = monitor.process_early_point(
+                    code,
+                    name,
+                    point,
+                    allow_signal=_early_allow,
+                )
+                early_row.update(range_meta.get(code) or {})
+                monitor.latest[f"{EARLY_LOW_LANE}:{code}"] = early_row
+                if early_fired:
+                    monitor.signals.append(dict(early_row))
+                    early_signals.append(dict(early_row))
+                _post_state = monitor.early_detectors[code].state
+                _state_key = (
+                    str(early_row.get("action") or ""),
+                    str(early_row.get("reason") or ""),
+                )
+                _anchor_changed = (
+                    _pre_state["anchor_low"] != _post_state.anchor_low
+                    or _pre_state["chase_blocked"] != _post_state.chase_blocked
+                    or _pre_state["emitted"] != _post_state.emitted
+                )
+                if early_audit is not None and (
+                    _anchor_changed or early_audit_last.get(code) != _state_key
+                ):
+                    early_audit_last[code] = _state_key
+                    early_audit.append({
+                        "event": "DECISION",
+                        "code": code,
+                        "name": name,
+                        "hr_rank": (range_meta.get(code) or {}).get("hr_rank"),
+                        "snapshot_ts": point.ts.isoformat(
+                            timespec="milliseconds"),
+                        "current_price": point.price,
+                        "broker_day_low": point.broker_day_low,
+                        "buy_money_cum": point.buy_money_cum,
+                        "sell_money_cum": point.sell_money_cum,
+                        "allow_signal": _early_allow,
+                        "pre_state": _pre_state,
+                        "anchor_low": _post_state.anchor_low,
+                        "anchor_low_ts": (
+                            _post_state.anchor_low_ts.isoformat(
+                                timespec="milliseconds")
+                            if _post_state.anchor_low_ts else ""),
+                        "chase_blocked": bool(_post_state.chase_blocked),
+                        "emitted": bool(_post_state.emitted),
+                        "rebound_pct": float(
+                            early_row.get("rebound_pct") or 0.0),
+                        "action": str(early_row.get("action") or ""),
+                        "reason": str(early_row.get("reason") or ""),
+                        "signal_ts": (
+                            str(early_row.get("ts") or "")
+                            if early_fired else ""),
+                        "signal_price": (
+                            float(early_row.get("price") or 0.0)
+                            if early_fired else 0.0),
+                        "prod_sha": early_audit_sha,
+                    })
             row, fired = monitor.process_point(
                 code,
                 name,
@@ -1029,6 +1440,8 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
             row.update(range_meta.get(code) or {})
             lane = str(row.get("entry_lane") or OPEN_CRASH_LANE)
             monitor.latest[f"{lane}:{code}"] = row
+            if _is_low_gauge_row(row):
+                low_gauge_rows.append(dict(row))
             if fired:
                 monitor.signals.append(dict(row))
                 if lane == OPEN_CRASH_LANE:
@@ -1042,17 +1455,26 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
             "mode": SIGNAL_MODE,
             "status": status,
             "entry_lanes": {
+                EARLY_LOW_LANE: "09:00:00-14:30 S03_EARLY_60S_REBOUND_V1",
                 OPEN_CRASH_LANE: "09:02-09:20 S06_STAIRCASE_RETEST_V1",
-                INTRADAY_CRASH_LANE: "09:20-14:30 S06_STAIRCASE_RETEST_V1",
+                INTRADAY_CRASH_LANE: (
+                    "09:20-14:30 S03_INTRADAY_CRASH_REBOUND_V1"
+                ),
             },
             "watch_count": len(union_codes),
+            "early_watch_count": len(early_codes),
             "open_watch_count": len(open_codes),
             "intraday_watch_count": len(intraday_codes),
             "profile_count": len(profiles),
             "signals": monitor.signals[-1000:],
             "candidates": list(monitor.latest.values()),
         }
-        _write_json_atomic(config.output_path, payload)
+        if not _write_json_atomic(config.output_path, payload):
+            print(f"SIGNAL_OUTPUT_STALE_CONTINUING path={config.output_path}", file=sys.stderr, flush=True)
+        _append_events(
+            config.event_dir / f"strategy_03_early_low_signals_{now:%Y%m%d}.csv",
+            early_signals,
+        )
         _append_events(
             config.event_dir / f"strategy_03_signals_{now:%Y%m%d}.csv",
             open_signals,
@@ -1061,6 +1483,12 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
             config.event_dir
             / f"strategy_03_intraday_signals_{now:%Y%m%d}.csv",
             intraday_signals,
+        )
+        # ★[2026-08-06] 계기판 그림자 — 저점 무장·계단 순간만. 빈 배치는 _append_events 가
+        #   스스로 건너뛰므로 조용한 날엔 파일 자체가 안 생긴다.
+        _append_events(
+            config.event_dir / f"strategy_03_low_gauge_{now:%Y%m%d}.csv",
+            low_gauge_rows,
         )
         if (
             once

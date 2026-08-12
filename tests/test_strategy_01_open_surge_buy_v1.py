@@ -41,15 +41,18 @@ class Strategy01DipReboundTests(unittest.TestCase):
 
     def observation(self, **overrides) -> OpenSurgeObservation:
         """기본 = 되돌림 성립 상태.
-        시가 50,000 → 당일저점 49,000(-2.0%) → 현재 49,500(저점 +1.02%)."""
+        ★[2026-08-06 친구님 지시 "1번은 -3~3%까지, 2번은 -3% 이하"] 깊이 조건이
+          '-3% 보다 깊어야' 에서 '-3% 보다 얕아야' 로 뒤집혔다. 기준 시세도 띠 안으로
+          옮겼다 — 종전 -3.5% 는 이제 2번 영역이라 1번이 안 산다.
+        시가 50,000 → 당일저점 48,750(-2.5%) → 현재 49,250(저점 +1.03%)."""
         values = {
             "observed_at": datetime(2026, 7, 27, 9, 0, 5, tzinfo=KST),
             "code": "123450",
             "previous_close": Decimal("50000"),
             "open_price": Decimal("50000"),
-            "current_price": Decimal("49500"),
+            "current_price": Decimal("49250"),
             "high_so_far": Decimal("50000"),
-            "low_so_far": Decimal("49000"),
+            "low_so_far": Decimal("48750"),
             "buy_money_ratio": Decimal("0.72"),
             "money_speed_5s": Decimal("2000000"),
             "money_speed_30s": Decimal("0"),
@@ -68,7 +71,11 @@ class Strategy01DipReboundTests(unittest.TestCase):
         self.assertEqual(STRATEGY_ID, StrategyId.S01_OPEN_SURGE)
         profile = STRATEGY_PROFILES[STRATEGY_ID]
         self.assertEqual(profile.force_exit_at.strftime("%H:%M"), "15:10")
-        self.assertEqual(profile.early_decision_at.strftime("%H:%M"), "09:20")
+        # ★[2026-08-03 친구님 지시 "조기추세 삭제해 / 상승보유는 트레일 앞으로"]
+        #   종전 09:20 조기추세 판정을 없앴다(09:20 에 매수분 전체가 한꺼번에
+        #   판정대에 올라 한 틱에 전량매도되던 구조 — 7/31 씨젠 실전 사례).
+        self.assertIsNone(profile.early_decision_at)
+        self.assertTrue(profile.rider_before_trail)
 
     # ── 되돌림 3문턱 ──
     def test_dip_then_rebound_is_buy_ready(self):
@@ -76,24 +83,49 @@ class Strategy01DipReboundTests(unittest.TestCase):
         self.assertEqual(decision.action, BuyAction.BUY_READY)
         self.assertEqual(decision.reason, "DIP_REBOUND_CONFIRMED")
 
-    def test_not_dipped_enough_waits(self):
-        """저점이 -0.5% 밖에 안 밀렸으면 아직 때가 아니다(영구 제외가 아니라 WAIT)."""
+    def test_too_deep_is_strategy_02_zone(self):
+        """★[2026-08-06] -3% 보다 깊게 빠졌으면 2번(저점매수) 담당이다.
+
+        이 시험이 1·2번 칸막이를 지킨다. 부등호가 도로 뒤집히면 여기서 터진다 —
+        종전에는 이 상태(-5%)가 1번의 '정상 매수 대상'이었다."""
         decision = self.strategy.evaluate(
-            self.observation(low_so_far=Decimal("49750"), current_price=Decimal("49900"))
+            self.observation(low_so_far=Decimal("47500"), current_price=Decimal("48000"))
         )
         self.assertEqual(decision.action, BuyAction.WAIT)
-        self.assertEqual(decision.reason, "DIP_NOT_DEEP_ENOUGH")
+        self.assertEqual(decision.reason, "DIP_TOO_DEEP_S02_ZONE")
+
+    def test_shallow_dip_is_still_strategy_01(self):
+        """★[2026-08-06] -0.5% 처럼 얕게 밀린 것은 1번의 구간이다(띠 -3%~+3%).
+
+        종전에는 'DIP_NOT_DEEP_ENOUGH' 로 걸러졌다. 뒤집힌 뒤엔 매수 대상이어야 한다."""
+        decision = self.strategy.evaluate(
+            self.observation(low_so_far=Decimal("49750"), current_price=Decimal("50000"))
+        )
+        self.assertEqual(decision.action, BuyAction.BUY_READY)
+        self.assertEqual(decision.reason, "DIP_REBOUND_CONFIRMED")
+
+    def test_straight_rise_without_below_open_pullback_waits(self):
+        """시가가 그대로 저점인 직선 상승은 과거 개장 추격을 되살리므로 사지 않는다."""
+        decision = self.strategy.evaluate(
+            self.observation(
+                low_so_far=Decimal("50000"),
+                current_price=Decimal("50600"),
+                high_so_far=Decimal("50600"),
+            )
+        )
+        self.assertEqual(decision.action, BuyAction.WAIT)
+        self.assertEqual(decision.reason, "PULLBACK_BELOW_OPEN_NOT_SEEN")
 
     def test_rebound_not_confirmed_waits(self):
         """저점 대비 +0.1% 뿐이면 반등 미확인."""
         decision = self.strategy.evaluate(
-            self.observation(current_price=Decimal("49049"))
+            self.observation(current_price=Decimal("48798"))
         )
         self.assertEqual(decision.action, BuyAction.WAIT)
         self.assertEqual(decision.reason, "REBOUND_NOT_CONFIRMED")
 
     def test_chase_above_low_three_percent_is_blocked(self):
-        """저점에서 이미 +4.1% 멀어졌으면 추격 금지."""
+        """저점에서 이미 +5.7% 멀어졌으면 추격 금지."""
         decision = self.strategy.evaluate(
             self.observation(current_price=Decimal("51009"),
                              high_so_far=Decimal("51009"))

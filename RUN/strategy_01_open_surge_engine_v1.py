@@ -84,14 +84,21 @@ def read_json(path: Path, default: Any) -> Any:
         return default
 
 
-def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
-    os.replace(temporary, path)
+    for attempt in range(6):
+        try:
+            os.replace(temporary, path)
+            return True
+        except PermissionError:
+            if attempt == 5:
+                return False
+            time.sleep(0.2)
 
 
 @dataclass(frozen=True)
@@ -249,9 +256,12 @@ class Strategy01Engine:
         self.windows = FlowWindows()
         self.names = self._load_names()
         self.state = self._load_state()
-        position = self.state.get("position") or {}
-        force_exit_only = bool(
-            position.get("real") and position.get("phase") in ACTIVE_PHASES)
+        # ★[SELL-LOCK 2026-08-04] __init__ 1회 계산 -> 매 판정마다 재계산.
+        #   장중에 새로 산 포지션이 보호를 못 받아, 승인 깃발이 깨지면 팔지도 않고
+        #   장부에서 지워졌다. 상세는 StrategyBroker.force_exit_only 참조.
+        force_exit_only = lambda: bool(
+            (self.state.get("position") or {}).get("real")
+            and (self.state.get("position") or {}).get("phase") in ACTIVE_PHASES)
         self.broker = broker or StrategyBroker(
             live_requested=self.config.live_requested,
             approval_path=self.config.approval_path,
@@ -297,7 +307,20 @@ class Strategy01Engine:
 
     def _save(self) -> None:
         self.state["heartbeat"] = kst_now().isoformat(timespec="seconds")
-        write_json_atomic(self.config.state_path, self.state)
+        if not write_json_atomic(self.config.state_path, self.state):
+            marker = self.config.state_path.with_suffix(
+                self.config.state_path.suffix + ".save_failed.flag")
+            try:
+                marker.write_text(
+                    f"STATE_SAVE_FAILED {kst_now().isoformat(timespec='seconds')}\n",
+                    encoding="ascii",
+                )
+            except OSError:
+                pass
+            self.log.critical(
+                "STATE_SAVE_LOCKED_FAIL_CLOSED path=%s", self.config.state_path)
+            raise RuntimeError(
+                f"STATE_SAVE_LOCKED_FAIL_CLOSED:{self.config.state_path}")
 
     def _event(
         self,
@@ -789,6 +812,7 @@ class Strategy01Engine:
             ),
             recent_buy_money_rising=bool(
                 rate10 and rate30 and rate10[0] >= rate30[0]),
+            common_peak_flow_ready=bool(rate10),
         )
 
     def _evaluate_exit(
@@ -805,14 +829,6 @@ class Strategy01Engine:
             return
         position["last_price"] = point["price"]
         position["last_ts"] = point["ts"].isoformat()
-        entry_price = number(position.get("entry_price"))
-        return_pct = (
-            (point["price"] / entry_price - 1.0) * 100
-            if entry_price > 0 else 0.0
-        )
-        if return_pct <= -2.0:
-            self._start_sell(position, now, f"HARD_STOP {return_pct:.2f}%", point)
-            return
         if now.time() >= self.config.force_exit:
             self._start_sell(position, now, "TIME_EXIT_1510", point)
             return
