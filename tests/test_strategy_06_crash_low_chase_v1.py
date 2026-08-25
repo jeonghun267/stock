@@ -103,11 +103,39 @@ class ChaseMachineTest(unittest.TestCase):
             "codes": [other, CODE], "crown_codes": [CODE],
             "for_date": self.today, "source_stale": False,
         })
-        write_json(self.config.snapshot_path, {"codes": {outside: {}, other: {}, CODE: {}}})
+        write_json(self.config.snapshot_path, {
+            "codes": {outside: {}, other: {}, CODE: {}, "0155E0": {}},
+        })
         self.engine._snapshot_cache = (0.0, {})
         codes, block = self.engine._universe(self.now)
         self.assertEqual(codes, [CODE, other, outside])
         self.assertEqual(block, "")
+
+    def test_snapshot_empty_reuses_only_fresh_previous_payload(self) -> None:
+        fresh = {"ts": self.now.isoformat(), "codes": {CODE: {}}}
+        self.engine._snapshot_cache = (0.0, fresh)
+        with (
+            patch("strategy_06_crash_low_chase_v1.read_json", return_value={}),
+            patch("strategy_06_crash_low_chase_v1.kst_now", return_value=self.now),
+            patch("strategy_06_crash_low_chase_v1.time.sleep"),
+        ):
+            codes, block = self.engine._universe(self.now)
+        self.assertEqual(codes, [CODE])
+        self.assertEqual(block, "")
+
+        stale = {
+            "ts": (self.now - timedelta(seconds=30)).isoformat(),
+            "codes": {CODE: {}},
+        }
+        self.engine._snapshot_cache = (0.0, stale)
+        with (
+            patch("strategy_06_crash_low_chase_v1.read_json", return_value={}),
+            patch("strategy_06_crash_low_chase_v1.kst_now", return_value=self.now),
+            patch("strategy_06_crash_low_chase_v1.time.sleep"),
+        ):
+            codes, block = self.engine._universe(self.now)
+        self.assertEqual(codes, [])
+        self.assertEqual(block, "SNAPSHOT_EMPTY")
 
     def test_universe_keeps_watching_when_crown_is_empty(self) -> None:
         """고저폭 정보가 비어도 snapshot 전체는 계속 본다."""

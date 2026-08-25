@@ -855,11 +855,33 @@ class Strategy06Engine:
         epoch = time.time()
         if epoch - self._snapshot_cache[0] < 0.5:
             return self._snapshot_cache[1]
+
+        previous = self._snapshot_cache[1]
+
+        def _valid(value: Any) -> bool:
+            return (
+                isinstance(value, dict)
+                and isinstance(value.get("codes"), dict)
+                and bool(value.get("codes"))
+            )
+
         payload = read_json(self.config.snapshot_path, {})
-        if not (isinstance(payload, dict) and isinstance(payload.get("codes"), dict) and payload.get("codes")):
+        if not _valid(payload):
             time.sleep(0.05)
             payload = read_json(self.config.snapshot_path, {})
-        self._snapshot_cache = (epoch, payload if isinstance(payload, dict) else {})
+        if not _valid(payload) and _valid(previous):
+            raw_cached_at = previous.get("ts")
+            try:
+                cached_at = as_kst(datetime.fromisoformat(str(raw_cached_at)))
+            except (TypeError, ValueError):
+                cached_at = None
+            if (
+                cached_at is not None
+                and abs((kst_now() - cached_at).total_seconds())
+                <= self.config.snapshot_max_age_sec
+            ):
+                payload = previous
+        self._snapshot_cache = (epoch, payload if _valid(payload) else {})
         return self._snapshot_cache[1]
 
     def _snapshot_point(self, code: str, now: datetime) -> Optional[Dict[str, Any]]:
@@ -896,7 +918,12 @@ class Strategy06Engine:
         snapshot_codes = []
         seen = set()
         for raw_code in snapshot_codes_raw:
-            code = str(raw_code).zfill(6)
+            code = str(raw_code).strip().zfill(6)
+            # Kiwoom cash-stock orders accept six ASCII digits only.  The
+            # full-snapshot universe can also contain ELW/right-style codes
+            # with letters, so reject them before chase state or order work.
+            if len(code) != 6 or not code.isascii() or not code.isdigit():
+                continue
             if code and code not in seen:
                 snapshot_codes.append(code)
                 seen.add(code)
