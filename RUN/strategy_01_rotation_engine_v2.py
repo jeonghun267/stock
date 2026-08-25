@@ -1348,7 +1348,7 @@ class Strategy01Engine:
                 return
             entry_stage = str(signal.get("entry_stage") or "")
             order_qty = (
-                1 if entry_stage in {"EARLY_FLOW", "STRONG_FLOW"}
+                1 if entry_stage in {"EARLY_FLOW", "STRONG_FLOW", "ROCKET"}
                 else int(self.config.quantity)
             )
             entered_codes = {

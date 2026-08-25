@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,8 @@ from strategy_01_open_surge_signal_v2 import (
     _book_telemetry,
     _is_top40_range_row,
     build_delay_0903_shadow,
+    promote_rocket_live,
+    restore_entry_v3_emitted,
 )
 
 
@@ -36,6 +39,34 @@ class SequenceStrategy:
 
 
 class Strategy01SignalV2Tests(unittest.TestCase):
+    def test_only_rocket_is_promoted_live_once_at_one_share(self) -> None:
+        rows = [
+            {"ts": "2026-08-26T09:00:05", "code": "111111", "action": "BUY_READY", "stage": "PULLBACK", "score": 99, "mode": "SIGNAL_ONLY_ORDER_ZERO"},
+            {"ts": "2026-08-26T09:00:05", "code": "222222", "action": "BUY_READY", "stage": "ROCKET", "score": 80, "mode": "SIGNAL_ONLY_ORDER_ZERO"},
+        ]
+        promoted = promote_rocket_live(rows, [], enabled=True)
+        self.assertEqual(promoted["code"], "222222")
+        self.assertEqual(promoted["entry_stage"], "ROCKET")
+        self.assertEqual(promoted["requested_quantity"], 1)
+        self.assertIsNone(promote_rocket_live(rows, [promoted], enabled=True))
+        self.assertIsNone(promote_rocket_live(rows, [], enabled=False))
+
+    def test_entry_v3_restart_restores_daily_lane_cap(self) -> None:
+        runtime = SimpleNamespace(emitted=set(), lane_counts=defaultdict(int))
+        payload = {
+            "date": "20260826",
+            "entry_v3_signals": [
+                {"code": "222222", "stage": "ROCKET"},
+                {"code": "222222", "stage": "ROCKET"},
+                {"code": "333333", "stage": "PULLBACK"},
+            ],
+        }
+        restored = restore_entry_v3_emitted(runtime, payload, "20260826")
+        self.assertEqual(len(restored), 2)
+        self.assertEqual(runtime.lane_counts["ROCKET"], 1)
+        self.assertEqual(runtime.lane_counts["PULLBACK"], 1)
+        self.assertIn(("222222", "ROCKET"), runtime.emitted)
+
     @staticmethod
     def rising_ma3(_code: str):
         return {

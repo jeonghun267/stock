@@ -116,7 +116,7 @@ REAL_MICRO_ON        = os.environ.get("REAL_MICRO", "OFF").strip().upper() == "O
 MICRO_WATCH_FILE     = IPC_DIR / "micro_watch.json"             # 구독 대상 코드(소비자가 작성: {"codes":[...]})
 MICRO_SNAPSHOT_FILE  = IPC_DIR / "live_micro_snapshot.json"     # 종목별 최신 마이크로(broker가 1초마다 작성)
 MICRO_SCREEN         = "9300"                                    # 마이크로 전용 실시간 화면(타 화면 무간섭) — 분할 시작 화면번호
-MICRO_FIDS           = "10;13;15;23;24;228;121;125;27;28;41;51;61;71"       # 기존 FID + S01 예상체결가/량(23/24)
+MICRO_FIDS           = "10;13;15;23;24;291;292;228;121;125;27;28;41;51;61;71"  # 기존 FID + S01 예상체결가/량(23/24, 291/292)
 # [OB-FIX 2026-07-13 친구님 "호가도 받게 해줘"] ★키움은 화면 1개당 실시간 100종목이 한계.
 #   CAP=120을 화면 9300 하나에 몰아넣어(SetRealReg) 넘치는 뒤쪽이 조용히 잘려나갔다.
 #   실측(장중 40초 관측): 정렬 앞100 호가생존 93/100 vs 뒤20 5/20.
@@ -1690,15 +1690,6 @@ class BrokerGateway:
             lo = _num(_g("18"))
             if lo:
                 rec["lo"] = lo
-            # S01 v3 ROCKET 입력 전용. 08:40~09:00 예상체결가/수량을
-            # 주문 판단과 분리된 공용 snapshot에 보존한다.
-            expected_px = _num(_g("23"))
-            expected_qty = _num(_g("24"))
-            if expected_px:
-                rec["auction_expected_px"] = expected_px
-                rec["auction_ts"] = datetime.now().isoformat()
-            if expected_qty:
-                rec["auction_expected_qty"] = expected_qty
             # ★[LAT-PROBE 2026-08-01] 지연 실측 ① — 체결 이벤트에만. 기록 전용, 전체 try 격리.
             if LAT_PROBE_ON:
                 try:
@@ -1721,6 +1712,18 @@ class BrokerGateway:
                 #   imb는 한번 쓰이면 안 지워지므로(rec 재사용) 낡은 호가를 구분할 방법이 없었다.
                 #   ★기록만 한다 — 진입 판정에는 안 씀(친구님: "호가 없으면 안 산다"→"가격 맞으면 사자").
                 rec["ob_ts"] = datetime.now().isoformat()
+        # S01 v3 ROCKET 입력 전용. 키움 공식 명세상 예상체결 FID는
+        # 주식호가잔량 이벤트에 실린다. 종전에는 체결 이벤트에서만 읽어 항상 빈 값이었다.
+        # 구형(23/24)을 우선하고 신형(291/292)을 보조로 읽되, 0/빈 값으로 기존 정상값을
+        # 지우지 않는다. 일부 버전의 전용 주식예상체결 이벤트도 함께 허용한다.
+        if "호가" in rt or "예상체결" in rt:
+            expected_px = _num(_g("23")) or _num(_g("291"))
+            expected_qty = _num(_g("24")) or _num(_g("292"))
+            if expected_px:
+                rec["auction_expected_px"] = expected_px
+                rec["auction_ts"] = datetime.now().isoformat()
+            if expected_qty:
+                rec["auction_expected_qty"] = expected_qty
         rec["ts"] = datetime.now().isoformat()
         self._micro_snapshot[code] = rec
         # ★1단계 검증: 체결강도 실제 값이 실시간으로 오는지 첫 15건 로그(opt10001=빈값과 대조)

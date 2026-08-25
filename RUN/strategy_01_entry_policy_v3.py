@@ -26,6 +26,9 @@ class EntryCandidate:
     low_price: float
     opening_high_3m: float
     vwap: float
+    high_range_ready: bool = False
+    money_flow_fresh: bool = False
+    money_speed_5s: float = 0.0
     auction_ready: bool = False
     auction_price_rising: bool = False
     auction_buy_ratio: float = 0.0
@@ -58,6 +61,7 @@ class EntryDecision:
 
 
 LANE_LIMITS = {Lane.ROCKET: 1, Lane.PULLBACK: 3, Lane.ORB: 2}
+ROCKET_MIN_MONEY_SPEED_5S = 1_666_667.0
 
 
 def _flow_ready(row: EntryCandidate) -> bool:
@@ -97,7 +101,9 @@ def evaluate_candidate(row: EntryCandidate) -> EntryDecision:
 
     if time(9, 0) <= clock < time(9, 1):
         rocket = (
-            row.auction_ready and row.auction_price_rising
+            row.high_range_ready and row.money_flow_fresh
+            and row.money_speed_5s >= ROCKET_MIN_MONEY_SPEED_5S
+            and row.auction_ready and row.auction_price_rising
             and row.auction_buy_ratio >= 0.65
             and row.auction_volume_percentile >= 80.0
             and row.first_5s_high_break and _flow_ready(row)

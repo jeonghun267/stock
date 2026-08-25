@@ -2,6 +2,7 @@
 """Atomic release state for the Strategy 03 EARLY_LOW candidate."""
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -14,6 +15,8 @@ FEATURE = "S03_EARLY_LOW"
 CONDITION_ID = "S03_EARLY_LOW_0900_0910_NEW_LOW_RESET_REBOUND_1P0_2P0_FLOW_TURN"
 QUANTITY = 1
 DURATION = "PERMANENT"
+OWNER_OVERRIDE_STATUS = "LIVE_OWNER_OVERRIDE_UNVERIFIED"
+OWNER_OVERRIDE_BASIS = "OWNER_DIRECT_OVERRIDE_AFTER_UNVERIFIED_REPLAY_20260825"
 
 
 def verified_release_record(
@@ -42,10 +45,73 @@ def verified_release_record(
     return record
 
 
-def release_live_enabled(manifest_path: Path = MANIFEST) -> bool:
-    """Fail closed unless an approved, report-bound atomic release is LIVE."""
-    record = verified_release_record(manifest_path)
-    if record is None or str(record.get("status") or "") != "LIVE":
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _owner_override_evidence_valid(
+    record: Mapping[str, Any],
+    manifest_path: Path,
+) -> bool:
+    if str(record.get("approval_basis") or "") != OWNER_OVERRIDE_BASIS:
         return False
-    report_sha = str(record.get("approved_report_sha256") or "").lower()
-    return len(report_sha) == 64 and all(ch in "0123456789abcdef" for ch in report_sha)
+    if str(record.get("evidence_status") or "") != "[UNVERIFIED]":
+        return False
+    if str(record.get("approved_by") or "") != "OWNER":
+        return False
+    expected_sha = str(record.get("evidence_report_sha256") or "").lower()
+    if len(expected_sha) != 64 or any(
+        ch not in "0123456789abcdef" for ch in expected_sha
+    ):
+        return False
+    try:
+        root = Path(manifest_path).resolve().parents[1]
+        report_path = Path(
+            str(record.get("evidence_report_path") or "")
+        ).resolve()
+        report_path.relative_to(
+            (root / "reports" / "verified_replay").resolve()
+        )
+        if _sha256(report_path) != expected_sha:
+            return False
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (
+        OSError, ValueError, UnicodeError, json.JSONDecodeError, IndexError,
+    ):
+        return False
+    exact = {
+        "provenance": "[UNVERIFIED]",
+        "status": "UNVERIFIED",
+        "strategy": "S03",
+        "condition_id": CONDITION_ID,
+        "quantity": QUANTITY,
+        "duration": DURATION,
+    }
+    return all(
+        report.get(field) == expected for field, expected in exact.items()
+    )
+
+
+def release_live_enabled(manifest_path: Path = MANIFEST) -> bool:
+    """Accept either a PASS-bound release or an explicit hash-bound owner override."""
+    record = verified_release_record(manifest_path)
+    if record is None:
+        return False
+    status = str(record.get("status") or "")
+    if status == "LIVE":
+        report_sha = str(
+            record.get("approved_report_sha256") or ""
+        ).lower()
+        return (
+            len(report_sha) == 64
+            and all(ch in "0123456789abcdef" for ch in report_sha)
+        )
+    if status == OWNER_OVERRIDE_STATUS:
+        return _owner_override_evidence_valid(
+            record, Path(manifest_path),
+        )
+    return False

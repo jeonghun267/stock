@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -15,6 +16,11 @@ if str(RUN) not in sys.path:
     sys.path.insert(0, str(RUN))
 
 import strategy_03_rotation_engine_v1 as s03_engine
+from approval_manifest_writer_v1 import content_sha
+from s03_early_low_release_v1 import (
+    CONDITION_ID, DURATION, OWNER_OVERRIDE_BASIS,
+    OWNER_OVERRIDE_STATUS, QUANTITY, release_live_enabled,
+)
 from strategy_03_rotation_engine_v1 import make_strategy03_signal_selector
 from strategy_03_signal_contract_v1 import (
     EARLY_LOW_ALGORITHM,
@@ -30,6 +36,71 @@ REPLAY = RUN / "s03_early_low_prod_replay_v1.py"
 
 
 class Strategy03EarlyLowTests(unittest.TestCase):
+    def _owner_override_fixture(
+        self, root: Path,
+    ) -> tuple[Path, Path]:
+        report = {
+            "provenance": "[UNVERIFIED]",
+            "status": "UNVERIFIED",
+            "strategy": "S03",
+            "condition_id": CONDITION_ID,
+            "quantity": QUANTITY,
+            "duration": DURATION,
+        }
+        report_path = (
+            root / "reports" / "verified_replay"
+            / "20260825" / "s03.json"
+        )
+        report_path.parent.mkdir(parents=True)
+        report_path.write_text(
+            json.dumps(report), encoding="utf-8",
+        )
+        report_sha = hashlib.sha256(
+            report_path.read_bytes(),
+        ).hexdigest()
+        manifest = {
+            "live_features": {"S03_EARLY_LOW": True},
+            "release_states": {
+                "S03_EARLY_LOW": {
+                    "status": OWNER_OVERRIDE_STATUS,
+                    "condition_id": CONDITION_ID,
+                    "quantity": QUANTITY,
+                    "duration": DURATION,
+                    "approval_basis": OWNER_OVERRIDE_BASIS,
+                    "approved_by": "OWNER",
+                    "evidence_status": "[UNVERIFIED]",
+                    "evidence_report_path": str(report_path),
+                    "evidence_report_sha256": report_sha,
+                }
+            },
+        }
+        manifest["manifest_sha"] = content_sha(manifest)
+        manifest_path = (
+            root / "config" / "live_approved_hashes_v1.json"
+        )
+        manifest_path.parent.mkdir(parents=True)
+        manifest_path.write_text(
+            json.dumps(manifest), encoding="utf-8",
+        )
+        return manifest_path, report_path
+
+    def test_hash_bound_owner_override_opens_release(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            manifest_path, _ = self._owner_override_fixture(
+                Path(folder),
+            )
+            self.assertTrue(release_live_enabled(manifest_path))
+
+    def test_owner_override_fails_closed_when_evidence_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            manifest_path, report_path = self._owner_override_fixture(
+                Path(folder),
+            )
+            report_path.write_text("{}", encoding="utf-8")
+            self.assertFalse(release_live_enabled(manifest_path))
+
     def point(self, second: int, price: float, day_low: float,
               buy: float = 0.0, sell: float = 0.0) -> MicroPoint:
         return MicroPoint(

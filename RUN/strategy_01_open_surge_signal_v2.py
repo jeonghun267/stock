@@ -11,7 +11,7 @@ import os
 import sys
 import time as time_module
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -54,6 +54,10 @@ ABOVE_OPEN_REBREAK_SHADOW = (
     in {"YES", "Y", "1", "TRUE", "ON"}
 )
 from strategy_01_entry_runtime_v3 import EntryRuntimeV3
+from approval_manifest_writer_v1 import live_feature_enabled
+
+ROCKET_LIVE_STAGE = "ROCKET"
+ROCKET_LIVE_FEATURE = "S01_ROCKET"
 # [S01 ABOVE-OPEN LIVE OBSERVATION 2026-08-14 owner approval]
 # Five trading sessions after the 2026-08-17 substitute holiday.  The
 # detector stays unchanged; only an already-confirmed shadow row can be
@@ -173,6 +177,8 @@ class ShadowPoint:
     buy_money_cum: float
     sell_money_cum: float
     exact_flow: bool
+    high_range_rank: int = 0
+    high_range_ready: bool = False
     che_str: float = 0.0
     cum_vol: float = 0.0
     theme_leader: bool = False
@@ -419,6 +425,16 @@ def load_live_points(
     points = _points_from_payload(
         codes, meta, snapshot, board_rows, opens, names, now, config, board_fresh
     )
+    points = [
+        replace(
+            point,
+            high_range_rank=int(_safe_float(
+                (range_meta.get(point.code) or {}).get("hr_rank")
+            )),
+            high_range_ready=_is_top40_range_row(range_meta.get(point.code)),
+        )
+        for point in points
+    ]
     status = "LIVE" if points else "DATA_WAIT"
     return points, status, len(codes), range_meta
 
@@ -1263,6 +1279,80 @@ def promote_above_open_rebreak_live(
     return selected
 
 
+def rocket_live_enabled() -> bool:
+    """Require both the hashed launcher switch and the sealed owner grant."""
+    env_enabled = (
+        os.environ.get("S01_ROCKET_LIVE", "NO").strip().upper()
+        in {"YES", "Y", "1", "TRUE", "ON"}
+    )
+    return env_enabled and live_feature_enabled(ROCKET_LIVE_FEATURE)
+
+
+def promote_rocket_live(
+    entry_v3_rows: Iterable[Mapping[str, Any]],
+    existing_signals: Iterable[Mapping[str, Any]],
+    *,
+    enabled: bool | None = None,
+) -> Dict[str, Any] | None:
+    """Promote only the already-selected ROCKET lane; other v3 lanes stay shadow."""
+    if enabled is None:
+        enabled = rocket_live_enabled()
+    if not enabled or any(
+        str(row.get("entry_stage") or "") == ROCKET_LIVE_STAGE
+        for row in existing_signals
+    ):
+        return None
+    eligible = [
+        dict(row) for row in entry_v3_rows
+        if str(row.get("stage") or "") == ROCKET_LIVE_STAGE
+        and str(row.get("action") or "") == BuyAction.BUY_READY.value
+        and str(row.get("mode") or "") == "SIGNAL_ONLY_ORDER_ZERO"
+    ]
+    if not eligible:
+        return None
+    selected = max(
+        eligible,
+        key=lambda row: (
+            _safe_float(row.get("score")),
+            str(row.get("code") or ""),
+        ),
+    )
+    selected.update({
+        "entry_stage": ROCKET_LIVE_STAGE,
+        "requested_quantity": 1,
+        "signal_sequence": 1,
+        "mode": "SIGNAL_ONLY_ORDER_ZERO",
+    })
+    return selected
+
+
+def restore_entry_v3_emitted(
+    runtime: EntryRuntimeV3,
+    payload: Mapping[str, Any],
+    today: str,
+) -> list[Dict[str, Any]]:
+    """Restore same-day v3 lane caps so a signal-process restart cannot refire."""
+    if str(payload.get("date") or "") != today:
+        return []
+    restored: list[Dict[str, Any]] = []
+    for raw in payload.get("entry_v3_signals") or []:
+        if not isinstance(raw, Mapping):
+            continue
+        code = str(raw.get("code") or "").zfill(6)
+        stage = str(raw.get("stage") or "")
+        if len(code) != 6 or not code.isdigit():
+            continue
+        if stage not in {"ROCKET", "PULLBACK", "ORB"}:
+            continue
+        key = (code, stage)
+        if key in runtime.emitted:
+            continue
+        runtime.emitted.add(key)
+        runtime.lane_counts[stage] += 1
+        restored.append(dict(raw))
+    return restored
+
+
 def build_delay_0903_shadow(
     signals: Iterable[Mapping[str, Any]], now: datetime,
 ) -> list[Dict[str, Any]]:
@@ -1311,7 +1401,9 @@ class ShadowRuntime:
             str(path): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in replay_sources
         }
-        self.entry_v3_signals: list[Dict[str, Any]] = []
+        self.entry_v3_signals = restore_entry_v3_emitted(
+            self.entry_v3, existing, datetime.now().strftime("%Y%m%d"),
+        )
         self._entry_v3_batch = -1
 
     def tick(self, now: datetime) -> Dict[str, Any]:
@@ -1345,6 +1437,13 @@ class ShadowRuntime:
         )
         self.entry_v3_signals.extend(entry_v3_new)
         signals = self.monitor.process_points(points)
+        rocket_live = rocket_live_enabled()
+        rocket_promoted = promote_rocket_live(
+            entry_v3_new, self.monitor.signals, enabled=rocket_live,
+        )
+        if rocket_promoted is not None:
+            self.monitor.signals.append(rocket_promoted)
+            signals.append(rocket_promoted)
         shadow_signals = self.monitor.drain_shadow_signals()
         promoted = promote_above_open_rebreak_live(
             shadow_signals, self.monitor.signals, now)
@@ -1372,6 +1471,7 @@ class ShadowRuntime:
             "signals": self.monitor.signals,
             "shadow_signals": self.monitor.shadow_signals,
             "entry_v3_mode": "SHADOW",
+            "rocket_live_mode": "LIVE" if rocket_live else "SHADOW",
             "entry_v3_loss_pause_until": (
                 loss_pause_until.isoformat(timespec="seconds") if loss_pause_until else ""
             ),

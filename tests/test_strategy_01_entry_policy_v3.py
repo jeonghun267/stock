@@ -19,7 +19,8 @@ class Strategy01EntryPolicyV3Test(unittest.TestCase):
         return EntryCandidate(
             ts=datetime.fromisoformat(at), code=code, price=101.0,
             open_price=100.0, low_price=99.2, opening_high_3m=100.8,
-            vwap=100.2, auction_ready=True, auction_price_rising=True,
+            vwap=100.2, high_range_ready=True, money_flow_fresh=True,
+            money_speed_5s=2_000_000, auction_ready=True, auction_price_rising=True,
             auction_buy_ratio=0.75, auction_volume_percentile=90,
             relative_volume=2.5, buy_ratio=0.8, buy_rate=200,
             sell_rate=80, buy_accelerating=True, sell_decelerating=True,
@@ -30,6 +31,18 @@ class Strategy01EntryPolicyV3Test(unittest.TestCase):
     def test_rocket_does_not_require_below_open_pullback(self):
         row = replace(self.base(), low_price=100.0)
         self.assertEqual(evaluate_candidate(row).lane, Lane.ROCKET)
+
+    def test_rocket_requires_high_range_top40(self):
+        self.assertIsNone(evaluate_candidate(
+            replace(self.base(), high_range_ready=False)).lane)
+
+    def test_rocket_requires_fresh_money_flow_board(self):
+        self.assertIsNone(evaluate_candidate(
+            replace(self.base(), money_flow_fresh=False)).lane)
+
+    def test_rocket_requires_existing_s01_money_speed_floor(self):
+        self.assertIsNone(evaluate_candidate(
+            replace(self.base(), money_speed_5s=1_666_666)).lane)
 
     def test_pullback_requires_half_to_one_point_two_rebound(self):
         row = self.base(at="2026-08-20T09:01:00")

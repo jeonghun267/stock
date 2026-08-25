@@ -242,6 +242,14 @@ class Strategy01RotationV2Tests(unittest.TestCase):
         self.assertEqual(broker.submissions[0]["quantity"], 2)
         self.assertEqual(engine._active_positions()[code]["qty"], 2)
 
+    def test_rocket_forces_exactly_one_share(self) -> None:
+        code = "100096"
+        self.write_market([code], {code: 10_000}, self.now, stages={code: ["ROCKET"]})
+        engine, broker = self.engine(self.config(quantity=2))
+        engine.tick(self.now)
+        self.assertEqual(broker.submissions[0]["quantity"], 1)
+        self.assertEqual(engine._active_positions()[code]["qty"], 1)
+
     def test_staged_signals_buy_one_share_then_add_one_share(self) -> None:
         code = "100097"
         engine, broker = self.engine(self.config(quantity=2))

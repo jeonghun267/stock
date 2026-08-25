@@ -87,6 +87,9 @@ class EntryRuntimeV3:
             ts=point.ts, code=point.code, price=point.price,
             open_price=point.open_hint, low_price=low,
             opening_high_3m=opening_high, vwap=vwap,
+            high_range_ready=bool(getattr(point, "high_range_ready", False)),
+            money_flow_fresh=bool(getattr(point, "exact_flow", False)),
+            money_speed_5s=float(getattr(point, "money_speed_5s", 0.0) or 0.0),
             auction_ready=bool(auction), auction_price_rising=auction_rising,
             auction_buy_ratio=auction_buy_ratio,
             auction_volume_percentile=auction_percentile,
@@ -104,8 +107,13 @@ class EntryRuntimeV3:
         )
         missing = []
         clock = point.ts.time()
-        if time(9, 0) <= clock < time(9, 1) and not auction:
-            missing.append("AUCTION_HISTORY")
+        if time(9, 0) <= clock < time(9, 1):
+            if not auction:
+                missing.append("AUCTION_HISTORY")
+            if not row.high_range_ready:
+                missing.append("HIGH_RANGE_TOP40")
+            if not row.money_flow_fresh:
+                missing.append("MONEY_FLOW_BOARD")
         if time(9, 3) <= clock < time(9, 20) and base <= 0:
             missing.append("RELATIVE_VOLUME_BASELINE")
         if not bars:

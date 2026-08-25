@@ -2,6 +2,8 @@
 REM Independent Strategy 01. Live buys require the separate owner approval flag.
 set PYTHONDONTWRITEBYTECODE=1
 set S01_LIVE=YES
+REM Owner 2026-08-25: v3 ROCKET is live at exactly one share; PULLBACK/ORB stay shadow.
+set S01_ROCKET_LIVE=YES
 REM Owner 2026-08-13: MA5 trend hold permanently ON (S01 only; profit>0 AND price>MA5 AND MA5 rising AND price>=MA10 holds vs peak/flow exits; hard stop and time exit stay first). UNVERIFIED until the 2026-08-14 production replay.
 set S01_MA5_TREND_HOLD_DATE=*
 REM S01 trend priority remains SHADOW until current-path PROD_REPLAY passes.

@@ -4,7 +4,7 @@
   "_근본차단": "태스크 RunLevel 을 Limited 로 낮추는 것. 관리자 셸에서만 된다. 브로커 계열 3개(PIPELINE_0900·WATCHDOG_BROKER·BROKER_NIGHT_STOP)는 브로커를 죽이고 살려야 해서 Highest 가 필요하다.",
   "_다시만들기": "C:\\python310\\python.exe C:\\stock_bot\\RUN\\morning_preflight_rehearsal_v1.py --rebaseline-elevated",
   "_주의": "일부러 고친 뒤에만 다시 만들 것. 먼저 다시 만들고 나중에 확인하면 검사가 무의미해진다.",
-  "생성": "2026-08-25T21:25:21",
+  "생성": "2026-08-25T22:42:29",
   "파일": {
     "RUN\\_run_hidden_wait.vbs": "c0ac14545cc05ce19b58106922dbf0189bf226d8296d43ded14f4bcc8f48266e",
     "RUN\\broker_night_stop.ps1": "415e983374a11e6ec1f17b27f301147675b0ec253b1ca9d9d7f696d05db80a71",
@@ -13,14 +13,14 @@
     "RUN\\hidden\\SAFEPLUS_PREFLIGHT_SELFTEST_HIGH.cmd": "ec1932bd3e85c9287b0c089f0b695b46ba7ee5be63e32690c00b4221aea15b2a",
     "RUN\\hidden\\SAFEPLUS_STRATEGY_ALL_PREFLIGHT.cmd": "82c043da48155fe6b36315f3589bf3af54fabda2a8f2a35494a635a69fe2dff4",
     "RUN\\hidden\\SAFEPLUS_STRATEGY_COMMON_CONTEXT.cmd": "35c1c1926a2ff56c3aaab2eb1fe24883dc2e4793be7bf0918bd979bff8481cc4",
-    "RUN\\hidden\\SAFEPLUS_STRATEGY01_LIVE.cmd": "fd6f3982f45a5fcec6ba8c4b0cc0e994af3beb149e010c9a2886c848090c9944",
-    "RUN\\hidden\\SAFEPLUS_STRATEGY01_SIGNAL.cmd": "97acff5ce6d179200ffc9c5b07a6eb9c3f1264a74a8507d1502db3cae6e6334f",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY01_LIVE.cmd": "ac856b14415110c5f9ad590b6a45d0d30b70f65fb667ba92c77892c122ec9852",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY01_SIGNAL.cmd": "7d3aa3b64c7b4c2ae752bacb958e6e33f6946309a9b7b9414f436f79f2acdd90",
     "RUN\\hidden\\SAFEPLUS_STRATEGY02_LIVE.cmd": "5cd1b383e7003366b564f437b716085205cbad68df367f94f60fbb905607b9c8",
     "RUN\\hidden\\SAFEPLUS_STRATEGY02_SIGNAL.cmd": "d0dc21f9cf7d9c3cb36e03681f9bf4b041a28d4151277f4e34cfd55a09eb4e84",
     "RUN\\hidden\\SAFEPLUS_STRATEGY03_LIVE_ASCII.cmd": "31f785a728e1797a226f6d7d21d84f6c98494786eb691bfba9409b839f1f786b",
     "RUN\\hidden\\SAFEPLUS_STRATEGY03_PREFLIGHT.cmd": "f0ac896aeb6ca1572dfe5059dcdadd08f11fba8eefb6bcf43c8aff1d5662ddf5",
     "RUN\\hidden\\SAFEPLUS_STRATEGY03_SIGNAL_ASCII.cmd": "c27611c64c3b9355a07bab0bc3378828239a5ffe5a3371c7b3076fbc5e12b181",
-    "RUN\\broker_gateway_v1.py": "3f30c6f9e0efd233afa3b89142f7829921040f0ff843d864fe7b0abc6dce33a3",
+    "RUN\\broker_gateway_v1.py": "4c9e8094611879db8045ee66afe4fcd9185ee898264674fee5ffe19c0039866b",
     "RUN\\ipc_order_auth_v1.py": "1af31e9e12e40e17d4415f6baff4afb17bc098fd00f60514623e4a7592d218eb"
   }
 }
