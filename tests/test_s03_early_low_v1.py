@@ -50,10 +50,10 @@ class Strategy03EarlyLowTests(unittest.TestCase):
             "action": "BUY_READY",
             "reason": "S03_EARLY_LOW_REBOUND+BUY_SPEED_LEAD",
             "ts": signal_ts.isoformat(timespec="milliseconds"),
-            "price": 101.2,
-            "anchor_low": 100.0,
+            "price": 10120.0,
+            "anchor_low": 10000.0,
             "anchor_low_ts": anchor_ts.isoformat(timespec="milliseconds"),
-            "anchor_id": f"{anchor_ts.isoformat(timespec='milliseconds')}:100.0000",
+            "anchor_id": f"{anchor_ts.isoformat(timespec='milliseconds')}:10000.0000",
             "rebound_pct": 1.2,
             "signal_sequence": 1,
             "code": "000001",
@@ -76,20 +76,20 @@ class Strategy03EarlyLowTests(unittest.TestCase):
 
     def test_fires_inside_capture_window_on_rebound_and_buy_speed_lead(self):
         detector = EarlyLowDetector()
-        armed = detector.feed(self.point(20, 100.0, 100.0), allow_signal=True)
-        detector.feed(self.point(40, 100.4, 100.0, 100.0, 100.0), allow_signal=True)
-        fired = detector.feed(self.point(65, 101.2, 100.0, 400.0, 150.0), allow_signal=True)
+        armed = detector.feed(self.point(20, 10000.0, 10000.0), allow_signal=True)
+        detector.feed(self.point(40, 10040.0, 10000.0, 100.0, 100.0), allow_signal=True)
+        fired = detector.feed(self.point(65, 10120.0, 10000.0, 400.0, 150.0), allow_signal=True)
         self.assertEqual(armed["action"], "ARMED")
         self.assertEqual(fired["action"], "BUY_READY")
         self.assertEqual(fired["reason"], "S03_EARLY_LOW_REBOUND+BUY_SPEED_LEAD")
-        self.assertEqual(fired["anchor_low"], 100.0)
+        self.assertEqual(fired["anchor_low"], 10000.0)
         self.assertAlmostEqual(fired["rebound_pct"], 1.2)
 
     def test_blocks_code_for_day_after_crossing_two_percent_first(self):
         detector = EarlyLowDetector()
-        detector.feed(self.point(20, 100.0, 100.0), allow_signal=True)
-        blocked = detector.feed(self.point(65, 102.1, 100.0), allow_signal=True)
-        later = detector.feed(self.point(70, 101.5, 100.0), allow_signal=True)
+        detector.feed(self.point(20, 10000.0, 10000.0), allow_signal=True)
+        blocked = detector.feed(self.point(65, 10310.0, 10000.0), allow_signal=True)
+        later = detector.feed(self.point(70, 10150.0, 10000.0), allow_signal=True)
         self.assertEqual(blocked["reason"], "EARLY_LOW_REBOUND_CHASE_LIMIT")
         self.assertEqual(later["action"], "DONE")
 
@@ -107,7 +107,7 @@ class Strategy03EarlyLowTests(unittest.TestCase):
                     "codes": {
                         "000001": {
                             "ts": decision_now.isoformat(),
-                            "cur": 101.2,
+                            "cur": 10120.0,
                         }
                     }
                 }),
@@ -142,7 +142,7 @@ class Strategy03EarlyLowTests(unittest.TestCase):
             snapshot_path = Path(folder) / "snapshot.json"
             snapshot_path.write_text(
                 json.dumps({"codes": {"000001": {
-                    "ts": decision_now.isoformat(), "cur": 101.2}}}),
+                    "ts": decision_now.isoformat(), "cur": 10120.0}}}),
                 encoding="utf-8",
             )
             s03_engine.live_feature_enabled = lambda name: bool(feature_ok)
@@ -191,7 +191,7 @@ class Strategy03EarlyLowTests(unittest.TestCase):
             snapshot_path = Path(folder) / "snapshot.json"
             snapshot_path.write_text(
                 json.dumps({"codes": {"000001": {
-                    "ts": decision_now.isoformat(), "cur": 101.2}}}),
+                    "ts": decision_now.isoformat(), "cur": 10120.0}}}),
                 encoding="utf-8",
             )
             os.environ["S03_EARLY_LOW_AUDIT_DIR"] = folder
@@ -260,7 +260,7 @@ class Strategy03EarlyLowTests(unittest.TestCase):
             snapshot_path = Path(folder) / "snapshot.json"
             snapshot_path.write_text(
                 json.dumps({"codes": {"000001": {
-                    "ts": decision_now.isoformat(), "cur": 101.2}}}),
+                    "ts": decision_now.isoformat(), "cur": 10120.0}}}),
                 encoding="utf-8",
             )
             os.environ["S03_EARLY_LOW_AUDIT_DIR"] = folder
@@ -291,7 +291,7 @@ class Strategy03EarlyLowTests(unittest.TestCase):
                     "codes": {
                         "000001": {
                             "ts": decision_now.isoformat(),
-                            "cur": 101.2,
+                            "cur": 10120.0,
                         }
                     }
                 }),
@@ -358,6 +358,13 @@ class Strategy03EarlyLowTests(unittest.TestCase):
             "hr_rank": 1,
             "snapshot_ts": point.ts.isoformat(timespec="milliseconds"),
             "current_price": point.price,
+            "entry_lane": EARLY_LOW_LANE,
+            "snapshot_op": point.open_price,
+            "snapshot_lo": point.broker_day_low,
+            "best_ask_px": point.best_ask_px,
+            "best_bid_px": point.best_bid_px,
+            "best_ask_qty": point.best_ask_qty,
+            "best_bid_qty": point.best_bid_qty,
             "broker_day_low": point.broker_day_low,
             "buy_money_cum": point.buy_money_cum,
             "sell_money_cum": point.sell_money_cum,
@@ -377,6 +384,8 @@ class Strategy03EarlyLowTests(unittest.TestCase):
             "flow_recent_sell_rate": float(row.get("flow_recent_sell_rate") or 0.0),
             "flow_price_responding": bool(row.get("flow_price_responding")),
             "signal_ts": str(row.get("ts") or "") if fired else "",
+            "signal_ts_exact": (
+                point.ts.isoformat(timespec="microseconds") if fired else ""),
             "signal_price": float(row.get("price") or 0.0) if fired else 0.0,
             "prod_sha": {"test": "0" * 64},
         }
@@ -385,11 +394,11 @@ class Strategy03EarlyLowTests(unittest.TestCase):
         chain = EarlyLowAuditChain("signal", "20260813", directory=folder)
         detector = EarlyLowDetector()
         first = chain.append(self._signal_audit_record(
-            detector, self.point(20, 100.0, 100.0)))
+            detector, self.point(20, 10000.0, 10000.0)))
         second = chain.append(self._signal_audit_record(
-            detector, self.point(40, 100.4, 100.0, 100.0, 100.0)))
+            detector, self.point(40, 10040.0, 10000.0, 100.0, 100.0)))
         third = chain.append(self._signal_audit_record(
-            detector, self.point(65, 101.2, 100.0, 400.0, 150.0)))
+            detector, self.point(65, 10120.0, 10000.0, 400.0, 150.0)))
         assert first is not None and second is not None and third is not None
         assert third["action"] == "BUY_READY"
 
@@ -409,8 +418,8 @@ class Strategy03EarlyLowTests(unittest.TestCase):
             self.assertTrue(ok, reason)
             self.assertEqual([r["seq"] for r in records], [1, 2, 3])
             lines = path.read_text(encoding="utf-8").splitlines()
-            lines[0] = lines[0].replace('"broker_day_low": 100.0',
-                                        '"broker_day_low": 99.0')
+            lines[0] = lines[0].replace('"broker_day_low": 10000.0',
+                                        '"broker_day_low": 9900.0')
             path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             ok, reason, _ = EarlyLowAuditChain.verify_file(path)
             self.assertFalse(ok)
@@ -426,7 +435,7 @@ class Strategy03EarlyLowTests(unittest.TestCase):
             snapshot_path = folder / "snapshot.json"
             snapshot_path.write_text(
                 json.dumps({"codes": {"000001": {
-                    "ts": decision_now.isoformat(), "cur": 101.2,
+                    "ts": decision_now.isoformat(), "cur": 10120.0,
                 }}}),
                 encoding="utf-8",
             )
@@ -454,7 +463,7 @@ class Strategy03EarlyLowTests(unittest.TestCase):
             chain = EarlyLowAuditChain("signal", "20260813", directory=folder)
             detector = EarlyLowDetector()
             record = self._signal_audit_record(
-                detector, self.point(20, 100.0, 100.0))
+                detector, self.point(20, 10000.0, 10000.0))
             record.pop("broker_day_low")
             self.assertIsNotNone(chain.append(record))
             result = self._run_replay(folder)
