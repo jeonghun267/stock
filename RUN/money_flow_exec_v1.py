@@ -175,27 +175,45 @@ def _leader_codes():
 
 
 _DU_WARNED = [False]
-def _deep_universe(board):
-    """★[7/12 친구님 "선별기에서 전체를 봐야 돼 — 던짐이나 선별된 거나 상관없어. 모두가 급락 후보자야.
-       여기는 테마 대장주들이 거의 많이 들어와" + "선별판만 쓰게 해야 돼"]
-    깊은바닥 감시 유니버스 = ★선별기 유니버스 전용(대장주 순위표 폴백 없음).
-    기존: 대장주 순위표(daily_leader_board·66종목)만 봄 → 선별기 정원(200)에 든 급락 테마주를 통째로 놓침.
-    변경: 선별판 univ_codes(깔때기 통과 전체·코스닥/대금/시총1000억/주가2만)만 사용. 등급·수급·던짐 무관.
-    ★선별판이 없거나 비면 **빈 리스트** = 깊은바닥 그 사이클은 쉼(엉뚱한 유니버스로 사느니 안 산다).
-      보드는 09:00 태스크, 매매기는 09:01 태스크라 정상이면 항상 앞서 있음. 없으면 로그 1회 경고.
-    롤백: setx MF_DEEP_UNIV LEADER (대장주 순위표로 복귀)"""
+def _deep_universe(board, live_snapshot=None, high_range_codes=None):
+    """DEEP 관찰 = snapshot 전체; 돈맥판/고저폭30은 정렬 태그만 제공."""
     if os.environ.get("MF_DEEP_UNIV", "BOARD").strip().upper() == "LEADER":
         return _leader_codes()
+    board_codes = []
     try:
-        uc = board.get("univ_codes") if isinstance(board, dict) else None
-        if uc:
-            return [str(c).zfill(6) for c in uc]
+        board_codes = [str(c).zfill(6) for c in (board.get("univ_codes") or [])]
     except Exception:
         pass
-    if not _DU_WARNED[0]:
-        _DU_WARNED[0] = True
-        _log("⚠️ 선별판에 유니버스(univ_codes)가 없음 → 깊은바닥 대기(보드 기동 확인 필요)")
-    return []
+    if live_snapshot is None:
+        live_snapshot = _jload(Path(r"C:\stock_bot\IPC\live_micro_snapshot.json"))
+    snap_rows = live_snapshot.get("codes", {}) if isinstance(live_snapshot, dict) else {}
+    if not isinstance(snap_rows, dict) or not snap_rows:
+        if not _DU_WARNED[0]:
+            _DU_WARNED[0] = True
+            _log("⚠️ live_micro_snapshot 유니버스가 없음 → 깊은바닥 대기")
+        return []
+    snapshot_codes = []
+    seen = set()
+    for raw_code, row in snap_rows.items():
+        code = str(raw_code).zfill(6)
+        if isinstance(row, dict) and code not in seen:
+            snapshot_codes.append(code)
+            seen.add(code)
+    if high_range_codes is None:
+        watch = _jload(Path(r"C:\stock_bot\IPC\micro_watch_high_range.json"))
+        high_range_codes = watch.get("codes", []) if isinstance(watch, dict) else []
+    board_order = []
+    board_seen = set()
+    for code in board_codes:
+        if code in seen and code not in board_seen:
+            board_order.append(code)
+            board_seen.add(code)
+    high_set = {str(c).zfill(6) for c in (high_range_codes or [])}
+    both = [c for c in board_order if c in high_set]
+    board_only = [c for c in board_order if c not in high_set]
+    high_only = [c for c in snapshot_codes if c in high_set and c not in board_seen]
+    tagged = set(both + board_only + high_only)
+    return both + board_only + high_only + [c for c in snapshot_codes if c not in tagged]
 
 
 def _pmgap_map():
@@ -1154,6 +1172,11 @@ def _entries(bc, pos, hm, today, mode):
         pos["_budget"] = _bud
     board = _jload(BOARD)
     rows = board.get("rows", []) if isinstance(board, dict) else []
+    live_snapshot = _jload(Path(r"C:\stock_bot\IPC\live_micro_snapshot.json"))
+    live_codes = live_snapshot.get("codes", {}) if isinstance(live_snapshot, dict) else {}
+    high_range_watch = _jload(Path(r"C:\stock_bot\IPC\micro_watch_high_range.json"))
+    high_range_codes = {str(c).zfill(6) for c in (high_range_watch.get("codes", []) if isinstance(high_range_watch, dict) else [])}
+    board_univ_codes = {str(c).zfill(6) for c in (board.get("univ_codes", []) if isinstance(board, dict) else [])}
     excl = {str(k).zfill(6) for k, v in _jload(RT_OPEN).items() if isinstance(v, dict) and float(v.get("qty", 0) or 0) > 0}
     che_st = _jload(CHE_STATE)   # 보드가 누적한 che 저점(min)/표본(n) — 재진입 저점반등 판정용
     ma60_map = _ma60_map() if MA60_GATE else {}   # [통합대장②] 일60선 맵(상승진입 추세게이트용)
@@ -1172,9 +1195,11 @@ def _entries(bc, pos, hm, today, mode):
         _pvm = _prev_val_map() if DEEP_PVAL_MIN > 0 else {}   # ★[7/15] 어제 거래대금 필터용
         _row_by = {str(_r.get("code", "")).zfill(6): _r for _r in rows}
         _deep = []
-        for _dc in _deep_universe(board):      # [7/12] 대장주66 → 선별기 유니버스 전체(정원 200)
+        for _dc in _deep_universe(board, live_snapshot, high_range_codes):
             _dpc = _pcm.get(_dc)
             _dcs = che_st.get(_dc) if isinstance(che_st.get(_dc), dict) else {}
+            if not _dcs and isinstance(live_codes.get(_dc), dict):
+                _dcs = live_codes[_dc]
             _dlo = float(_dcs.get("lo", 0) or 0)
             if not _dpc or _dpc <= 0 or _dlo <= 0:
                 continue
@@ -1200,6 +1225,9 @@ def _entries(bc, pos, hm, today, mode):
                           "big": _br.get("big"), "chg": _br.get("chg"), "inst": _br.get("inst"),
                           "frgn": _br.get("frgn"), "prog": _br.get("prog"), "indiv": _br.get("indiv"),
                           "acc10": bool(_br.get("acc10")),   # [7/11 🤝] 외인&프로 10일 동반매집(보드 계산 승계)
+                          "money_flow_tag": _dc in board_univ_codes,
+                          "high_range30_tag": _dc in high_range_codes,
+                          "source_priority": int(_dc in board_univ_codes) + int(_dc in high_range_codes),
                           "gap": round(_dgap, 2), "gapdown": bool(_gapdown),   # ★[7/15] 갭하락 우선권용
                           "depth": round((_dlo / _dpc - 1) * 100, 2)})   # [7/11] 당일저점 전일比 깊이(%·음수)
             if _dc not in _DEEP_SEEN:
@@ -1254,7 +1282,8 @@ def _entries(bc, pos, hm, today, mode):
         _gap_prio = os.environ.get("MF_DEEP_GAP_PRIORITY", "YES").strip().upper() == "YES"
 
         def _deep_key(x):
-            k = []
+            # 돈맥판/고저폭30은 매수조건이 아니라 동일 조건 후보 간 우선순위 가산만 한다.
+            k = [-int(x.get("source_priority", 0) or 0)]
             if _gap_prio:
                 k.append(0 if x.get("gapdown") else 1)        # 0. ★갭하락 먼저(우선권)
             if _rev_prio:

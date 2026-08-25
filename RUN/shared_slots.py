@@ -10,12 +10,51 @@
 """
 import json, os, time
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 import msvcrt
 
 FILE = Path(os.environ.get("SHARED_SLOTS_FILE") or r"C:\stock_bot\data\shared_slots.json")
 MAX  = int(os.environ.get("SHARED_MAX_SLOTS", "6"))
 LOCK_TIMEOUT_SEC = float(os.environ.get("SHARED_SLOTS_LOCK_TIMEOUT_SEC", "2"))
+AUDIT_DIR = Path(os.environ.get("S01_S03_SLOT_AUDIT_DIR", r"C:\stock_bot\data\audit\s01_s03_slot_competition"))
+AUDIT_FRESH_SEC = float(os.environ.get("S01_S03_SLOT_READY_FRESH_SEC", "5"))
+REGIME_CACHE_DIR = Path(r"C:\stock_bot\DATA")
+_AUDIT_IDS = {"STRATEGY01": "S01", "STRATEGY03": "S03"}
+
+def _aid(value):
+    return _AUDIT_IDS.get(str(value).strip().upper(), "")
+
+def _epoch(value):
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return (dt.astimezone() if dt.tzinfo else dt.astimezone()).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+def _regime(day):
+    try:
+        row = json.loads((REGIME_CACHE_DIR / f"market_regime_{day}.json").read_text(encoding="utf-8-sig"))
+        value = str(row.get("regime") or "").upper()
+        return value if value in {"BULL", "NEUTRAL", "BEAR"} else "UNKNOWN"
+    except (OSError, ValueError, TypeError):
+        return "UNKNOWN"
+
+def _audit(day, sid, signal_ts, requested, ok, used, peer, owner, reason):
+    try:
+        path = AUDIT_DIR / f"s01_s03_slot_competition_{day}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {"timestamp": datetime.now().astimezone().isoformat(timespec="microseconds"),
+               "regime": _regime(day), "strategy_id": sid, "buy_ready_ts": str(signal_ts),
+               "slot_acquire_request_ts": requested.isoformat(timespec="microseconds"),
+               "acquire_success": bool(ok), "used_slots_before": int(used),
+               "peer_fresh_buy_ready": bool(peer), "final_slot_acquired_strategy": owner,
+               "result_reason": reason}
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
 
 
 @contextmanager
@@ -70,24 +109,38 @@ def has(code, today):
     return str(code).zfill(6) in _load(today).get("slots", {})
 
 
-def acquire(code, strat, today):
-    """슬롯 확보. 이미 내 종목이면 True(재매수). 풀 차면 False."""
-    code = str(code).zfill(6)
+def _acquire(code, strat, today, buy_ready_ts=""):
+    code = str(code).zfill(6); sid = _aid(strat) if buy_ready_ts else ""
+    requested = datetime.now().astimezone()
     try:
         with _exclusive_lock():
-            d = _load(today)
-            s = d.setdefault("slots", {})
-            if code in s:
-                # 다른 전략이 점유한 같은 종목은 중복진입 금지.
-                return s[code].get("strat") == strat
-            if len(s) >= MAX:
-                return False
-            s[code] = {"strat": strat}
-            d["date"] = today
-            _save(d)
-            return True
+            d = _load(today); slots = d.setdefault("slots", {}); used = len(slots); peer = False
+            if sid:
+                ready = d.setdefault("_s01_s03_audit_ready", {})
+                other = "S03" if sid == "S01" else "S01"
+                age = requested.timestamp() - _epoch((ready.get(other) or {}).get("buy_ready_ts"))
+                peer = 0.0 <= age <= AUDIT_FRESH_SEC
+                ready[sid] = {"buy_ready_ts": str(buy_ready_ts), "slot_acquire_request_ts": requested.isoformat(timespec="microseconds")}
+            if code in slots:
+                ok = slots[code].get("strat") == strat; reason = "OWN_SLOT_REUSE" if ok else "CODE_OWNED_BY_PEER"; owner = slots[code].get("strat")
+            elif len(slots) >= MAX:
+                ok = False; reason = "POOL_FULL"; owner = next(reversed(slots.values())).get("strat") if slots else ""
+            else:
+                slots[code] = {"strat": strat}; d["date"] = today; ok = True; reason = "ACQUIRED"; owner = strat
+            if (ok and reason == "ACQUIRED") or sid: _save(d)
+            if sid: _audit(today, sid, buy_ready_ts, requested, ok, used, peer, _aid(owner), reason)
+            return ok
     except TimeoutError:
+        if sid: _audit(today, sid, buy_ready_ts, requested, False, count(today), False, "", "LOCK_TIMEOUT")
         return False
+
+def acquire(code, strat, today):
+    """Unchanged first-come shared-slot decision."""
+    return _acquire(code, strat, today)
+
+def acquire_with_audit(code, strat, today, *, buy_ready_ts):
+    """Audit S01/S03 competition without changing the decision."""
+    return _acquire(code, strat, today, buy_ready_ts)
 
 
 def release(code, today):

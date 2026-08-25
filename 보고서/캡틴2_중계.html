@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="20">
+<title>스톡봇 통합 중계</title>
+<style>
+html,body{margin:0;background:#000;color:#e2e2e2;
+font-family:'Consolas','D2Coding','Malgun Gothic',monospace;font-size:18px;line-height:1.55;}
+.wrap{max-width:1160px;margin:0 auto;padding:22px 26px 60px;}
+.clock{font-size:25px;color:#a9c7ff;border-bottom:1px solid #333;padding-bottom:10px;}
+.clock b{color:#fff;float:right;}
+h2{font-size:16px;color:#7fb2ff;margin:22px 0 7px;}
+table{border-collapse:collapse;width:100%;}
+th{color:#8a8a8a;text-align:left;font-size:14px;border-bottom:1px solid #333;}
+td,th{padding:5px 12px 5px 0;white-space:nowrap;}
+.nm{color:#fff;} .up{color:#3ddc84;} .down{color:#ff6b6b;}
+.warn{color:#ffcf5c;} .dim{color:#888;} .big{font-size:20px;font-weight:700;}
+.events div{margin:2px 0;} .alert{margin-top:20px;padding:10px;color:#ffcf5c;border:1px solid #7b6225;}
+</style></head><body><div class="wrap"><div class="clock">스톡봇 통합 중계 <b>2026-08-25 15:30:01</b></div>
+<h2>전략 1·2·3·4·5·6 상태</h2>
+<table><tr><th>전략</th><th>게이트</th><th>심장박동</th><th>신호</th><th>당일종목</th><th>완료회전</th><th>보유</th></tr>
+<tr><td class="nm">전략 01 장초반 급상승 초입</td><td class="warn">LIVE</td><td class="warn">멈춤 의심 5분전</td><td>0</td><td>0/6</td><td>0</td><td>0</td></tr>
+<tr><td class="nm">전략 02 저점매수·매도소진</td><td class="warn">LIVE</td><td class="warn">멈춤 의심 5분전</td><td>8</td><td>3/15</td><td>3</td><td>0</td></tr>
+<tr><td class="nm">전략 03 골짜기 급반등</td><td class="warn">LIVE</td><td class="warn">멈춤 의심 5분전</td><td>5</td><td>0/6</td><td>0</td><td>0</td></tr>
+<tr><td class="nm">전략 04 눌림목</td><td class="warn">LIVE</td><td class="warn">멈춤 의심 5분전</td><td>0</td><td>0/6</td><td>0</td><td>0</td></tr>
+<tr><td class="nm">전략 05 장중 베이스 돌파</td><td class="warn">LIVE</td><td class="warn">멈춤 의심 5분전</td><td>1</td><td>1/6</td><td>1</td><td>0</td></tr>
+<tr><td class="nm">전략 06 급락 저점</td><td class="warn">LIVE</td><td class="warn">멈춤 의심 5분전</td><td>0</td><td>5/20</td><td>0</td><td>0</td></tr>
+</table>
+<h2>장전 3단계 검증</h2>
+<table><tr><th>권한</th><th>대상</th><th>결과</th><th>1·2·3단계</th><th>완료</th><th>사유</th></tr>
+<tr><td>HIGH</td><td>S01~S03</td><td class="up">PASS</td><td class="up">PASS/PASS/PASS</td><td>08:30:11</td><td>PASS</td></tr>
+<tr><td>LIMITED</td><td>S04</td><td class="up">PASS</td><td class="up">PASS/PASS/PASS</td><td>08:30:19</td><td>PASS</td></tr>
+</table>
+<h2>공용 슬롯 — 0/6</h2>
+<div class="dim">점유 없음</div>
+<h2>오늘 실제 체결</h2>
+<div>매수 <b>8</b>건 / 매도 <b>8</b>건</div><div>가격차 손익(세금·수수료 전) <span class="up big">+16,320원</span></div><div class="dim">순보유 0종목</div>
+<h2>전략별 보유</h2>
+<div class="dim">보유 없음</div>
+<h2>완결 매매</h2>
+<table>
+<tr><td>전략 05</td><td class="dim">10:07:51→10:20:41</td><td class="nm">403870</td><td class="dim">403870</td><td>46,050→45,550</td><td class="down big">-1.09%</td></tr>
+<tr><td>전략 06</td><td class="dim">10:27:39→10:28:18</td><td class="nm">477850</td><td class="dim">477850</td><td>23,050→23,100</td><td class="up big">+0.22%</td></tr>
+<tr><td>전략 02</td><td class="dim">10:36:57→10:53:20</td><td class="nm">356860</td><td class="dim">356860</td><td>35,600→35,800</td><td class="up big">+0.56%</td></tr>
+<tr><td>전략 06</td><td class="dim">12:08:00→12:24:09</td><td class="nm">199430</td><td class="dim">199430</td><td>14,350→14,350</td><td class="up big">+0.00%</td></tr>
+<tr><td>전략 06</td><td class="dim">12:21:56→12:38:59</td><td class="nm">094170</td><td class="dim">094170</td><td>30,700→30,800</td><td class="up big">+0.33%</td></tr>
+<tr><td>전략 06</td><td class="dim">12:05:02→12:40:50</td><td class="nm">174900</td><td class="dim">174900</td><td>26,850→27,500</td><td class="up big">+2.42%</td></tr>
+<tr><td>전략 02</td><td class="dim">10:39:48→13:30:07</td><td class="nm">131290</td><td class="dim">131290</td><td>235,500→251,000</td><td class="up big">+6.58%</td></tr>
+<tr><td>전략 02</td><td class="dim">09:54:27→15:10:04</td><td class="nm">304100</td><td class="dim">304100</td><td>15,760→16,080</td><td class="up big">+2.03%</td></tr>
+</table>
+<h2>최근 전략 이벤트</h2>
+<div class="events">
+<div class="down">13:30:08 전략 02 SELL_CONFIRMED 티에스이 S02_PEAK_5_DROP_1P2_FLOW_1OF4_EXIT score=3/4 peak=8.07% drop=1.38% age=6s cycle=1/2 gross=6.582% net_before_slippage=6.358% mfe=8.068% mae=-0.637% rank=1/1</div>
+<div class="">13:45:11 전략 02 POST_EXIT_AUDIT 티에스이 15m from_exit=0.199% from_entry=6.794%</div>
+<div class="">13:50:41 전략 06 CHASE_TRIGGER 원풍물산 drop=-8.30% low=707</div>
+<div class="">14:00:11 전략 02 POST_EXIT_AUDIT 티에스이 30m from_exit=-0.199% from_entry=6.369%</div>
+<div class="up">14:07:15 전략 06 BUY_BLOCKED 원풍물산 PRICE_BELOW_MIN</div>
+<div class="">14:30:10 전략 02 POST_EXIT_AUDIT 티에스이 60m from_exit=0.199% from_entry=6.794%</div>
+<div class="">15:08:54 전략 02 S02_EXIT_6S_SHADOW 솔트룩스 [HYPOTHETICAL] WATCH COMMON_PEAK_FLOW_WATCH 0s score=2/4 required=2 peak=2.98% drop=0.80%</div>
+<div class="">15:08:56 전략 02 S02_EXIT_6S_SHADOW 솔트룩스 [HYPOTHETICAL] SELL COMMON_PEAK_FLOW_EXIT score=2/4 peak=2.98% drop=0.80% age=3s</div>
+<div class="down">15:10:04 전략 02 SELL_QUERY_DEGRADED 솔트룩스 S02_INITIAL_OPEN_ORDER_BUDGET_EXPIRED</div>
+<div class="down">15:10:04 전략 02 SELL_PENDING 솔트룩스 TIME_EXIT_1510 / OK exact fill reconciliation</div>
+<div class="">15:10:06 전략 02 ORDER_NUMBER_CONFIRMED 솔트룩스 매도</div>
+<div class="down">15:10:06 전략 02 SELL_CONFIRMED 솔트룩스 TIME_EXIT_1510 cycle=1/2 gross=2.030% net_before_slippage=1.816% mfe=2.982% mae=-0.761% rank=1/1</div>
+</div></div></body></html>

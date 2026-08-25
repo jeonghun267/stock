@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from datetime import datetime, time as wall_time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping
+
+RUN_DIR = Path(__file__).resolve().parent
+if str(RUN_DIR) not in sys.path:
+    sys.path.insert(0, str(RUN_DIR))
 
 from strategy_common_hold_sell_v1 import (
     HoldSellObservation, HoldSellState, StrategyId, UnifiedHoldSellEngine,

@@ -60,6 +60,37 @@ def _mask_account(value: Any) -> str:
     return (raw[:4] + "**") if len(raw) >= 4 else "**"
 
 
+def _selector_tags_at_entry(code: Any, now: Optional[datetime] = None) -> Dict[str, str]:
+    """BUY 감사용 selector 소속 태그. 주문 판단에는 사용하지 않는다."""
+    today = (now or datetime.now()).strftime("%Y%m%d")
+    normalized = str(code or "").zfill(6)
+    result = {
+        "high_range_at_entry": "UNKNOWN",
+        "money_flow_at_entry": "UNKNOWN",
+    }
+    try:
+        payload = json.loads(Path(
+            r"C:\stock_bot\IPC\micro_watch_high_range.json"
+        ).read_text(encoding="utf-8-sig"))
+        source_day = str(payload.get("for_date") or "").replace("-", "")[:8]
+        if source_day == today:
+            codes = {str(item).zfill(6) for item in (payload.get("codes") or [])}
+            result["high_range_at_entry"] = "YES" if normalized in codes else "NO"
+    except Exception:
+        pass
+    try:
+        payload = json.loads(Path(
+            r"C:\stock_bot\data\돈흐름_선별판.json"
+        ).read_text(encoding="utf-8-sig"))
+        source_day = str(payload.get("ts") or "").replace("-", "")[:8]
+        if source_day == today:
+            codes = {str(item).zfill(6) for item in (payload.get("univ_codes") or [])}
+            result["money_flow_at_entry"] = "YES" if normalized in codes else "NO"
+    except Exception:
+        pass
+    return result
+
+
 # ─────────────────────────────────────────────────────────
 # [TR-CALLER 2026-07-11] 화면0001 호출자 특정 수술 — 모든 요청에 호출자 서명
 # 배경: broker_journal의 OnReceiveTrData 라인은 rqname/screen_no만 남는데,
@@ -665,6 +696,7 @@ class BrokerClient:
                     "error": f"send_order_real: order_type {order_type} 범위 외 (1~6)",
                     "data": None}
 
+        selector_tags = _selector_tags_at_entry(code) if order_type == 1 else {}
         payload = {
             "type":            "SENDORDER_REAL",
             "idempotency_key": str(idempotency_key),
@@ -677,6 +709,7 @@ class BrokerClient:
             "price":           int(price),
             "hoga_gb":         str(hoga_gb),
             "origin_order_no": str(origin_order_no),
+            **selector_tags,
             # [GHOST-WIN 2026-07-30] 실주문만 유예를 줄인다 — request()의 setdefault(timeout+5)보다
             #   이 명시값이 우선. 게이트웨이 쪽 상한(BROKER_ORDER_MAX_TTL_SEC=8)과 이중 방어.
             "ttl_sec":         max(1, int(timeout_sec) - _GHOST_MARGIN_SEC),

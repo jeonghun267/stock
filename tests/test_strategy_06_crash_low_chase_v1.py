@@ -96,33 +96,28 @@ class ChaseMachineTest(unittest.TestCase):
         return self.engine._positions().get(f"{CODE}:{n}")
 
     def test_universe_covers_all_high_range_with_crown_first(self) -> None:
-        """★[UNIVERSE-FIX 2026-08-06] 대상은 고저폭30 전체 · crown 은 우선순위일 뿐.
-
-        종전 시험은 'crown 만 본다'를 못박고 있었다. 그 동작 때문에 8/6 에
-        crown=1종목이라 -8% 급락 3건이 전부 감시 밖이었다(파일 상단 8/1 승인
-        설계는 "대상: 그날의 고저폭30"). 되돌리면 이 시험이 깨진다.
-        """
+        """고저폭·crown은 전체 snapshot 안에서 우선순위로만 작동한다."""
         other = "654320"
+        outside = "777770"
         write_json(self.config.watch_path, {
-            "codes": [other, CODE],
-            "crown_codes": [CODE],
-            "for_date": self.today,
-            "source_stale": False,
+            "codes": [other, CODE], "crown_codes": [CODE],
+            "for_date": self.today, "source_stale": False,
         })
+        write_json(self.config.snapshot_path, {"codes": {outside: {}, other: {}, CODE: {}}})
+        self.engine._snapshot_cache = (0.0, {})
         codes, block = self.engine._universe(self.now)
-        self.assertEqual(codes, [CODE, other])   # crown 먼저, 그다음 나머지
+        self.assertEqual(codes, [CODE, other, outside])
         self.assertEqual(block, "")
 
     def test_universe_keeps_watching_when_crown_is_empty(self) -> None:
-        """crown 이 비어도 고저폭 목록 전체는 계속 본다(종전엔 통째로 멈췄다)."""
+        """고저폭 정보가 비어도 snapshot 전체는 계속 본다."""
         other = "654320"
         write_json(self.config.watch_path, {
-            "codes": [other, CODE],
-            "crown_codes": [],
-            "crown_priority_codes": [],
-            "for_date": self.today,
-            "source_stale": False,
+            "codes": [other, CODE], "crown_codes": [], "crown_priority_codes": [],
+            "for_date": self.today, "source_stale": False,
         })
+        write_json(self.config.snapshot_path, {"codes": {other: {}, CODE: {}}})
+        self.engine._snapshot_cache = (0.0, {})
         codes, block = self.engine._universe(self.now)
         self.assertEqual(sorted(codes), sorted([CODE, other]))
         self.assertEqual(block, "")
@@ -139,6 +134,20 @@ class ChaseMachineTest(unittest.TestCase):
 
     def test_default_take_profit_is_five_percent(self) -> None:
         self.assertEqual(self.config.tp_pct, 5.0)
+
+    def test_under_10000_is_observed_but_order_is_blocked(self) -> None:
+        write_json(self.config.snapshot_path, {
+            "codes": {CODE: {"cur": 9999, "ts": self.now.isoformat()}},
+        })
+        self.engine._snapshot_cache = (0.0, {})
+        codes, block = self.engine._universe(self.now)
+        self.assertIn(CODE, codes)
+        self.assertEqual(block, "")
+        chase = ChaseState(low=9000.0)
+        with patch.object(self.engine, "_event") as event:
+            result = self.engine._try_entry(CODE, CODE, {"price": 9999.0}, chase, self.now)
+        self.assertEqual(result, "STOP")
+        self.assertEqual(event.call_args.kwargs["reason"], "PRICE_BELOW_MIN")
 
     def test_live_entry_acquires_and_releases_common_slot(self) -> None:
         class Broker:
@@ -240,12 +249,12 @@ class ChaseMachineTest(unittest.TestCase):
         core_b = "111110"
         core_a2 = "222220"
         write_json(self.config.watch_path, {
-            "codes": [core_b, CODE, core_a2],
-            "crown_codes": [core_b, CODE, core_a2],
-            "crown_priority_codes": [CODE, core_a2],
-            "for_date": self.today,
+            "codes": [core_b, CODE, core_a2], "crown_codes": [core_b, CODE, core_a2],
+            "crown_priority_codes": [CODE, core_a2], "for_date": self.today,
             "source_stale": False,
         })
+        write_json(self.config.snapshot_path, {"codes": {core_b: {}, CODE: {}, core_a2: {}}})
+        self.engine._snapshot_cache = (0.0, {})
         codes, block = self.engine._universe(self.now)
         self.assertEqual(codes, [CODE, core_a2, core_b])
         self.assertEqual(block, "")

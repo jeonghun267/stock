@@ -94,6 +94,7 @@ LOCKED_FIRST = os.environ.get("EOD_GAP_LOCKED_FIRST", "YES").strip().upper() == 
 #   ⚠️백테의 '점수'는 거래대금 대용치다(실전 점수식을 그대로 못 씀). 방향은 맞으나 근사.
 #   롤백: setx EOD_GAP_LOCKED_MIN_SCORE 75   (또는 setx EOD_GAP_LOCKED_FIRST NO)
 LOCKED_MIN_SCORE = float(os.environ.get("EOD_GAP_LOCKED_MIN_SCORE", "0") or "0")
+LOCKED_MIN_MARKETCAP = 100_000_000_000.0  # BrokerClient EODGAP 주문 하한과 동일: 1,000억원
 # 상한가에 한해 정배열(5>20>60) 관문 면제. 비-LOCKED는 종전대로 유지(거기선 검증 안 했다).
 JB_EXEMPT_LOCKED = os.environ.get("EOD_GAP_JB_EXEMPT_LOCKED", "YES").strip().upper() == "YES"
 # [2026-06-22 친구님] ★score경로가 잠긴 상한가(LOCKED=종가+28.5%↑=호가0=못삼) 1등을 고르면 체결안돼 NO_TRADE.
@@ -197,6 +198,27 @@ def _passes_locked_score(score):
         return float(score) >= LOCKED_MIN_SCORE
     except (TypeError, ValueError):
         return False
+
+
+def _passes_locked_marketcap(cand):
+    """LOCKED PICK 전에 BrokerClient와 같은 시총 하한을 미리 적용한다."""
+    try:
+        from broker_client import _load_shares_cache
+        code = str(cand[1]).zfill(6)
+        price = float(cand[4] or 0)
+        shares = float(_load_shares_cache().get(code, 0) or 0)
+        if price <= 0 or shares <= 0:  # BrokerClient와 동일한 fail-open
+            return True
+        marketcap = shares * price
+        if marketcap < LOCKED_MIN_MARKETCAP:
+            _log(
+                f"[LOCKED-MCAP] {code} {marketcap/1e8:.0f}억<1000억 "
+                "→ PICK 사전제외"
+            )
+            return False
+        return True
+    except Exception:
+        return True
 
 
 def _save_live_board_cache(rows, now=None):
@@ -1417,6 +1439,7 @@ def mode_pick():
         # [LOCKED-FLOOR 2026-08-14] 상한가에는 LOCKED_MIN_SCORE 를 쓴다(기본 0=면제).
         #   종전엔 _passes_final_score(MIN_SCORE 70~75)를 공유해 이 경로가 늘 죽었다.
         _lk = [c for c in cands if c[8] and _passes_locked_score(c[0])
+               and _passes_locked_marketcap(c)
                and (VAL_CEIL_EOK <= 0 or c[3] <= VAL_CEIL_EOK)]
         if _lk:
             _lk_d2 = {}

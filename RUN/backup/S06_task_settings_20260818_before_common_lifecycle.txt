@@ -1,0 +1,2 @@
+STRATEGY06_LIVE DisallowStartIfOnBatteries=True StopIfGoingOnBatteries=True StartWhenAvailable=False MultipleInstances=IgnoreNew
+SAFEPLUS_STRATEGY_ENGINE_RECOVERY DisallowStartIfOnBatteries=True StopIfGoingOnBatteries=True StartWhenAvailable=False MultipleInstances=IgnoreNew

@@ -44,7 +44,7 @@ def build_config() -> Config:
         fill_wait_sec=float(os.environ.get("S04_FILL_WAIT_SEC", "8")),
         loop_sec=float(os.environ.get("S04_LOOP_SEC", "1")),
         entry_start=day_time(10, 0),
-        entry_end=day_time(12, 0),
+        entry_end=day_time(14, 30),
         force_exit=day_time(15, 10),
         process_end=day_time(15, 25),
         state_schema="strategy_04_rotation_engine_v1",

@@ -297,7 +297,8 @@ def _run_cycle(scripts: dict, cycle: int) -> None:
             if rc == 0:
                 print("[OK] PREFLIGHT done.", flush=True)
             else:
-                print(f"[WARN] PREFLIGHT RC={rc} - size_mult=1.0 폴백 사용", flush=True)
+                print(f"[FAIL] PREFLIGHT RC={rc} - 이번 사이클 중단.", flush=True)
+                return
 
     # STEP 1: INTRADAY
     print(f"\n[STEP 1] INTRADAY  [{_ts()}]", flush=True)

@@ -15,4 +15,4 @@ REM   stale approval, but never writes a new one, so the OFF gate holds.
 REM   TO RE-ENABLE S04: append  --approve  to the python line below. Nothing else.
 set PYTHONDONTWRITEBYTECODE=1
 cd /d C:\stock_bot\RUN
-C:\python310\python.exe -B -X utf8 C:\stock_bot\RUN\strategy_04_preflight_v1.py >> C:\stock_bot\data\LOG\sched_STRATEGY04_PREFLIGHT.log 2>&1
+C:\python310\python.exe -B -X utf8 C:\stock_bot\RUN\strategy_04_preflight_v1.py --approve >> C:\stock_bot\data\LOG\sched_STRATEGY04_PREFLIGHT.log 2>&1

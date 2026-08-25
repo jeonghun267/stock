@@ -37,6 +37,8 @@ RUN_DIR = Path(__file__).resolve().parent
 if str(RUN_DIR) not in sys.path:
     sys.path.insert(0, str(RUN_DIR))
 
+from live_owner_approval_guard_v1 import verify_live_hashes
+
 ROOT = Path(r"C:\stock_bot")
 RUN = ROOT / "RUN"
 DATA = ROOT / "data"
@@ -54,6 +56,22 @@ results: list[tuple[str, str, str]] = []   # (level, name, detail)
 
 def add(level: str, name: str, detail: str) -> None:
     results.append((level, name, detail))
+
+
+def check_live_owner_approval_hashes() -> None:
+    """Catch live-engine hash drift before the scheduled launchers run."""
+    failures = []
+    for strategy in ("S01", "S02", "S03", "S06"):
+        passed, errors = verify_live_hashes(strategy)
+        if not passed:
+            failures.append(f"{strategy}:" + " | ".join(errors[:3]))
+    if failures:
+        add(
+            "FAIL", "실전 승인 해시",
+            f"{len(failures)}개 전략 불일치 - " + " || ".join(failures),
+        )
+    else:
+        add("PASS", "실전 승인 해시", "S01·S02·S03·S06 승인 장부와 일치")
 
 
 def local_modules() -> set[str]:
@@ -981,6 +999,7 @@ def main() -> int:
     check_lowfind_contract()
     check_anchor_pipe()
     check_sellhold_contract()
+    check_live_owner_approval_hashes()
     check_elevated_path()
     check_tasks()
     check_data_freshness()   # [DATA-GUARD 2026-08-14]

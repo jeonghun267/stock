@@ -41,6 +41,8 @@ from strategy_03_signal_contract_v1 import (
     production_file_sha256,
     EARLY_LOW_MAX_REBOUND_PCT,
     EARLY_LOW_MIN_REBOUND_PCT,
+    EARLY_LOW_FAST_REBOUND_MAX_PCT,
+    EARLY_LOW_FAST_REBOUND_REASON,
     FIRST_REBOUND_PCT,
     INTRADAY_CRASH_LANE,
     MIN_HIGHER_LOW_PCT,
@@ -298,7 +300,7 @@ class EarlyLowDetector:
             return self._row(point, "DONE", "EARLY_LOW_REBOUND_CHASE_BLOCKED")
 
         rebound = (point.price / state.anchor_low - 1.0) * 100.0
-        if rebound > EARLY_LOW_MAX_REBOUND_PCT:
+        if rebound > EARLY_LOW_FAST_REBOUND_MAX_PCT:
             state.chase_blocked = True
             return self._row(point, "DONE", "EARLY_LOW_REBOUND_CHASE_LIMIT")
         if not allow_signal:
@@ -322,7 +324,12 @@ class EarlyLowDetector:
             return self._row(point, "WAIT", "EARLY_LOW_NO_BUY_SPEED_LEAD")
 
         state.emitted = True
-        return self._row(point, "BUY_READY", "S03_EARLY_LOW_REBOUND+BUY_SPEED_LEAD")
+        reason = (
+            EARLY_LOW_FAST_REBOUND_REASON
+            if rebound > EARLY_LOW_MAX_REBOUND_PCT
+            else "S03_EARLY_LOW_REBOUND+BUY_SPEED_LEAD"
+        )
+        return self._row(point, "BUY_READY", reason)
 
 
 @dataclass
@@ -987,6 +994,34 @@ def load_prior_profile_universe(
     return output
 
 
+def load_latest_prior_profiles(
+    path: Path,
+    *,
+    current_day: str,
+) -> tuple[str, dict[str, PriorProfile]]:
+    """Load every code from the latest EOD trading date before current_day."""
+    selected_date = ""
+    output: dict[str, PriorProfile] = {}
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                row_date = str(row.get("date") or "").replace("-", "")[:8]
+                if len(row_date) != 8 or row_date >= current_day or row_date < selected_date:
+                    continue
+                code = str(row.get("code") or "").zfill(6)
+                op, high, low = _number(row.get("open")), _number(row.get("high")), _number(row.get("low"))
+                close, value = _number(row.get("close")), _number(row.get("value"))
+                if close <= 0 or high < low:
+                    continue
+                if row_date > selected_date:
+                    selected_date, output = row_date, {}
+                span = high - low
+                output[code] = PriorProfile(previous_close=close, previous_value=value, previous_range_pct=((high-low)/op*100.0 if op>0 else 0.0), previous_close_position=((close-low)/span if span>0 else 0.5))
+    except (OSError, csv.Error):
+        return "", {}
+    return selected_date, output
+
+
 class RapidReboundMonitor:
     def __init__(self) -> None:
         self.early_detectors: dict[str, EarlyLowDetector] = {}
@@ -1162,23 +1197,16 @@ def load_live_points(
     opens: Mapping[str, float],
     open_codes: set[str],
     lows: Mapping[str, float] | None = None,
-) -> tuple[list[tuple[str, str, MicroPoint, PriorProfile]], str]:
+) -> tuple[list[tuple[str, str, MicroPoint, PriorProfile | None]], str]:
     today = now.strftime("%Y%m%d")
     if str(watch.get("for_date") or "").replace("-", "")[:8] != today:
         return [], "WATCH_DATE_MISMATCH"
-    codes = {str(code).zfill(6) for code in (watch.get("codes") or [])}
-    # ★[2026-07-31] 고저폭 TOP30 = all_meta 에 hr_rank 가 실린 종목(위 주석 참조).
-    hr_codes = {str(c).zfill(6) for c, m in (watch.get("all_meta") or {}).items()
-                if isinstance(m, Mapping) and m.get("hr_rank") is not None}
     snapshot = _read_json(config.snapshot_path)
     names = _name_map(_read_json(config.names_path))
     output = []
     for code, raw in (snapshot.get("codes") or {}).items():
         code = str(code).zfill(6)
-        if code not in codes or code not in profiles or not isinstance(raw, Mapping):
-            continue
-        # hr_codes 가 비면(고저폭 목록 실패) 제한하지 않는다(fail-open).
-        if HIGH_RANGE_ONLY and hr_codes and code not in hr_codes:
+        if not isinstance(raw, Mapping):
             continue
         ts = _parse_dt(raw.get("ts"), now)
         if ts is None:
@@ -1198,11 +1226,6 @@ def load_live_points(
         #   되돌리기: backup\골짜기_급반등_20260806_before_open_price_fix.py
         open_price = _number(raw.get("op")) or _number(opens.get(code))
         if price <= 0 or buy_cum < 0 or sell_cum < 0:
-            continue
-        if code in open_codes:
-            if 0 < open_price < config.min_price:
-                continue
-        elif price < config.min_price:
             continue
         point = MicroPoint(
             ts=ts,
@@ -1225,7 +1248,7 @@ def load_live_points(
             best_ask_qty=abs(_number(raw.get("best_ask_qty"))),
             best_bid_qty=abs(_number(raw.get("best_bid_qty"))),
         )
-        output.append((code, names.get(code, code), point, profiles[code]))
+        output.append((code, names.get(code, code), point, profiles.get(code)))
     return output, ("LIVE" if output else "DATA_WAIT")
 
 
@@ -1347,7 +1370,7 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
     deep_shadow_ledger = DeepCrashShadowLedger("")
     deep_shadow_ledger_path = config.event_dir / "strategy_03_deep_crash_shadow_empty.json"
     profile_key: tuple[Any, ...] | None = None
-    profile_universe: dict[tuple[str, str], PriorProfile] = {}
+    profile_date = ""
     profiles: dict[str, PriorProfile] = {}
     # ★[EARLY-LOW-AUDIT 2026-08-12] 장초 레인 생산 감사 — 상태가 바뀐 순간의
     #   원시 입력(브로커 당일저가·현재가·앵커)을 해시 사슬 JSONL 로 남긴다.
@@ -1385,9 +1408,8 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
         open_codes = _current_watch_codes(open_watch, day)
         intraday_codes = _current_watch_codes(shared_watch, day)
         early_high_range_codes = _early_high_range_codes(early_watch, day)
-        # 장초 전용 경로는 공통 감시종목 전체를 항상 본다. 고저폭 목록이 낡아도
-        # open/intraday 감시대상까지 0개로 축소하지 않는다.
-        early_codes = open_codes | intraday_codes | early_high_range_codes
+        # Existing watch sources remain metadata and operational counters only.
+        early_codes: set[str] = set()
         open_source_date = str(open_watch.get("source_date") or "")
         intraday_source_date = str(shared_watch.get("source_date") or "")
         early_source_date = str(early_watch.get("source_date") or "")
@@ -1396,39 +1418,12 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
             eod_signature = (eod_stat.st_mtime_ns, eod_stat.st_size)
         except OSError:
             eod_signature = (0, 0)
-        new_profile_key = (
-            open_source_date,
-            intraday_source_date,
-            early_source_date,
-            eod_signature,
-        )
+        new_profile_key = (day, eod_signature)
         if new_profile_key != profile_key:
-            profile_universe = load_prior_profile_universe(
-                config.eod_path,
-                source_dates={
-                    open_source_date, intraday_source_date, early_source_date,
-                },
-            )
+            profile_date, profiles = load_latest_prior_profiles(config.eod_path, current_day=day)
             profile_key = new_profile_key
-        profiles = {
-            code: profile_universe[(open_source_date, code)]
-            for code in open_codes
-            if (open_source_date, code) in profile_universe
-        }
-        profiles.update({
-            code: profile_universe[(intraday_source_date, code)]
-            for code in intraday_codes
-            if (intraday_source_date, code) in profile_universe
-        })
-        profiles.update({
-            code: profile_universe[(early_source_date, code)]
-            for code in early_high_range_codes
-            if code not in profiles
-            and (early_source_date, code) in profile_universe
-        })
 
-        union_codes = open_codes | intraday_codes | early_codes
-        combined_watch = {"for_date": day, "codes": sorted(union_codes)}
+        combined_watch = {"for_date": day}
         # The first EOD scan can take seconds.  Snapshot freshness must be
         # measured against the decision time, not the stale loop-start time.
         now = datetime.now(KST).replace(tzinfo=None)
@@ -1436,14 +1431,60 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
             config, now=now, watch=combined_watch, profiles=profiles,
             opens=opens,
             lows=lows,
-            open_codes=union_codes,
+            open_codes=open_codes,
         )
+        union_codes = {code for code, _name, _point, _profile in points}
+        early_codes = set(union_codes)
         open_signals: list[dict[str, Any]] = []
         intraday_signals: list[dict[str, Any]] = []
         early_signals: list[dict[str, Any]] = []
+        profile_missing_count = 0
         low_gauge_rows: list[dict[str, Any]] = []  # ★[2026-08-06] 계기판 그림자
         market_pct = read_market_change_pct(now)
         for code, name, point, profile in points:
+            if profile is None:
+                profile_missing_count += 1
+                missing_row = {
+                    "action": "WAIT",
+                    "reason": "S03_PRIOR_PROFILE_MISSING",
+                    "entry_lane": EARLY_LOW_LANE,
+                    "code": code,
+                    "name": name,
+                    "ts": point.ts.isoformat(timespec="microseconds"),
+                    "price": point.price,
+                }
+                monitor.latest[f"PROFILE:{code}"] = missing_row
+                missing_key = ("WAIT", "S03_PRIOR_PROFILE_MISSING")
+                if (
+                    early_audit is not None
+                    and early_audit_last.get(code) != missing_key
+                ):
+                    early_audit_last[code] = missing_key
+                    early_audit.append({
+                        "event": "PROFILE_MISSING",
+                        "entry_lane": EARLY_LOW_LANE,
+                        "code": code,
+                        "name": name,
+                        "snapshot_ts": point.ts.isoformat(
+                            timespec="microseconds"),
+                        "current_price": point.price,
+                        "snapshot_op": point.open_price,
+                        "snapshot_lo": point.broker_day_low,
+                        "buy_money_cum": point.buy_money_cum,
+                        "sell_money_cum": point.sell_money_cum,
+                        "best_ask_px": point.best_ask_px,
+                        "best_bid_px": point.best_bid_px,
+                        "best_ask_qty": point.best_ask_qty,
+                        "best_bid_qty": point.best_bid_qty,
+                        "anchor_low": 0.0,
+                        "anchor_low_ts": "",
+                        "signal_ts": "",
+                        "signal_ts_exact": "",
+                        "action": "WAIT",
+                        "reason": "S03_PRIOR_PROFILE_MISSING",
+                        "prod_sha": early_audit_sha,
+                    })
+                continue
             shadow_meta = relative_strength_shadow.evaluate(
                 code=code,
                 ts=point.ts,
@@ -1477,7 +1518,7 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
                         _pre_detector.state.anchor_low if _pre_detector else 0.0),
                     "anchor_low_ts": (
                         _pre_detector.state.anchor_low_ts.isoformat(
-                            timespec="milliseconds")
+                            timespec="microseconds")
                         if _pre_detector and _pre_detector.state.anchor_low_ts
                         else ""),
                     "chase_blocked": bool(
@@ -1487,7 +1528,7 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
                         _pre_detector.state.emitted if _pre_detector else False),
                     "flow_points": [
                         {
-                            "ts": flow_point.ts.isoformat(timespec="milliseconds"),
+                            "ts": flow_point.ts.isoformat(timespec="microseconds"),
                             "price": flow_point.price,
                             "buy_money_cum": flow_point.buy_money_cum,
                             "sell_money_cum": flow_point.sell_money_cum,
@@ -1526,21 +1567,28 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
                     early_audit_last[code] = _state_key
                     early_audit.append({
                         "event": "DECISION",
+                        "entry_lane": EARLY_LOW_LANE,
                         "code": code,
                         "name": name,
                         "hr_rank": (range_meta.get(code) or {}).get("hr_rank"),
                         "snapshot_ts": point.ts.isoformat(
-                            timespec="milliseconds"),
+                            timespec="microseconds"),
                         "current_price": point.price,
+                        "snapshot_op": point.open_price,
+                        "snapshot_lo": point.broker_day_low,
                         "broker_day_low": point.broker_day_low,
                         "buy_money_cum": point.buy_money_cum,
                         "sell_money_cum": point.sell_money_cum,
+                        "best_ask_px": point.best_ask_px,
+                        "best_bid_px": point.best_bid_px,
+                        "best_ask_qty": point.best_ask_qty,
+                        "best_bid_qty": point.best_bid_qty,
                         "allow_signal": _early_allow,
                         "pre_state": _pre_state,
                         "anchor_low": _post_state.anchor_low,
                         "anchor_low_ts": (
                             _post_state.anchor_low_ts.isoformat(
-                                timespec="milliseconds")
+                                timespec="microseconds")
                             if _post_state.anchor_low_ts else ""),
                         "chase_blocked": bool(_post_state.chase_blocked),
                         "emitted": bool(_post_state.emitted),
@@ -1558,6 +1606,9 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
                         "reason": str(early_row.get("reason") or ""),
                         "signal_ts": (
                             str(early_row.get("ts") or "")
+                            if early_fired else ""),
+                        "signal_ts_exact": (
+                            point.ts.isoformat(timespec="microseconds")
                             if early_fired else ""),
                         "signal_price": (
                             float(early_row.get("price") or 0.0)
@@ -1600,7 +1651,9 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
             "early_watch_count": len(early_codes),
             "open_watch_count": len(open_codes),
             "intraday_watch_count": len(intraday_codes),
+            "profile_date": profile_date,
             "profile_count": len(profiles),
+            "profile_missing_count": profile_missing_count,
             "signals": monitor.signals[-1000:],
             "candidates": list(monitor.latest.values()),
         }

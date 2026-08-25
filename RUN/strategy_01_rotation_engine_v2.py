@@ -1540,9 +1540,14 @@ class Strategy01Engine:
                     )
                     self._save()
                     return
-                if not self.slots.acquire(
-                    code, self.config.slot_owner, self.state["date"]
-                ):
+                audit_acquire = getattr(self.slots, "acquire_with_audit", None)
+                acquired = (
+                    audit_acquire(code, self.config.slot_owner, self.state["date"],
+                                  buy_ready_ts=str(signal.get("ts") or ""))
+                    if audit_acquire is not None
+                    else self.slots.acquire(code, self.config.slot_owner, self.state["date"])
+                )
+                if not acquired:
                     self._event(
                         "BUY_WAIT", code=code, name=name,
                         reason="SHARED_SLOT_OR_DUPLICATE",

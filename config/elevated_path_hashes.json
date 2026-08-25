@@ -4,7 +4,7 @@
   "_근본차단": "태스크 RunLevel 을 Limited 로 낮추는 것. 관리자 셸에서만 된다. 브로커 계열 3개(PIPELINE_0900·WATCHDOG_BROKER·BROKER_NIGHT_STOP)는 브로커를 죽이고 살려야 해서 Highest 가 필요하다.",
   "_다시만들기": "C:\\python310\\python.exe C:\\stock_bot\\RUN\\morning_preflight_rehearsal_v1.py --rebaseline-elevated",
   "_주의": "일부러 고친 뒤에만 다시 만들 것. 먼저 다시 만들고 나중에 확인하면 검사가 무의미해진다.",
-  "생성": "2026-08-20T18:04:04",
+  "생성": "2026-08-25T08:36:57",
   "파일": {
     "RUN\\_run_hidden_wait.vbs": "c0ac14545cc05ce19b58106922dbf0189bf226d8296d43ded14f4bcc8f48266e",
     "RUN\\broker_night_stop.ps1": "415e983374a11e6ec1f17b27f301147675b0ec253b1ca9d9d7f696d05db80a71",
@@ -16,11 +16,11 @@
     "RUN\\hidden\\SAFEPLUS_STRATEGY01_LIVE.cmd": "fd6f3982f45a5fcec6ba8c4b0cc0e994af3beb149e010c9a2886c848090c9944",
     "RUN\\hidden\\SAFEPLUS_STRATEGY01_SIGNAL.cmd": "97acff5ce6d179200ffc9c5b07a6eb9c3f1264a74a8507d1502db3cae6e6334f",
     "RUN\\hidden\\SAFEPLUS_STRATEGY02_LIVE.cmd": "5cd1b383e7003366b564f437b716085205cbad68df367f94f60fbb905607b9c8",
-    "RUN\\hidden\\SAFEPLUS_STRATEGY02_SIGNAL.cmd": "23bdaab756f965452a1000e503341a09e6105dfb8d44ccc9a08fbbd88101bbc8",
-    "RUN\\hidden\\SAFEPLUS_STRATEGY03_LIVE_ASCII.cmd": "0040aa3130ace1508bd13fb80e8919ba7413bf52d710763daac500ee1244f157",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY02_SIGNAL.cmd": "d0dc21f9cf7d9c3cb36e03681f9bf4b041a28d4151277f4e34cfd55a09eb4e84",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY03_LIVE_ASCII.cmd": "677c1f62885c10fd1a2858503d94aea5e1a3373aa273724603e8eacb68a69800",
     "RUN\\hidden\\SAFEPLUS_STRATEGY03_PREFLIGHT.cmd": "f0ac896aeb6ca1572dfe5059dcdadd08f11fba8eefb6bcf43c8aff1d5662ddf5",
-    "RUN\\hidden\\SAFEPLUS_STRATEGY03_SIGNAL_ASCII.cmd": "307b084c6ee188575354e85b47f1abd3e563434fe2424f8a6e6fbf8c102169d6",
-    "RUN\\broker_gateway_v1.py": "745d890d4909f1b883a269e1ccf109dd306b49c0a7478eab14aa9a4bdc65f3a9",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY03_SIGNAL_ASCII.cmd": "a9eae6f653f010b7521d73421ef9556ebb4439b08ae185ad0a21ce8e5fe8a1c4",
+    "RUN\\broker_gateway_v1.py": "3f30c6f9e0efd233afa3b89142f7829921040f0ff843d864fe7b0abc6dce33a3",
     "RUN\\ipc_order_auth_v1.py": "addb23dcfe05241bdf4251b4d49d35d8549d228283c8a7f83f05dc79b7561c40"
   }
 }

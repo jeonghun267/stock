@@ -39,6 +39,8 @@ from strategy_03_signal_contract_v1 import (
     EARLY_LOW_LANE,
     EARLY_LOW_MAX_REBOUND_PCT,
     EARLY_LOW_MIN_REBOUND_PCT,
+    EARLY_LOW_FAST_REBOUND_MAX_PCT,
+    EARLY_LOW_FAST_REBOUND_REASON,
     EarlyLowAuditChain,
     production_file_sha256,
     # ★[S03-LANE-FIX 2026-08-06 친구님 지시 "가로 해"] 2번 레인 잣대를 새로 가져온다.
@@ -78,6 +80,7 @@ from strategy_03_flow_turn_fast_v1 import (
 #   이유를 남기는 기록 전용 경로. 판정 로직은 건드리지 않는다.
 DROP_LOG_DIR = Path(r"C:\stock_bot\data\audit\s03_engine_drop")
 S03_REGIME_PATH = Path(r"C:\stock_bot\data\BACKTEST\regime_std_shadow.csv")
+S03_ORDER_MIN_PRICE = 10_000.0
 _REGIME_CACHE: dict[str, Any] = {"mtime_ns": None, "rows": []}
 
 
@@ -183,6 +186,7 @@ def make_strategy03_signal_selector(
     flow_turn_live_enabled: bool | None = None,
     bottom_all_lanes_live_enabled: bool | None = None,
     regime_path: Path = S03_REGIME_PATH,
+    audit_stream: str = "engine",
 ):
     """Recheck the S06-style staircase price band and live flow before ordering."""
     if early_low_live_enabled is None:
@@ -225,7 +229,8 @@ def make_strategy03_signal_selector(
     ])
 
     def _audit_early_rows(payload, rows, validated, candidate_validated,
-                          snapshot, now, max_age_sec, consumed):
+                          snapshot, now, max_age_sec, consumed,
+                          price_guard_blocked):
         early_rows = [
             row for row in (payload.get("signals") or [])
             if isinstance(row, Mapping)
@@ -237,7 +242,7 @@ def make_strategy03_signal_selector(
         day = now.strftime("%Y%m%d")
         chain = _audit_chains.get(day)
         if chain is None:
-            chain = EarlyLowAuditChain("engine", day)
+            chain = EarlyLowAuditChain(audit_stream, day)
             _audit_chains.clear()
             _audit_chains[day] = chain
             _audit_seen.clear()
@@ -286,6 +291,7 @@ def make_strategy03_signal_selector(
             raw = codes.get(code)
             written = chain.append({
                 "event": "ORDER_GATE",
+                "entry_lane": EARLY_LOW_LANE,
                 "code": code,
                 "name": str(row.get("name") or ""),
                 "hr_rank": row.get("hr_rank"),
@@ -307,6 +313,24 @@ def make_strategy03_signal_selector(
                 "snapshot_raw": dict(raw) if isinstance(raw, Mapping) else None,
                 "snapshot_ts": (
                     str(raw.get("ts") or "") if isinstance(raw, Mapping) else ""),
+                "snapshot_op": (
+                    abs(number(raw.get("op"))) if isinstance(raw, Mapping)
+                    else 0.0),
+                "snapshot_lo": (
+                    abs(number(raw.get("lo"))) if isinstance(raw, Mapping)
+                    else 0.0),
+                "best_ask_px": (
+                    abs(number(raw.get("best_ask_px"))) if isinstance(raw, Mapping)
+                    else 0.0),
+                "best_bid_px": (
+                    abs(number(raw.get("best_bid_px"))) if isinstance(raw, Mapping)
+                    else 0.0),
+                "best_ask_qty": (
+                    abs(number(raw.get("best_ask_qty"))) if isinstance(raw, Mapping)
+                    else 0.0),
+                "best_bid_qty": (
+                    abs(number(raw.get("best_bid_qty"))) if isinstance(raw, Mapping)
+                    else 0.0),
                 "current_price": (
                     abs(number(raw.get("cur"))) if isinstance(raw, Mapping)
                     else 0.0),
@@ -320,7 +344,11 @@ def make_strategy03_signal_selector(
                 "chase_blocked": bool(row.get("chase_blocked")),
                 "signal_ts": str(row.get("ts") or ""),
                 "signal_price": number(row.get("price")),
-                "decision_now": now.isoformat(timespec="milliseconds"),
+                "decision_now": now.isoformat(timespec="microseconds"),
+                "selector_ts": now.isoformat(timespec="microseconds"),
+                "selector_terminal_reason": (
+                    "S03_PRICE_BELOW_10000" if key in price_guard_blocked else ""
+                ),
                 "max_age_sec": float(max_age_sec),
                 "snapshot_max_age_sec": float(snapshot_max_age_sec),
                 "consumed": sorted(str(item) for item in consumed),
@@ -363,6 +391,7 @@ def make_strategy03_signal_selector(
         snapshot = read_json(snapshot_path, {})
         codes = snapshot.get("codes") or {}
         decision_at = parse_dt(now.isoformat(), now)
+        price_guard_blocked: set[tuple[str, str]] = set()
 
         # ★[DROP-REASON-LOG 2026-08-19 친구님 지시 "탈락 사유 기록"] 기록 전용 —
         #   판정 로직 무변경. 기록 실패는 삼켜서 주문 판정을 깨지 않는다.
@@ -432,6 +461,13 @@ def make_strategy03_signal_selector(
             if price <= 0 or anchor_low <= 0:
                 _drop(row, "PRICE_OR_ANCHOR_INVALID",
                       price=price, anchor_low=anchor_low)
+                continue
+            if price < S03_ORDER_MIN_PRICE:
+                price_guard_blocked.add((
+                    str(row.get("code") or "").zfill(6),
+                    str(row.get("ts") or ""),
+                ))
+                _drop(row, "S03_PRICE_BELOW_10000", price=price)
                 continue
             rebound = (price / anchor_low - 1.0) * 100.0
 
@@ -565,7 +601,13 @@ def make_strategy03_signal_selector(
             lane = str(row.get("entry_lane") or OPEN_CRASH_LANE)
             bottom_shadow = _record_bottom_confirm_shadow(lane)
             if lane == EARLY_LOW_LANE:
-                if not EARLY_LOW_MIN_REBOUND_PCT <= rebound <= EARLY_LOW_MAX_REBOUND_PCT:
+                signal_reason = str(row.get("reason") or "")
+                rebound_valid = (
+                    EARLY_LOW_MAX_REBOUND_PCT < rebound <= EARLY_LOW_FAST_REBOUND_MAX_PCT
+                    if signal_reason == EARLY_LOW_FAST_REBOUND_REASON
+                    else EARLY_LOW_MIN_REBOUND_PCT <= rebound <= EARLY_LOW_MAX_REBOUND_PCT
+                )
+                if not rebound_valid:
                     _drop(row, "EARLY_LOW_REBOUND_OUT_OF_BAND",
                           price=price, rebound_pct=round(rebound, 4))
                     continue
@@ -647,7 +689,7 @@ def make_strategy03_signal_selector(
         try:
             audit_failed = _audit_early_rows(
                 payload, rows, validated, candidate_validated, snapshot, decision_at,
-                max_age_sec, consumed,
+                max_age_sec, consumed, price_guard_blocked,
             )
         except Exception as exc:  # noqa: BLE001
             print(

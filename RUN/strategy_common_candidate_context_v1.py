@@ -442,6 +442,10 @@ def publish_once(
         profiles = loaded_profiles
     shared_base = _read_json(SHARED_PATH)
     valley_base = _read_json(VALLEY_PATH)
+    if not _ordered_unique(
+        valley_base.get("base_codes") or valley_base.get("codes") or []
+    ):
+        raise RuntimeError("VALLEY_BASE_EMPTY_PRESERVE_LAST")
     shared, valley, audit = build_context(
         now=now,
         shared_base=shared_base,

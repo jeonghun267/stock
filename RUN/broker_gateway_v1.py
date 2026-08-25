@@ -3521,6 +3521,8 @@ class BrokerGateway:
                 "request_id": request_id,
                 "created_at": datetime.now().isoformat(),
                 "order_fingerprint": order_fingerprint,
+                "high_range_at_entry": req.get("high_range_at_entry", "UNKNOWN"),
+                "money_flow_at_entry": req.get("money_flow_at_entry", "UNKNOWN"),
             },
             "error": "SENDORDER_IN_FLIGHT_RECONCILE_REQUIRED",
         }
@@ -3541,8 +3543,9 @@ class BrokerGateway:
             return
 
         logger.info(
-            "[SENDORDER-REAL] key=%s account=%s code=%s qty=%d price=%d type=%d hoga=%s rqname=%s",
+            "[SENDORDER-REAL] key=%s account=%s code=%s qty=%d price=%d type=%d hoga=%s rqname=%s high_range_at_entry=%s money_flow_at_entry=%s",
             idempotency_key, _mask_acct(account), code, qty, price, order_type, hoga_gb, rqname,
+            req.get("high_range_at_entry", "UNKNOWN"), req.get("money_flow_at_entry", "UNKNOWN"),
         )                        # ↑ [SEC-ACCTMASK] 로그 인자만 마스킹 — SendOrder 에는 원본이 간다
 
         # [ORDER-EVT 2026-07-30] 접수→실행 지연 기록. ②(유령 창) 판단의 유일한 근거.
@@ -3561,6 +3564,8 @@ class BrokerGateway:
             "ts_client": str(req.get("ts", "")),
             "age_sec": _age_sec,                                    # ★7/31 아침에 볼 숫자
             "ttl_sec": int(req.get("ttl_sec", self.DEFAULT_TTL_SEC)),
+            "high_range_at_entry": req.get("high_range_at_entry", "UNKNOWN"),
+            "money_flow_at_entry": req.get("money_flow_at_entry", "UNKNOWN"),
         })
 
         _t0 = datetime.now()

@@ -23,7 +23,7 @@ KST = ZoneInfo("Asia/Seoul")
 SIGNAL_SCHEMA = "strategy_04_deep_w_pullback_signal_v1"
 SIGNAL_MODE = "SIGNAL_ONLY_ORDER_ZERO"
 ENTRY_START = time(10, 0)
-ENTRY_END = time(12, 0)
+ENTRY_END = time(14, 30)
 # ★[2026-07-27 친구님 승인] 관문별 탈락 그림자 계측 열 — 기록 전용(신호 로직 무변경).
 FUNNEL_FIELDS = (
     "ts", "code", "name", "action", "reason", "price", "drop_pct",
@@ -746,7 +746,7 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
             "valid_topbook_count": valid_points,
             "market_fresh": market_fresh,
             "market_change_pct": market_change,
-            "entry_window": "10:00-12:00",
+            "entry_window": "10:00-14:30",
             "signals": monitor.signals[-1000:],
             "candidates": list(monitor.latest.values()),
         }

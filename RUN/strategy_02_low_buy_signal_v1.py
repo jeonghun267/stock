@@ -308,6 +308,15 @@ ADAPTIVE_FAST_MAX_ENTRY_GAP_PCT = 1.5
 ADAPTIVE_RETEST_MAX_ENTRY_GAP_PCT = 2.0
 ADAPTIVE_WEAK_MIN_OBSERVE_SEC = 300.0
 
+# ★[DAY-LOW-CAP 2026-08-25 친구님 승인 "고점매수만 차단"]
+#   당일 저점 대비 매수 상한(%). 저점매수 조건은 건드리지 않고 고점 추격만 막는다.
+#   롤백: setx S02_DAY_LOW_MAX_GAP_PCT 999 (사실상 해제) 후 신호기 재시작
+try:
+    DAY_LOW_MAX_GAP_PCT = float(
+        os.environ.get("S02_DAY_LOW_MAX_GAP_PCT", "2.0"))
+except (TypeError, ValueError):
+    DAY_LOW_MAX_GAP_PCT = 2.0
+
 
 def _adaptive_regime_group(band: str) -> str:
     normalized = str(band or "").strip().upper()
@@ -1245,9 +1254,13 @@ class LowBuySignalMonitor:
         # 낙폭을 선행 하드게이트로 쓰지 않는다. 모든 새 anchor 저점을 추적한 뒤
         # FAST/RETEST 장세·수급·재확인 관문이 최종 진입을 결정한다.
         # 적응형을 끄면 기존 고정 낙폭 동작으로 즉시 복귀한다.
-        required_drop_pct = _effective_required_drop_pct(
-            point.ts, self.adaptive_bottom_enabled
-        )
+        # ★[DROP-GATE 복원 2026-08-25 친구님 "낙폭 문턴 복원 승인"]
+        #   위 설명과 달리, 적응형이 켜져도 낙폭 게이트를 유지한다.
+        #   8/25 356860: 장중고점 대비 -2.36% 뿐인데 FAST/RETEST 관문을 통과해
+        #   당일 저가 +9.37% 자리에서 매수됐다. 대체 관문이 제 역할을 못했다.
+        #   저점 추적(six_low 갱신)은 그대로 돌아간다 — 추격 시작만 막는다.
+        #   롤백: 이 두 줄을 _effective_required_drop_pct(point.ts, self.adaptive_bottom_enabled) 로 되돌림
+        required_drop_pct = _required_drop_pct(point.ts)
         if point.price <= 0:
             return None
         reference_price = state.six_reference_price
@@ -2125,6 +2138,33 @@ class LowBuySignalMonitor:
                     "algorithm": signal.algorithm,
                 })
                 return blocked, False
+
+        # ★[DAY-LOW-CAP 2026-08-25] 8/5 주석의 예고가 8/25 356860 에서 현실화 —
+        #   anchor 기준 1.28% 인데 당일 저점 기준으로는 9.37% 였다
+        #   (당일 저가 32,550 → 매수 35,600). 저점매수 조건은 그대로 두고
+        #   고점 추격만 막는다. NaN 무력화 방지를 위해 not (x <= MAX) 형태.
+        #   저점 자료가 없으면 차단(fail-closed).
+        _day_low_gap = (
+            (point.price / state.session_low - 1) * 100
+            if state.session_low > 0 else None
+        )
+        if _day_low_gap is None or not (_day_low_gap <= DAY_LOW_MAX_GAP_PCT):
+            blocked = self._wait_row(
+                code, name, point,
+                "S02_DAY_LOW_MISSING" if _day_low_gap is None
+                else "S02_DAY_LOW_GAP_TOO_FAR")
+            blocked.update({
+                "anchor_low": signal.anchor_low_price,
+                "anchor_low_ts": signal.anchor_low_ts.isoformat(timespec="seconds"),
+                "entry_gap_pct": round(entry_gap, 4),
+                "algorithm": signal.algorithm,
+                "day_low": round(state.session_low, 4),
+                "day_low_gap_pct": (
+                    round(_day_low_gap, 4)
+                    if _day_low_gap is not None else None),
+                "day_low_cap_pct": DAY_LOW_MAX_GAP_PCT,
+            })
+            return blocked, False
 
         state.emission_count += 1
         state.emitted_anchors.add(anchor_id)

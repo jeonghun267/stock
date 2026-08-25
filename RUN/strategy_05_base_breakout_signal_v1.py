@@ -49,6 +49,9 @@ class SignalConfig:
         "S05_STATE", r"C:\stock_bot\data\strategy_05_base_breakout_signal_state_v1.json"))
     event_dir: Path = Path(os.environ.get(
         "S05_EVENT_DIR", r"C:\stock_bot\data\strategy_05_signal_v1"))
+    funnel_audit_dir: Path = Path(os.environ.get(
+        "S05_FUNNEL_AUDIT_DIR",
+        r"C:\stock_bot\data\audit\s05_funnel"))
     loop_sec: float = float(os.environ.get("S05_LOOP_SEC", "1"))
     max_snapshot_age_sec: float = float(os.environ.get("S05_SNAPSHOT_MAX_AGE", "4"))
     max_signals_per_code: int = int(os.environ.get("S05_MAX_CYCLES_PER_CODE", "2"))
@@ -428,9 +431,232 @@ def _append_events(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+
+FUNNEL_STAGE_NAMES = {
+    1: "OBSERVED_CODE",
+    2: "BASE_30M_COMPLETE",
+    3: "BASE_RANGE_LE_3PCT",
+    4: "BREAKOUT",
+    5: "BREAKOUT_VOLUME_GE_3X",
+    6: "RETEST_WITHIN_10_BARS",
+    7: "RETEST_DEPTH_LE_0P8PCT",
+    8: "REBOUND_0P3_TO_1P0",
+    9: "ENTRY_ABOVE_LINE_LE_1P0",
+    10: "BUY_RATIO_AND_BUY_SELL_RATIO",
+    11: "FAST_BUY_SELL_RATIO",
+    12: "SPREAD_AND_MICROPRICE",
+    13: "ENTRY_MONEY",
+    14: "BUY_READY",
+}
+
+
+class S05FunnelAudit:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.day = ""
+        self.path: Path | None = None
+        self.counters = {
+            stage: {"input": 0, "pass": 0, "reject": 0}
+            for stage in FUNNEL_STAGE_NAMES
+        }
+        self.seen: set[str] = set()
+        self.cycles: dict[str, dict[str, Any]] = {}
+
+    def _ensure_day(self, ts: datetime) -> None:
+        day = ts.strftime("%Y%m%d")
+        if day == self.day:
+            return
+        self.day = day
+        self.path = self.root / f"s05_funnel_{day}.jsonl"
+        self.counters = {
+            stage: {"input": 0, "pass": 0, "reject": 0}
+            for stage in FUNNEL_STAGE_NAMES
+        }
+        self.seen = set()
+        self.cycles = {}
+        if not self.path.exists():
+            return
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        row = json.loads(line)
+                        stage = int(row.get("stage") or 0)
+                        counter = row.get("counter") or {}
+                        if stage in self.counters:
+                            self.counters[stage] = {
+                                "input": int(counter.get("input") or 0),
+                                "pass": int(counter.get("pass") or 0),
+                                "reject": int(counter.get("reject") or 0),
+                            }
+                        key = str(row.get("dedupe_key") or "")
+                        if key:
+                            self.seen.add(key)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+        except OSError:
+            return
+
+    def _record(self, ts: datetime, stage: int, *, code: str, reason: str,
+                dedupe_key: str, input_inc: int = 0, pass_inc: int = 0,
+                reject_inc: int = 0, cycle_id: str = "") -> None:
+        try:
+            self._ensure_day(ts)
+            if self.path is None or dedupe_key in self.seen:
+                return
+            current = self.counters[stage]
+            updated = {
+                "input": current["input"] + input_inc,
+                "pass": current["pass"] + pass_inc,
+                "reject": current["reject"] + reject_inc,
+            }
+            payload = {
+                "schema": "s05_funnel_audit_v1",
+                "ts": ts.isoformat(timespec="microseconds"),
+                "stage": stage,
+                "stage_name": FUNNEL_STAGE_NAMES[stage],
+                "code": str(code).zfill(6),
+                "reason": reason,
+                "cycle_id": cycle_id,
+                "dedupe_key": dedupe_key,
+                "counter": updated,
+                "order_capability": 0,
+            }
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8", newline="") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self.counters[stage] = updated
+            self.seen.add(dedupe_key)
+        except (OSError, KeyError, TypeError, ValueError):
+            return
+
+    def observe(self, code: str, ts: datetime) -> None:
+        day = ts.strftime("%Y%m%d")
+        self._record(ts, 1, code=code, reason="OBSERVED",
+                     dedupe_key=f"{day}:{code}:1:pass",
+                     input_inc=1, pass_inc=1)
+
+    def record_base_window(self, code: str, bars: Iterable[Bar],
+                           config: SignalConfig) -> None:
+        try:
+            rows = list(bars)
+            if not rows:
+                return
+            current = rows[-1]
+            window_id = f"{code}:{current.ts.isoformat()}"
+            complete = len(rows) >= config.base_n + 1
+            self._record(current.ts, 2, code=code,
+                         reason="BASE_COMPLETE" if complete else "BASE_INCOMPLETE",
+                         dedupe_key=f"{window_id}:2:result", input_inc=1,
+                         pass_inc=int(complete), reject_inc=int(not complete))
+            if not complete:
+                return
+            base = rows[-(config.base_n + 1):-1]
+            base_high = max(row.high for row in base)
+            base_low = min(row.low for row in base)
+            average_volume = sum(row.volume for row in base) / len(base)
+            range_ok = base_low > 0 and (
+                (base_high / base_low - 1.0) * 100.0
+                <= config.base_tight_pct)
+            self._record(current.ts, 3, code=code,
+                         reason="BASE_RANGE_PASS" if range_ok else "BASE_RANGE_REJECT",
+                         dedupe_key=f"{window_id}:3:result", input_inc=1,
+                         pass_inc=int(range_ok), reject_inc=int(not range_ok))
+            if not range_ok:
+                return
+            breakout = current.close > current.open and current.close > base_high
+            self._record(current.ts, 4, code=code,
+                         reason="BREAKOUT_PASS" if breakout else "BREAKOUT_REJECT",
+                         dedupe_key=f"{window_id}:4:result", input_inc=1,
+                         pass_inc=int(breakout), reject_inc=int(not breakout))
+            if not breakout:
+                return
+            volx = current.volume / average_volume if average_volume > 0 else 0.0
+            volume_ok = volx >= config.base_volx
+            self._record(current.ts, 5, code=code,
+                         reason="VOLUME_PASS" if volume_ok else "VOLUME_REJECT",
+                         dedupe_key=f"{window_id}:5:result", input_inc=1,
+                         pass_inc=int(volume_ok), reject_inc=int(not volume_ok))
+        except (ArithmeticError, KeyError, TypeError, ValueError):
+            return
+
+    def start_cycle(self, code: str, cycle_id: str, ts: datetime) -> None:
+        try:
+            self._ensure_day(ts)
+            current = self.cycles.get(code)
+            if current and current.get("id") == cycle_id:
+                return
+            if current:
+                self.finish(code, ts, "CYCLE_REPLACED")
+            next_stage = 6
+            while next_stage <= 14 and f"{cycle_id}:{next_stage}:pass" in self.seen:
+                next_stage += 1
+            self.cycles[code] = {"id": cycle_id, "next": next_stage}
+            if next_stage <= 14:
+                self._record(ts, next_stage, code=code, reason="STAGE_INPUT",
+                             cycle_id=cycle_id,
+                             dedupe_key=f"{cycle_id}:{next_stage}:input",
+                             input_inc=1)
+        except (KeyError, TypeError, ValueError):
+            return
+
+    def pass_stage(self, code: str, stage: int, ts: datetime,
+                   reason: str) -> None:
+        try:
+            cycle = self.cycles.get(code)
+            if not cycle or int(cycle.get("next") or 0) != stage:
+                return
+            cycle_id = str(cycle["id"])
+            self._record(ts, stage, code=code, reason=reason,
+                         cycle_id=cycle_id,
+                         dedupe_key=f"{cycle_id}:{stage}:pass", pass_inc=1)
+            next_stage = stage + 1
+            if next_stage > 14:
+                self.cycles.pop(code, None)
+                return
+            cycle["next"] = next_stage
+            self._record(ts, next_stage, code=code, reason="STAGE_INPUT",
+                         cycle_id=cycle_id,
+                         dedupe_key=f"{cycle_id}:{next_stage}:input", input_inc=1)
+        except (KeyError, TypeError, ValueError):
+            return
+
+    def advance(self, code: str, ts: datetime,
+                conditions: Mapping[int, bool]) -> None:
+        while True:
+            cycle = self.cycles.get(code)
+            if not cycle:
+                return
+            stage = int(cycle.get("next") or 0)
+            if stage not in conditions or not conditions[stage]:
+                return
+            self.pass_stage(code, stage, ts, "CONDITION_PASS")
+
+    def finish(self, code: str, ts: datetime, reason: str) -> None:
+        try:
+            cycle = self.cycles.pop(code, None)
+            if not cycle:
+                return
+            stage = int(cycle.get("next") or 0)
+            if not 1 <= stage <= 14:
+                return
+            cycle_id = str(cycle["id"])
+            self._record(ts, stage, code=code, reason=reason,
+                         cycle_id=cycle_id,
+                         dedupe_key=f"{cycle_id}:{stage}:reject", reject_inc=1)
+        except (KeyError, TypeError, ValueError):
+            return
+
+    def close_all(self, ts: datetime, reason: str) -> None:
+        for code in list(self.cycles):
+            self.finish(code, ts, reason)
+
+
 class BaseBreakoutSignalMonitor:
-    def __init__(self, config: SignalConfig) -> None:
+    def __init__(self, config: SignalConfig, *,
+                 audit: S05FunnelAudit | None = None) -> None:
         self.config = config
+        self.audit = audit
         self.states: Dict[str, CodeState] = {}
         self.latest: Dict[str, Dict[str, Any]] = {}
         self.signals: list[Dict[str, Any]] = []
@@ -566,9 +792,13 @@ class BaseBreakoutSignalMonitor:
         if state.phase == "WAIT_RETEST":
             state.wait_left -= 1
             if state.wait_left <= 0:
+                if self.audit is not None:
+                    self.audit.finish(code, completed.ts, "RETEST_10_BAR_TIMEOUT")
                 state.phase = "SCAN"
         if state.phase != "SCAN" or not ENTRY_START <= completed.ts.time() < ENTRY_END:
             return True
+        if self.audit is not None:
+            self.audit.record_base_window(code, state.bars, self.config)
         pattern = detect_base_breakout(
             state.bars,
             base_n=self.config.base_n,
@@ -582,6 +812,9 @@ class BaseBreakoutSignalMonitor:
             state.base_range_pct = pattern["base_range_pct"]
             state.breakout_volx = pattern["breakout_volx"]
             state.wait_left = self.config.retest_wait_bars
+            if self.audit is not None:
+                cycle_id = f"{code}:{completed.ts.isoformat()}:{state.breakout_line:.4f}"
+                self.audit.start_cycle(code, cycle_id, completed.ts)
         return True
 
     @staticmethod
@@ -683,6 +916,11 @@ class BaseBreakoutSignalMonitor:
         allow_signal: bool,
     ) -> tuple[dict[str, Any], bool]:
         state = self.states.setdefault(code, CodeState())
+        if self.audit is not None:
+            self.audit.observe(code, point.ts)
+            if state.phase != "SCAN" and state.breakout_ts is not None:
+                cycle_id = f"{code}:{state.breakout_ts.isoformat()}:{state.breakout_line:.4f}"
+                self.audit.start_cycle(code, cycle_id, point.ts)
         if state.micro and (
             point.ts <= state.micro[-1].ts
             or point.buy_volume_cum < state.micro[-1].buy_volume_cum
@@ -693,6 +931,8 @@ class BaseBreakoutSignalMonitor:
         ):
             state.micro.clear()
             if state.phase in {"LOW_SEARCH", "BUY_CONFIRM"}:
+                if self.audit is not None:
+                    self.audit.finish(code, point.ts, "MICRO_COUNTER_OR_TIME_RESET")
                 state.phase = "SCAN"
                 state.dominance_since = None
         state.micro.append(point)
@@ -701,22 +941,32 @@ class BaseBreakoutSignalMonitor:
             state.micro.popleft()
 
         if not allow_signal:
+            if self.audit is not None:
+                self.audit.finish(code, point.ts, "ENTRY_TIME_CLOSED")
             return self._row(code, name, point, state, "ENTRY_TIME_CLOSED"), False
         if point.price < self.config.min_price:
+            if self.audit is not None:
+                self.audit.finish(code, point.ts, "PRICE_BELOW_10000")
             return self._row(code, name, point, state, "PRICE_BELOW_10000"), False
         if state.phase == "SCAN":
             return self._row(code, name, point, state, "BASE_30M_WAIT"), False
         if state.phase == "WAIT_RETEST":
             if point.price > state.breakout_line:
                 return self._row(code, name, point, state, "BREAKOUT_RETEST_WAIT"), False
+            if self.audit is not None:
+                self.audit.pass_stage(code, 6, point.ts, "RETEST_ENTERED")
             retest_depth_pct = (
                 (state.breakout_line - point.price) / state.breakout_line * 100.0
             )
             if retest_depth_pct > self.config.max_retest_depth_pct:
                 row = self._row(code, name, point, state, "RETEST_TOO_DEEP")
                 row["retest_depth_pct"] = round(retest_depth_pct, 4)
+                if self.audit is not None:
+                    self.audit.finish(code, point.ts, "RETEST_TOO_DEEP")
                 self._reset_pattern(state)
                 return row, False
+            if self.audit is not None:
+                self.audit.pass_stage(code, 7, point.ts, "RETEST_DEPTH_PASS")
             state.phase = "LOW_SEARCH"
             state.search_start = point.ts
             state.candidate_low = point
@@ -725,10 +975,14 @@ class BaseBreakoutSignalMonitor:
 
         if state.phase == "LOW_SEARCH":
             if state.search_start is None or state.candidate_low is None:
+                if self.audit is not None:
+                    self.audit.finish(code, point.ts, "LOW_SEARCH_STATE_INVALID")
                 state.phase = "SCAN"
                 return self._row(code, name, point, state, "LOW_SEARCH_STATE_INVALID"), False
             search_age = (point.ts - state.search_start).total_seconds()
             if search_age >= self.config.low_search_max_sec:
+                if self.audit is not None:
+                    self.audit.finish(code, point.ts, "LOW_SEARCH_TIMEOUT")
                 state.phase = "SCAN"
                 return self._row(code, name, point, state, "LOW_SEARCH_TIMEOUT"), False
             retest_floor = state.breakout_line * (
@@ -778,6 +1032,8 @@ class BaseBreakoutSignalMonitor:
         if elapsed < self.config.buy_min_sec:
             return row, False
         if elapsed > self.config.buy_max_sec:
+            if self.audit is not None:
+                self.audit.finish(code, point.ts, "BUY_CONFIRM_TIMEOUT")
             state.phase = "SCAN"
             row["reason"] = "BUY_CONFIRM_TIMEOUT"
             return row, False
@@ -787,6 +1043,8 @@ class BaseBreakoutSignalMonitor:
         buy_money = point.buy_money_cum - reset.buy_money_cum
         sell_money = point.sell_money_cum - reset.sell_money_cum
         if min(buy_volume, sell_volume, buy_money, sell_money) < 0:
+            if self.audit is not None:
+                self.audit.finish(code, point.ts, "EXACT_FLOW_COUNTER_RESET")
             state.phase = "SCAN"
             row["reason"] = "EXACT_FLOW_COUNTER_RESET"
             return row, False
@@ -833,6 +1091,18 @@ class BaseBreakoutSignalMonitor:
         microprice_ok = (
             point.microprice_edge_bps > self.config.min_microprice_edge_bps
         )
+        if self.audit is not None:
+            self.audit.advance(code, point.ts, {
+                8: rebound_ok,
+                9: line_reclaimed and chase_ok,
+                10: (total_volume >= 1
+                     and buy_ratio >= self.config.min_buy_ratio
+                     and buy_sell_ratio >= self.config.min_buy_sell_ratio
+                     and buy_money_ratio >= self.config.min_buy_money_ratio),
+                11: persistence_ok and fast_flow_ok,
+                12: spread_ok and microprice_ok,
+                13: total_money >= self.config.min_entry_money_krw,
+            })
         dominance_ok = (
             total_volume >= 1
             and total_money >= self.config.min_entry_money_krw
@@ -891,9 +1161,13 @@ class BaseBreakoutSignalMonitor:
             anchor in state.emitted_anchors
             or state.emission_count >= self.config.max_signals_per_code
         ):
+            if self.audit is not None:
+                self.audit.finish(code, point.ts, "ANCHOR_OR_CYCLE_ALREADY_USED")
             state.phase = "SCAN"
             row["reason"] = "ANCHOR_OR_CYCLE_ALREADY_USED"
             return row, False
+        if self.audit is not None:
+            self.audit.pass_stage(code, 14, point.ts, "BUY_READY")
         state.emission_count += 1
         state.emitted_anchors.add(anchor)
         state.phase = "SCAN"
@@ -914,7 +1188,8 @@ class BaseBreakoutSignalMonitor:
 
 def run(config: SignalConfig, *, once: bool = False) -> int:
     now = datetime.now(KST).replace(tzinfo=None)
-    monitor = BaseBreakoutSignalMonitor(config)
+    monitor = BaseBreakoutSignalMonitor(
+        config, audit=S05FunnelAudit(config.funnel_audit_dir))
     monitor.restore(_read_json(config.state_path), now.strftime("%Y%m%d"))
     eligible = load_eod_eligible(config.eod_path, config.min_price)
     last_state_save = ""
@@ -1010,6 +1285,8 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
             new_signals,
         )
         if once or now.weekday() >= 5 or now.time() >= time(15, 25):
+            if monitor.audit is not None:
+                monitor.audit.close_all(now, "PROCESS_END")
             return 0
         time_module.sleep(max(0.2, config.loop_sec))
 

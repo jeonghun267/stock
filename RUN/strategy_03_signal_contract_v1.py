@@ -88,6 +88,8 @@ EARLY_LOW_MIN_REBOUND_PCT = 1.0
 #             + s03_early_low_release_v1.py의 CONDITION_ID
 #             + config\live_approved_hashes_v1.json의 release_states
 EARLY_LOW_MAX_REBOUND_PCT = 2.0
+EARLY_LOW_FAST_REBOUND_MAX_PCT = 3.0
+EARLY_LOW_FAST_REBOUND_REASON = "S03_EARLY_LOW_FAST_REBOUND_2_TO_3"
 
 # ★[EARLY-LOW-AUDIT 2026-08-12 친구님 승인 "영구 실전 연결"] 장초 레인 생산 감사.
 #   실전 활성화(S03_EARLY_LOW_LIVE=YES)는 이 감사 기록을 실제 생산 코드로 재생해
@@ -284,6 +286,12 @@ def _lane_valid(raw: Mapping[str, Any], ts: datetime) -> bool:
     if lane == EARLY_LOW_LANE:
         anchor_low = float(raw.get("anchor_low") or 0)
         anchor_ts = _parse_local(raw.get("anchor_low_ts"))
+        reason = str(raw.get("reason") or "")
+        rebound_valid = (
+            EARLY_LOW_MAX_REBOUND_PCT < rebound <= EARLY_LOW_FAST_REBOUND_MAX_PCT
+            if reason == EARLY_LOW_FAST_REBOUND_REASON
+            else EARLY_LOW_MIN_REBOUND_PCT <= rebound <= EARLY_LOW_MAX_REBOUND_PCT
+        )
         return (
             algorithm == EARLY_LOW_ALGORITHM
             and in_window
@@ -291,8 +299,7 @@ def _lane_valid(raw: Mapping[str, Any], ts: datetime) -> bool:
             and anchor_ts is not None
             and EARLY_LOW_CAPTURE_START
             <= anchor_ts.time() <= EARLY_LOW_CAPTURE_END
-            and EARLY_LOW_MIN_REBOUND_PCT
-            <= rebound <= EARLY_LOW_MAX_REBOUND_PCT
+            and rebound_valid
             and bool(raw.get("flow_turn_ready"))
             and float(raw.get("flow_recent_buy_rate") or 0.0)
             > float(raw.get("flow_recent_sell_rate") or 0.0)

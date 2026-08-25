@@ -41,10 +41,20 @@ REBOUND_TOLERANCE = 1e-6
 
 SIGNAL_REQUIRED = (
     "trade_day", "code", "hr_rank", "snapshot_ts", "current_price",
+    "entry_lane", "snapshot_op", "snapshot_lo",
+    "best_ask_px", "best_bid_px", "best_ask_qty", "best_bid_qty",
     "broker_day_low", "buy_money_cum", "sell_money_cum", "allow_signal",
     "pre_state", "anchor_low", "anchor_low_ts", "chase_blocked", "emitted",
     "rebound_pct", "flow_turn_ready", "flow_recent_buy_rate",
-    "flow_recent_sell_rate", "flow_price_responding", "action", "reason", "signal_ts", "signal_price", "prod_sha",
+    "flow_recent_sell_rate", "flow_price_responding", "action", "reason",
+    "signal_ts", "signal_ts_exact", "signal_price", "prod_sha",
+)
+PROFILE_MISSING_REQUIRED = (
+    "trade_day", "event", "entry_lane", "code", "snapshot_ts",
+    "current_price", "snapshot_op", "snapshot_lo", "buy_money_cum",
+    "sell_money_cum", "best_ask_px", "best_bid_px", "best_ask_qty",
+    "best_bid_qty", "anchor_low", "anchor_low_ts", "signal_ts",
+    "signal_ts_exact", "action", "reason", "prod_sha",
 )
 PRE_STATE_REQUIRED = (
     "anchor_low", "anchor_low_ts", "chase_blocked", "emitted", "flow_points",
@@ -57,7 +67,9 @@ ENGINE_REQUIRED = (
     "max_age_sec", "snapshot_max_age_sec", "consumed",
     "early_low_live_enabled", "flow_turn_live_enabled", "order_mode",
     "contract_pass", "selector_pass", "candidate_selector_pass",
-    "prod_sha",
+    "entry_lane", "snapshot_op", "snapshot_lo", "best_ask_px",
+    "best_bid_px", "best_ask_qty", "best_bid_qty", "selector_ts",
+    "selector_terminal_reason", "prod_sha",
 )
 PAYLOAD_META_REQUIRED = ("schema", "date", "updated_at", "mode")
 
@@ -236,6 +248,11 @@ def _replay_engine_record(
     if candidate_ok != bool(record["candidate_selector_pass"]):
         return (f"candidate_selector_pass got={candidate_ok} "
                 f"recorded={record['candidate_selector_pass']}"), None
+    terminal_reason = str(record.get("selector_terminal_reason") or "")
+    if terminal_reason == "S03_PRICE_BELOW_10000":
+        raw_price = abs(float((record.get("snapshot_raw") or {}).get("cur") or 0))
+        if raw_price >= 10000 or candidate_ok:
+            return "S03_PRICE_BELOW_10000 record is not fail-closed", None
     return None, candidate_ok
 
 
@@ -264,10 +281,26 @@ def main() -> int:
         streams[stream] = records
 
     for record in streams["signal"]:
+        required = (
+            PROFILE_MISSING_REQUIRED
+            if str(record.get("event") or "") == "PROFILE_MISSING"
+            else SIGNAL_REQUIRED
+        )
         missing = _check_fields(
-            record, SIGNAL_REQUIRED, f"stream=signal seq={record.get('seq')}")
+            record, required, f"stream=signal seq={record.get('seq')}")
         if missing:
             return _fail_unverified(missing)
+        if str(record.get("event") or "") == "PROFILE_MISSING":
+            if not (
+                str(record.get("entry_lane") or "") == EARLY_LOW_LANE
+                and str(record.get("action") or "") == "WAIT"
+                and str(record.get("reason") or "")
+                == "S03_PRIOR_PROFILE_MISSING"
+                and not str(record.get("signal_ts") or "")
+            ):
+                return _fail_unverified(
+                    f"PROFILE_MISSING_INVALID seq={record.get('seq')}")
+            continue
         pre = record.get("pre_state")
         if not isinstance(pre, Mapping):
             return _fail_unverified(
@@ -301,6 +334,8 @@ def main() -> int:
         scratch = Path(scratch_name)
         os.environ["S03_EARLY_LOW_AUDIT_DIR"] = str(scratch / "replay_audit")
         for record in streams["signal"]:
+            if str(record.get("event") or "") == "PROFILE_MISSING":
+                continue
             problem = _replay_signal_record(record)
             if problem:
                 mismatches.append(
@@ -319,11 +354,22 @@ def main() -> int:
         record for record in streams["signal"]
         if str(record.get("action")) == "BUY_READY"
     ]
+    profile_missing = [
+        record for record in streams["signal"]
+        if str(record.get("event") or "") == "PROFILE_MISSING"
+    ]
+    under_10000 = [
+        record for record in streams["engine"]
+        if str(record.get("selector_terminal_reason") or "")
+        == "S03_PRICE_BELOW_10000"
+    ]
     print(
         f"[PROD_REPLAY] date={day} signal_records={len(streams['signal'])} "
         f"engine_records={len(streams['engine'])} "
         f"day_low_inputs={len(day_low_records)} buy_ready={len(fired)} "
-        f"would_pass_if_live={would_live_pass}",
+        f"would_pass_if_live={would_live_pass} "
+        f"profile_missing={len(profile_missing)} "
+        f"under_10000_blocked={len(under_10000)} broker_submit=0",
         flush=True,
     )
     if mismatches:

@@ -8,15 +8,6 @@
 - 추가 제안·확장 작업·장황한 안전설명 금지.
 - 길어질 것 같으면 작성하지 말고 먼저 사용자에게 묻는다.
 
-# Model and Reasoning Budget Policy
-
-- Default to `gpt-5.6-terra` with `medium` reasoning for routine inspection, search, explanation, and straightforward edits.
-- Use `gpt-5.6-sol` with `high` reasoning only for trading-condition changes, complex debugging, and final pre-live verification.
-- Use `max` reasoning only when the user explicitly requests `max` in the current task.
-- Do not perform unnecessary whole-repository searches, repeat unchanged investigations, or rerun the same test without changed code or evidence.
-- Run one focused validation for the changed behavior unless shared/core trading code or an explicit user request requires broader validation.
-- If the current Codex task cannot switch models automatically, state that limitation and never claim a model switch that did not occur.
-
 # 5.6 Sol 비용·시간 절약 잠금 (Mandatory)
 
 - 기본 조사 한도는 `대상 파일 확인 1회 → 최소 수정 1회 → 집중 검증 1회`다. 이를 넘기기 전에 즉시 멈추고 사용자에게 이유와 예상 비용을 묻는다.

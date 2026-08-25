@@ -279,6 +279,10 @@ def load_strategy(meta: dict[str, str], now: dt.datetime, names: dict[str, str])
                 if isinstance(row, dict) and row.get("action") == "BUY_READY"
             )
 
+    last_error = str(state.get("last_error") or "") if current_state else ""
+    if last_error.startswith("MA3_SEED_NOT_READY:"):
+        last_error = ""
+
     return {
         **meta,
         "daily_cap": integer(meta.get("daily_cap"), 6),
@@ -294,7 +298,7 @@ def load_strategy(meta: dict[str, str], now: dt.datetime, names: dict[str, str])
         "order_attempts": integer(state.get("order_attempts_total")) if current_state else 0,
         "ready_signals": ready_signals,
         "recovery_blocked": bool(state.get("recovery_blocked")) if current_state else False,
-        "last_error": str(state.get("last_error") or "") if current_state else "",
+        "last_error": last_error,
     }
 
 

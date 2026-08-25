@@ -540,8 +540,12 @@ def _supply_poller(bc, today):
 
 def _update_che_state(snap, che_state, today, hmn):
     """che 저점(min)·당일저점(lo) 누적 — 매매기 저점반등/구조붕괴용(바닥사냥꾼 방식)·09:10 이후·일단위 리셋."""
-    for code in _UNIV[0]:
-        sc = snap.get(code) or {}
+    # DEEP은 선별판 밖 급락주도 관찰하므로 snapshot 전체의 상태를 누적한다.
+    # 선별판 _UNIV는 순위/메타데이터 용도로만 유지한다.
+    for code, sc in snap.items():
+        code = str(code).zfill(6)
+        if not isinstance(sc, dict):
+            continue
         _cs = che_state.get(code) if isinstance(che_state.get(code), dict) else {}
         _px = sc.get("cur")
         if isinstance(_px, (int, float)) and _px > 0:

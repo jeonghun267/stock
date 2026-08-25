@@ -21,6 +21,7 @@ from strategy_05_base_breakout_signal_v1 import (
     CodeState,
     MicroPoint,
     SignalConfig,
+    S05FunnelAudit,
     detect_base_breakout,
 )
 from strategy_01_rotation_engine_v2 import kst_now
@@ -173,6 +174,58 @@ class Strategy05Tests(unittest.TestCase):
         self.assertEqual(fired_row["entry_lane"], "S05_BASE:19200.0000:19200.0000")
         self.assertGreaterEqual(fired_row["rebound_pct"], 0.3)
         self.assertLessEqual(fired_row["rebound_pct"], 1.0)
+    def test_funnel_audit_records_all_stages_without_changing_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            config = replace(SignalConfig(), funnel_audit_dir=Path(folder))
+            audit = S05FunnelAudit(config.funnel_audit_dir)
+            code = "445090"
+            base_ts = datetime(2026, 7, 27, 13, 15)
+            bars = [
+                Bar(base_ts - timedelta(minutes=30 - i),
+                    19000, 19100, 18950, 19020, 100)
+                for i in range(30)
+            ]
+            bars.append(Bar(base_ts, 19020, 19300, 19020, 19200, 400))
+            audit.record_base_window(code, bars, config)
+            monitor = BaseBreakoutSignalMonitor(config, audit=audit)
+            state = monitor.states.setdefault(code, CodeState())
+            state.phase = "WAIT_RETEST"
+            state.breakout_line = 19200
+            state.breakout_ts = base_ts
+            state.base_range_pct = 1.5
+            state.breakout_volx = 4.0
+            state.wait_left = 10
+            audit.start_cycle(code, f"{code}:{base_ts.isoformat()}:19200.0000", base_ts)
+            sequence = [
+                (1, 19200, 15, 12, 1_200_000, 1_100_000),
+                (4, 19210, 18, 14, 1_600_000, 1_300_000),
+                (11, 19210, 50, 30, 2_500_000, 1_500_000),
+                (19, 19210, 100, 60, 4_000_000, 2_000_000),
+                (29, 19260, 300, 120, 8_000_000, 3_000_000),
+                (31, 19260, 500, 150, 12_000_000, 3_500_000),
+                (34, 19260, 750, 190, 17_000_000, 4_200_000),
+                (37, 19260, 1100, 230, 24_000_000, 5_000_000),
+            ]
+            fired = False
+            for sec, price_value, bv, sv, bm, sm in sequence:
+                _row, fired = monitor.process_micro(
+                    code, "test",
+                    point(base_ts + timedelta(seconds=sec),
+                          price_value, bv, sv, bm, sm),
+                    allow_signal=True)
+                if fired:
+                    break
+            self.assertTrue(fired)
+            path = Path(folder) / "s05_funnel_20260727.jsonl"
+            rows = [json.loads(line) for line in
+                    path.read_text(encoding="utf-8").splitlines()]
+            latest = {int(row["stage"]): row["counter"] for row in rows}
+            for stage in range(1, 15):
+                self.assertGreaterEqual(latest[stage]["input"], 1)
+                self.assertGreaterEqual(latest[stage]["pass"], 1)
+                self.assertEqual(latest[stage]["reject"], 0)
+            self.assertTrue(all(row["order_capability"] == 0 for row in rows))
+
     def test_persistence_uses_buy_money_not_total_money(self) -> None:
         monitor = BaseBreakoutSignalMonitor(SignalConfig())
         state = CodeState()

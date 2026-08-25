@@ -27,6 +27,10 @@ from strategy_02_low_buy_signal_v1 import (
     load_live_points,
 )
 from strategy_02_rotation_engine_v1 import Strategy02Engine, build_config
+from strategy_05_rotation_engine_v1 import (
+    Strategy05Engine,
+    build_config as build_s05_config,
+)
 from strategy_02_signal_contract_v1 import (
     SIGNAL_MODE,
     SIGNAL_SCHEMA,
@@ -34,6 +38,7 @@ from strategy_02_signal_contract_v1 import (
 )
 from strategy_common_hold_sell_v1 import (
     HoldSellAction,
+    HoldSellDecision,
     HoldSellObservation,
     HoldSellState,
     StrategyId,
@@ -1145,6 +1150,133 @@ class Strategy02Tests(unittest.TestCase):
         self.assertEqual(config.max_daily_codes, 15)
         self.assertEqual(config.max_cycles_per_code, 2)
         self.assertEqual(config.rotation_capital_krw, 2_000_000)
+
+
+    def _init_with_strategy_id(self, strategy_id):
+        config = (
+            build_config()
+            if strategy_id == StrategyId.S02_LOW_BUY_SELL_EXHAUSTION
+            else build_s05_config()
+        )
+
+        def fake_parent_init(instance, *_args, **_kwargs):
+            instance.config = config
+            instance.exit_engine = UnifiedHoldSellEngine()
+            instance.loss_reentry_gate = None
+            instance._event = lambda *_a, **_k: None
+            instance.signal_selector = lambda *_a, **_k: []
+            instance.log = logging.getLogger("s02-exclusive-test")
+
+        with patch.object(Strategy01Engine, "__init__", fake_parent_init):
+            return Strategy02Engine(config)
+
+    def test_s02_peak_and_flow_latch_are_isolated_from_s05(self) -> None:
+        baseline_score = UnifiedHoldSellEngine().config.common_peak_score
+        with patch.dict(os.environ, {"S02_PEAK_SCORE": "3"}):
+            s02_engine = self._init_with_strategy_id(
+                StrategyId.S02_LOW_BUY_SELL_EXHAUSTION)
+            s05_engine = self._init_with_strategy_id(
+                StrategyId.S05_BASE_BREAKOUT)
+        self.assertEqual(s02_engine.exit_engine.config.common_peak_score, 3)
+        self.assertEqual(s05_engine.exit_engine.config.common_peak_score, baseline_score)
+        self.assertIs(getattr(s02_engine.exit_engine.evaluate, "__self__", None), s02_engine)
+        self.assertIsNot(getattr(s05_engine.exit_engine.evaluate, "__self__", None), s05_engine)
+
+    def test_s02_daygate_does_not_block_s05_entries(self) -> None:
+        def stub(strategy_id):
+            engine = object.__new__(Strategy02Engine)
+            engine.config = (
+                build_config()
+                if strategy_id == StrategyId.S02_LOW_BUY_SELL_EXHAUSTION
+                else build_s05_config()
+            )
+            engine._s02_only = strategy_id == StrategyId.S02_LOW_BUY_SELL_EXHAUSTION
+            engine.state = {}
+            engine._event = lambda *_a, **_k: None
+            engine._save = lambda: None
+            engine._s02_signal_rows_by_code = {}
+            return engine
+        now = datetime(2026, 8, 24, 10, 0)
+        with patch("strategy_02_rotation_engine_v1.day_gate_blocked", return_value=True), patch.object(Strategy01Engine, "_try_entries") as parent_entries:
+            stub(StrategyId.S05_BASE_BREAKOUT)._try_entries(now)
+            parent_entries.assert_called_once()
+            parent_entries.reset_mock()
+            stub(StrategyId.S02_LOW_BUY_SELL_EXHAUSTION)._try_entries(now)
+            parent_entries.assert_not_called()
+
+    def test_s05_base_failure_exit_remains_active(self) -> None:
+        engine = object.__new__(Strategy05Engine)
+        engine.exit_engine = UnifiedHoldSellEngine()
+        engine._s05_last_observation = {}
+        engine._s05_last_point = {}
+        sold = []
+        engine._start_sell = lambda _position, _now, reason, _point: sold.append(reason)
+        now = self.now
+        observation = HoldSellObservation(
+            observed_at=now, price=9_900,
+            buy_money_per_sec_10s=1, sell_money_per_sec_10s=10,
+            buy_volume_per_sec_5s=1, sell_volume_per_sec_5s=10,
+            sell_volume_per_sec_previous_10s=1,
+            one_minute_bull_to_bear=True,
+        )
+        point = {"price": 9_900}
+        position = {
+            "code": "123456", "phase": "HOLD",
+            "entry_lane": "S05_BASE:10000.0000:9950.0000",
+            "s05_failure_since": (now - timedelta(seconds=4)).isoformat(),
+        }
+        def parent_exit(instance, _position, _now):
+            instance._s05_last_observation["123456"] = observation
+            instance._s05_last_point["123456"] = point
+        with patch.object(Strategy02Engine, "_evaluate_exit", parent_exit):
+            engine._evaluate_exit(position, now)
+        self.assertEqual(len(sold), 1)
+        self.assertIn("S05_BASE_FAILURE_EXIT", sold[0])
+
+    def test_flow_defense_4of5_latch_live_repeats_within_120s(self) -> None:
+        engine = object.__new__(Strategy02Engine)
+        engine._s02_flow_defense_latch = {}
+        events = []
+        engine._event = lambda event, **kwargs: events.append((event, kwargs))
+        state = HoldSellState(
+            position_id="s02:test:123456",
+            strategy_id=StrategyId.S02_LOW_BUY_SELL_EXHAUSTION,
+            code="123456",
+            quantity=1,
+            entry_price=10_000,
+            entry_at=self.now,
+        )
+
+        def evaluate(seconds: int, reason: str):
+            observed_at = self.now + timedelta(seconds=seconds)
+            observation = HoldSellObservation(
+                observed_at=observed_at,
+                price=9_900,
+            )
+            decision = HoldSellDecision(
+                action=HoldSellAction.WATCH,
+                reason=reason,
+                strategy_id=state.strategy_id,
+                code=state.code,
+                observed_at=observed_at,
+                price=observation.price,
+                order_key=state.order_key,
+            )
+            return engine._apply_flow_defense_latch(
+                state, observation, decision,
+            )
+
+        warning = "COMMON_FLOW_DEFENSE_WATCH 0/3s score=4/5"
+        first = evaluate(0, warning)
+        self.assertFalse(first.should_sell)
+        self.assertEqual(events, [])
+        second = evaluate(85, warning)
+        self.assertTrue(second.should_sell)
+        self.assertIn("S02_FLOW_DEFENSE_LATCH_EXIT", second.reason)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "S02_FLOW_DEFENSE_LATCH_LIVE")
+        self.assertTrue(state.sell_latched)
+        self.assertEqual(state.sell_action, HoldSellAction.SELL)
 
 
 if __name__ == "__main__":

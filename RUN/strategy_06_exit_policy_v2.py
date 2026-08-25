@@ -26,6 +26,7 @@ class ExitObservation:
     buy_ratio_10s: float
     anchor_break_sec: float = 0.0
     ma5_reversal_sec: float = 0.0
+    ma10_break_sec: float = 0.0
     flow_grace_sec: float = 0.0
     observed_time: time = time(9, 0)
     same_day: bool = True
@@ -68,7 +69,14 @@ def decide_exit(obs: ExitObservation) -> ExitDecision:
         and sell_dominant and obs.anchor_break_sec >= 3.0
     ):
         return ExitDecision("SELL", "ANCHOR_LOW_BREAK_FLOW_3S")
-    if below_ma10 and sell_dominant:
+    # ★[MA10-3S 2026-08-25 친구님 승인] 지속 3초 조건 추가.
+    #   8/25 477850: 매수 40초 만에 이 규칙으로 팔렸다(+0.217%).
+    #   당일 고가는 27,000 으로 매도가 23,100 대비 +16.88% 더 올랐다.
+    #   S06은 -8% 급락 저점을 사므로 매수 시점에 이미 MA10 아래다 —
+    #   below_ma10 은 항상 참이고 sell_dominant 한 번이면 즉시 팔렸다.
+    #   같은 파일의 ANCHOR_LOW_BREAK_FLOW_3S · MA5_FALLING_FLOW_3S 와 동일한 형태.
+    #   롤백: 이 조건에서 and obs.ma10_break_sec >= 3.0 을 제거
+    if below_ma10 and sell_dominant and obs.ma10_break_sec >= 3.0:
         return ExitDecision("SELL", "MA10_BREAK_SELL_FLOW")
     if below_ma5 and not ma5_rising and sell_dominant and obs.ma5_reversal_sec >= 3.0:
         return ExitDecision("SELL", "MA5_FALLING_FLOW_3S")
