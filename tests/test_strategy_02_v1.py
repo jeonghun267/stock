@@ -4,12 +4,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
+
+RUN = Path(__file__).resolve().parents[1] / "RUN"
+if str(RUN) not in sys.path:
+    sys.path.insert(0, str(RUN))
 
 # ★[2026-08-01] 이 파일의 확정대기·호가관문 검증은 롤백 경로(S02_SIX_STYLE=NO) 기준.
 #   실전 기본값(YES·6번식)은 해당 관문을 의도적으로 우회한다.
@@ -709,6 +714,8 @@ class Strategy02Tests(unittest.TestCase):
                 state_path=root / "state.json",
                 fills_dir=root / "fills",
                 event_dir=root / "events",
+                audit_root=root / "audit" / "hold_sell",
+                audit_enabled=False,
                 order_lifecycle_root=root / "order_lifecycle",
                 log_path=root / "engine.log",
                 approval_path=root / "approved.flag",
@@ -809,6 +816,8 @@ class Strategy02Tests(unittest.TestCase):
                 state_path=root / "state.json",
                 fills_dir=root / "fills",
                 event_dir=root / "events",
+                audit_root=root / "audit" / "hold_sell",
+                audit_enabled=False,
                 log_path=root / "engine.log",
                 approval_path=root / "approved.flag",
                 off_flag_path=root / "off.flag",
@@ -991,6 +1000,8 @@ class Strategy02Tests(unittest.TestCase):
                 state_path=root / "state.json",
                 fills_dir=root / "fills",
                 event_dir=root / "events",
+                audit_root=root / "audit" / "hold_sell",
+                audit_enabled=False,
                 log_path=root / "engine.log",
                 approval_path=root / "approved.flag",
                 off_flag_path=root / "off.flag",

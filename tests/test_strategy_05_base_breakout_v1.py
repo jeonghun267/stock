@@ -375,6 +375,8 @@ class Strategy05Tests(unittest.TestCase):
                     state_path=root / "state.json",
                     fills_dir=root / "fills",
                     event_dir=root / "events",
+                    audit_root=root / "audit" / "hold_sell",
+                    audit_enabled=False,
                     log_path=root / "engine.log",
                     approval_path=root / "approved.flag",
                     off_flag_path=root / "off.flag",
