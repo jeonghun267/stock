@@ -2,7 +2,7 @@
 """새전략 06 — 급락 저점추격 매수 (독립 엔진).
 
 ★[2026-08-01 친구님 승인 설계 v2]
-  대상: 그날의 고저폭30 (IPC\\micro_watch_high_range.json)
+  대상: live_micro_snapshot 전체 (고저폭30은 metadata/우선순위로만 사용)
   발동: 당일 첫 관측가(시가 근사) 대비 -8% 도달 — 조건은 이것 하나
   추격: 저점을 계속 기록, 신저점이면 리셋(계단식 하락을 끝까지 따라감)
   관찰: 저점+0.5% 첫 반등 뒤 0.4% 이상 눌림을 기다리고, 눌림 저점이 원저점보다
@@ -67,10 +67,11 @@ from ma3_common_v1 import (
 )
 import shared_slots
 from strategy_common_order_v1 import StrategyBroker, fills_by_order
-from strategy_06_exit_policy_v2 import (
-    ExitObservation as S06ExitObservation,
-    decide_exit as decide_s06_exit,
-)
+# ★[S06-COMMON-EXIT 2026-08-25 친구님 지시] 매도 판정을 S02 와 같은 공통 엔진으로
+#   옮긴다. 종전 strategy_06_exit_policy_v2 호출은 제거했다(파일은 증거로 남긴다).
+#   판정은 UnifiedHoldSellEngine, 관측값 변환·매도상태 보관은 어댑터가 맡는다.
+from strategy_common_hold_sell_v1 import HoldSellAction
+from strategy_06_common_exit_adapter_v1 import Strategy06CommonExitAdapter, build_exit_engine
 
 # ★[EXACT-INPUT 2026-08-20 친구님 지시] 판정 직전 입력을 그대로 저장한다(기록 전용).
 #   판정·주문에는 일절 관여하지 않으며, 기록기가 없거나 깨져도 매매는 그대로 돈다.
@@ -283,6 +284,8 @@ def setup_logger(config: Config) -> logging.Logger:
         "[%(asctime)s] %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
     file_handler = logging.FileHandler(config.log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
     logger.addHandler(file_handler)
@@ -462,6 +465,10 @@ class Strategy06Engine:
         self._bars_cache: Tuple[float, dict] = (-1.0, {})
         self._entry_wait_epoch: Dict[str, float] = {}
         self._observe_log_epoch: Dict[str, float] = {}
+        # ★[S06-COMMON-EXIT 2026-08-25] 매도 판정은 S02 와 같은 공통 엔진이 한다.
+        #   진입 경로는 이 두 줄과 무관하다(어댑터는 _evaluate_exit 에서만 쓰인다).
+        self.exit_adapter = Strategy06CommonExitAdapter(self)
+        self.exit_engine = build_exit_engine()
         self._startup_reconcile()
 
     # ── 상태 ────────────────────────────────────────────────────────────
@@ -471,6 +478,9 @@ class Strategy06Engine:
             "date": day,
             "order_attempts_total": 0,
             "positions": {},
+            # ★[S06-COMMON-EXIT 2026-08-25] 공통 매도엔진의 포지션별 매도상태.
+            #   positions 바깥에 두는 이유는 어댑터 파일 머리말 참조(보존입력 재생 보호).
+            "hold_sell_states": {},
             "entered_codes": [],
             "chase": {},
             "history": [],
@@ -502,11 +512,24 @@ class Strategy06Engine:
             )
             fresh = self._blank_state(today)
             fresh["positions"] = dict(payload["positions"]) if pending else holds
+            # 살아남은 포지션의 매도상태만 함께 넘긴다(고점·확인타이머 보존).
+            carried = payload.get("hold_sell_states")
+            if isinstance(carried, dict):
+                live = {
+                    f"{str(position.get('code') or '').zfill(6)}:"
+                    f"{int(position.get('entry_no') or 1)}"
+                    for position in fresh["positions"].values()
+                    if isinstance(position, dict)
+                }
+                fresh["hold_sell_states"] = {
+                    key: value for key, value in carried.items() if key in live
+                }
             if pending:
                 fresh["recovery_blocked"] = True
                 fresh["last_error"] = "PENDING_ORDER_FROM_PREVIOUS_DAY"
             return fresh
         payload.setdefault("order_attempts_total", 0)
+        payload.setdefault("hold_sell_states", {})
         payload.setdefault("entered_codes", [])
         payload.setdefault("chase", {})
         payload.setdefault("history", [])
@@ -598,6 +621,8 @@ class Strategy06Engine:
             archived["archived_at"] = kst_now().isoformat(timespec="seconds")
             history.append(archived)
             del self._positions()[position_key]
+        # 장부에서 사라진 포지션의 매도상태를 같이 지운다(찌꺼기 누적 방지).
+        self.exit_adapter.prune(self._positions().keys())
         if len(history) > 200:
             del history[:-200]
         self._refresh_recovery_blocked()
@@ -831,6 +856,9 @@ class Strategy06Engine:
         if epoch - self._snapshot_cache[0] < 0.5:
             return self._snapshot_cache[1]
         payload = read_json(self.config.snapshot_path, {})
+        if not (isinstance(payload, dict) and isinstance(payload.get("codes"), dict) and payload.get("codes")):
+            time.sleep(0.05)
+            payload = read_json(self.config.snapshot_path, {})
         self._snapshot_cache = (epoch, payload if isinstance(payload, dict) else {})
         return self._snapshot_cache[1]
 
@@ -861,38 +889,43 @@ class Strategy06Engine:
         }
 
     def _universe(self, now: datetime) -> Tuple[list, str]:
-        """오늘의 고저폭 핵심확인대(A등급 우선). (codes, block_reason)"""
+        """전체 실시간 snapshot을 관찰하고 고저폭 종목만 앞에 둔다."""
+        snapshot_codes_raw = self._snapshot().get("codes") or {}
+        if not isinstance(snapshot_codes_raw, dict) or not snapshot_codes_raw:
+            return [], "SNAPSHOT_EMPTY"
+        snapshot_codes = []
+        seen = set()
+        for raw_code in snapshot_codes_raw:
+            code = str(raw_code).zfill(6)
+            if code and code not in seen:
+                snapshot_codes.append(code)
+                seen.add(code)
+
         watch = read_json(self.config.watch_path, {})
-        codes = [str(c).zfill(6) for c in (watch.get("codes") or [])]
-        if not codes:
-            return [], "WATCHLIST_EMPTY"
-        if str(watch.get("for_date") or "") != now.strftime("%Y%m%d"):
-            return [], "WATCHLIST_NOT_TODAY"
-        if watch.get("source_stale"):
-            return [], "WATCHLIST_SOURCE_STALE"
-        # ★[UNIVERSE-FIX 2026-08-06 친구님 지시 "6번 수정해"] 승인 설계로 되돌린다.
-        #   이 파일 상단의 8/1 승인 설계는 "대상: 그날의 고저폭30" 인데, 코드는
-        #   crown_codes 만 대상으로 삼고 있었다 — 8/6 실측 crown=1종목(119850).
-        #   그 결과 오늘 -8% 를 넘긴 3종목(049080 -10.7% · 327260 -10.2% ·
-        #   043260 -8.3%)이 전부 감시 밖이었고 S06 는 구조적으로 0건이었다.
-        #   crown 은 "제외 기준"이 아니라 "우선순위"로만 쓴다: 우선crown → 나머지crown
-        #   → 나머지 고저폭. 대상 집합만 넓히고 매수 조건(-8%·계단·눌림·수급)은
-        #   하나도 건드리지 않는다.
-        #   되돌리기: backup\strategy_06_crash_low_chase_v1_20260806_before_universe_fix.py
+        watch_codes = [str(c).zfill(6) for c in (watch.get("codes") or [])]
+        watch_set = set(watch_codes)
         priority_set = {
             str(c).zfill(6) for c in (watch.get("crown_priority_codes") or [])
         }
         crown_set = {
             str(c).zfill(6) for c in (watch.get("crown_codes") or [])
         }
-        priority_codes = [c for c in codes if c in priority_set]
+        # ★[UNIVERSE-COVERAGE 2026-08-24 owner 승인]
+        #   고저폭/왕관은 관찰 제외 장벽이 아니라 우선순위 metadata다. 실시간
+        #   snapshot 전체를 보되 기존 매수조건·가격하한·수급 fail-closed는 유지한다.
+        priority_codes = [c for c in snapshot_codes if c in priority_set]
         crown_rest = [
-            c for c in codes if c in crown_set and c not in priority_set
+            c for c in snapshot_codes if c in crown_set and c not in priority_set
         ]
-        others = [
-            c for c in codes if c not in crown_set and c not in priority_set
+        high_range_rest = [
+            c for c in snapshot_codes
+            if c in watch_set and c not in crown_set and c not in priority_set
         ]
-        return priority_codes + crown_rest + others, ""
+        snapshot_rest = [
+            c for c in snapshot_codes
+            if c not in watch_set and c not in crown_set and c not in priority_set
+        ]
+        return priority_codes + crown_rest + high_range_rest + snapshot_rest, ""
 
     def _hr_row(self, code: str) -> Mapping[str, Any]:
         epoch = time.time()
@@ -1668,6 +1701,7 @@ class Strategy06Engine:
         shadow: bool = False,
     ) -> None:
         fill_price = fill_price or number(position.get("last_price"))
+        order_no = str((position.get("pending") or {}).get("order_no") or "")
         position.update({
             "phase": "HOLD",
             "qty": int(quantity),
@@ -1677,6 +1711,16 @@ class Strategy06Engine:
             "pending": None,
             "real": not shadow,
         })
+        # ★[S06-COMMON-EXIT 2026-08-25] 체결이 확정된 이 자리에서 매도상태를 만든다.
+        #   실패해도(입력 불완전) 매수는 그대로 확정된다 — 매도상태는 다음 판정 때
+        #   어댑터 ensure() 가 장부 기준으로 다시 만든다.
+        self.exit_adapter.create(
+            position,
+            quantity=int(quantity),
+            entry_price=fill_price,
+            entry_at=as_kst(observed_at),
+            order_no=order_no,
+        )
         self._update_excursion(position, fill_price, observed_at)
         self._refresh_recovery_blocked()
         self._event(
@@ -1904,18 +1948,12 @@ class Strategy06Engine:
             return None
         return ma3_buy_side_alive(recent[0], base[0], recent[1], base[1])
 
-    def _exit_flow_rates(self, code: str, epoch_now: float) -> Tuple[float, float]:
-        flow = self.flows.get(str(code).zfill(6))
-        if not flow or len(flow) < 2:
-            return 0.0, 0.0
-        rows = [row for row in flow if epoch_now - row[0] <= 10.0]
-        if len(rows) < 2 or rows[-1][0] - rows[0][0] < 3.0:
-            return 0.0, 0.0
-        span = rows[-1][0] - rows[0][0]
-        return (
-            max(0.0, rows[-1][1] - rows[0][1]) / span,
-            max(0.0, rows[-1][2] - rows[0][2]) / span,
-        )
+    # ★[S06-COMMON-EXIT 2026-08-25] 종전 S06 전용 매도 입력 계산기 4종
+    #   (_exit_flow_rates · _exit_atr_3m_pct · _exit_condition_seconds ·
+    #    _same_day_exit_observation)을 제거했다. 그 값들은 이제 공통 엔진의
+    #   관측값으로 어댑터가 만든다. 아래 _append_exit_flow 만 남긴다 —
+    #   어댑터가 같은 수급 이력을 그대로 쓴다.
+    #   되돌리기: RUN\backup 의 20260825 이전 사본 복원 + exit_policy_v2 재배선.
 
     def _append_exit_flow(self, code: str, point: Mapping[str, Any]) -> None:
         buy = number(point.get("buy_money_cum"), -1.0)
@@ -1928,107 +1966,6 @@ class Strategy06Engine:
             flow.append((epoch, buy, sell))
         while flow and epoch - flow[0][0] > 240.0:
             flow.popleft()
-
-    def _exit_atr_3m_pct(self, code: str) -> float:
-        """Completed one-minute bars aggregated to 3-minute true range."""
-        payload = read_json_cached(self.config.bars_path, {})
-        source = payload.get("m") if isinstance(payload, dict) else None
-        row = ((source or payload).get(str(code).zfill(6)) or {})
-        bars, labels = row.get("prev") or [], row.get("pm") or []
-        if not bars or len(bars) != len(labels):
-            return 0.0
-        grouped: Dict[str, list] = {}
-        for bar, raw_tag in zip(bars[-90:], labels[-90:]):
-            if not isinstance(bar, (list, tuple)) or len(bar) < 4:
-                continue
-            tag = str(raw_tag or "")
-            hm = tag[-4:] if len(tag) in {4, 12} else ""
-            if len(hm) != 4 or not hm.isdigit():
-                continue
-            minute = int(hm[:2]) * 60 + int(hm[2:])
-            prefix = tag[:8] if len(tag) == 12 else "today"
-            grouped.setdefault(f"{prefix}:{minute // 3}", []).append(bar)
-        blocks = []
-        for rows in grouped.values():
-            high = max(number(row_[1]) for row_ in rows)
-            low = min(number(row_[2]) for row_ in rows)
-            close = number(rows[-1][3])
-            if min(high, low, close) > 0:
-                blocks.append((high, low, close))
-        if len(blocks) < 3:
-            return 0.0
-        true_ranges = []
-        for index in range(1, len(blocks)):
-            high, low, _close = blocks[index]
-            previous_close = blocks[index - 1][2]
-            true_ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
-        close = blocks[-1][2]
-        return (sum(true_ranges[-10:]) / min(10, len(true_ranges))) / close * 100.0
-
-    @staticmethod
-    def _exit_condition_seconds(
-        position: Dict[str, Any], key: str, active: bool, now: datetime,
-    ) -> float:
-        if not active:
-            position.pop(key, None)
-            return 0.0
-        if not position.get(key):
-            position[key] = now.isoformat(timespec="seconds")
-            return 0.0
-        return max(0.0, (now - parse_dt(position[key], now)).total_seconds())
-
-    def _same_day_exit_observation(
-        self, position: Dict[str, Any], point: Mapping[str, Any], now: datetime,
-    ) -> S06ExitObservation:
-        code = str(position.get("code") or "").zfill(6)
-        self._append_exit_flow(code, point)
-        buy_rate, sell_rate = self._exit_flow_rates(code, point["ts"].timestamp())
-        total_rate = buy_rate + sell_rate
-        buy_ratio = buy_rate / total_rate if total_rate > 0 else 0.0
-        ma = ma3_rows(code) or {}
-        price = number(point.get("price"))
-        sell_dominant = sell_rate > 0 and sell_rate >= 1.5 * max(0.0, buy_rate)
-        ma5_failing = (
-            number(ma.get("ma5")) > 0 and price < number(ma.get("ma5"))
-            and number(ma.get("ma5")) <= number(ma.get("ma5_prev"))
-            and sell_dominant
-        )
-        anchor_break = price < number(position.get("dip_low")) and sell_dominant
-        anchor_sec = self._exit_condition_seconds(
-            position, "exit_anchor_break_since", anchor_break, now)
-        ma5_sec = self._exit_condition_seconds(
-            position, "exit_ma5_failure_since", ma5_failing, now)
-        atr_pct = self._exit_atr_3m_pct(code)
-        peak = max(number(position.get("peak_price")), number(position.get("entry_price")))
-        peak_return = (peak / number(position.get("entry_price")) - 1.0) * 100.0
-        peak_drop = (peak - price) / peak * 100.0 if peak > 0 else 0.0
-        trail_ready = peak_return >= 1.0 and peak_drop >= max(0.8, atr_pct * 1.5)
-        rider = ma3_rider_permit(
-            code, price, buy_side=self._morning_buy_side(code, point["ts"].timestamp()))
-        grace_sec = self._exit_condition_seconds(
-            position, "exit_flow_grace_since",
-            bool(trail_ready and rider and buy_ratio >= 0.90), now)
-        return S06ExitObservation(
-            price=price,
-            entry_price=number(position.get("entry_price")),
-            anchor_low=number(position.get("dip_low")),
-            peak_price=peak,
-            atr_3m_pct=atr_pct,
-            ma5=number(ma.get("ma5")),
-            ma5_prev=number(ma.get("ma5_prev")),
-            ma10=number(ma.get("ma10")),
-            ma20=number(ma.get("ma20")),
-            ma20_prev=number(ma.get("ma20_prev")),
-            buy_rate_10s=buy_rate,
-            sell_rate_10s=sell_rate,
-            buy_side_alive=rider,
-            buy_ratio_10s=buy_ratio,
-            anchor_break_sec=anchor_sec,
-            ma5_reversal_sec=ma5_sec,
-            flow_grace_sec=grace_sec,
-            observed_time=now.time(),
-            same_day=True,
-        )
 
     @staticmethod
     def _morning_trail_drop(entry: float, peak: float) -> float:
@@ -2140,10 +2077,31 @@ class Strategy06Engine:
             return
         if point is None:
             return
-        observation = self._same_day_exit_observation(position, point, now)
-        decision = decide_s06_exit(observation)
-        if decision.action == "SELL":
-            self._start_sell(position, now, decision.reason, point)
+        # ★[S06-COMMON-EXIT 2026-08-25 친구님 지시] 여기부터가 S02 와 같은 엔진이다.
+        #   위 강제청산(15:20 HARD_FLAT · 밤샘 9시 정리)과 재시도 간격은 종전 그대로다.
+        hold_state = self.exit_adapter.ensure(position)
+        if hold_state is None:
+            return                                   # 입력 불완전 = 판정 보류(무주문)
+        if (
+            hold_state.last_observed_at is not None
+            and point["ts"] <= hold_state.last_observed_at
+        ):
+            return                                   # 같은 틱 재판정 금지(S02 와 동일)
+        observation = self.exit_adapter.build_observation(position, point)
+        if observation is None:
+            return
+        decision = self.exit_engine.evaluate(hold_state, observation)
+        self.exit_adapter.save(position, hold_state)
+        if decision.should_sell:
+            partial = decision.action is HoldSellAction.PARTIAL_SELL
+            self._start_sell(
+                position,
+                now,
+                decision.reason,
+                point,
+                quantity_override=1 if partial else None,
+                partial=partial,
+            )
 
     def _start_sell(
         self,
@@ -2151,6 +2109,9 @@ class Strategy06Engine:
         now: datetime,
         reason: str,
         point: Optional[Mapping[str, Any]],
+        *,
+        quantity_override: Optional[int] = None,
+        partial: bool = False,
     ) -> None:
         if int(position.get("sell_retries") or 0) >= self.config.max_sell_retries:
             position["phase"] = "RECOVERY_BLOCKED"
@@ -2160,8 +2121,19 @@ class Strategy06Engine:
                         name=position["name"], reason=reason)
             return
         price = number((point or {}).get("price"), number(position.get("last_price")))
+        # ★[S06-COMMON-EXIT 2026-08-25] 부분매도도 S02 와 같은 모양으로 처리한다.
+        #   S06 은 1주 매수가 기본이라 position_qty>1 일 때만 성립한다(2주 설정 시).
+        position_qty = int(position.get("qty") or 0)
+        partial_intent = bool(partial and position_qty > 1)
         if not position.get("real"):
-            self._confirm_exit(position, price, reason, shadow=True)
+            requested_qty = position_qty
+            if quantity_override is not None:
+                requested_qty = min(requested_qty, max(1, int(quantity_override)))
+            if partial_intent and 0 < requested_qty < position_qty:
+                self._confirm_partial_exit(
+                    position, requested_qty, price, reason, shadow=True)
+            else:
+                self._confirm_exit(position, price, reason, shadow=True)
             return
         # ★[2026-08-01 보안점검 치명2] 같은 종목 매도 직렬화 — 다른 포지션의 매도가
         #   진행 중이면 3초 뒤 재시도(주문번호 입양 오인·멱등키 충돌 방지).
@@ -2188,7 +2160,9 @@ class Strategy06Engine:
             self._event("SELL_WAIT", code=position["code"], name=position["name"],
                         reason="BROKER_AVAILABLE_QTY_ZERO")
             return
-        quantity = min(int(position.get("qty") or 0), available)
+        quantity = min(position_qty, available)
+        if quantity_override is not None:
+            quantity = min(quantity, max(1, int(quantity_override)))
         if quantity <= 0:
             position["retry_after_epoch"] = time.time() + 5
             self._event("SELL_WAIT", code=position["code"], name=position["name"],
@@ -2232,6 +2206,10 @@ class Strategy06Engine:
             "cancel_epoch": 0.0,
             "last_status": "PREPARED",
             "reason": reason,
+            # 실제로 남는 수량이 있을 때만 부분매도로 취급한다(S02 와 같은 판정식).
+            "partial": bool(
+                partial_intent and quantity < position_qty and quantity < actual_qty
+            ),
         }
         self._save()
         status = self.broker.submit(
@@ -2245,7 +2223,11 @@ class Strategy06Engine:
                 reason=f"{reason} / {status} exact fill reconciliation",
             )
         elif status == "SHADOW":
-            self._confirm_exit(position, price, reason, shadow=True)
+            if position["pending"].get("partial"):
+                self._confirm_partial_exit(
+                    position, quantity, price, reason, shadow=True)
+            else:
+                self._confirm_exit(position, price, reason, shadow=True)
         else:
             position["phase"] = "HOLD"
             position["pending"] = None
@@ -2263,7 +2245,11 @@ class Strategy06Engine:
         filled, average = fills.get(order_no, (0, 0.0)) if order_no else (0, 0.0)
         needed = int(pending["requested_qty"])
         if filled >= needed:
-            self._confirm_exit(position, average, pending["reason"])
+            if pending.get("partial"):
+                self._confirm_partial_exit(
+                    position, needed, average, pending["reason"])
+            else:
+                self._confirm_exit(position, average, pending["reason"])
             return
         if pending.get("cancel_requested"):
             if time.time() - number(pending.get("cancel_epoch")) < 2:
@@ -2275,11 +2261,19 @@ class Strategy06Engine:
                 return
             actual_qty = int((holdings.get(code) or {}).get("qty") or 0)
             if actual_qty <= max(0, int(pending["pre_hold_qty"]) - needed):
-                self._confirm_exit(
-                    position,
-                    average or number(position.get("last_price")),
-                    pending["reason"],
-                )
+                if pending.get("partial") and actual_qty > 0:
+                    self._confirm_partial_exit(
+                        position,
+                        int(pending["pre_hold_qty"]) - actual_qty,
+                        average or number(position.get("last_price")),
+                        pending["reason"],
+                    )
+                else:
+                    self._confirm_exit(
+                        position,
+                        average or number(position.get("last_price")),
+                        pending["reason"],
+                    )
             elif actual_qty < int(pending["pre_hold_qty"]):
                 position["qty"] = min(int(position["qty"]), actual_qty)
                 position["phase"] = "HOLD"
@@ -2326,8 +2320,17 @@ class Strategy06Engine:
         actual_qty = int((holdings.get(code) or {}).get("qty") or 0)
         if actual_qty < int(pending["pre_hold_qty"]):
             if actual_qty <= max(0, int(pending["pre_hold_qty"]) - needed):
-                self._confirm_exit(
-                    position, number(position.get("last_price")), pending["reason"])
+                if pending.get("partial") and actual_qty > 0:
+                    self._confirm_partial_exit(
+                        position,
+                        int(pending["pre_hold_qty"]) - actual_qty,
+                        number(position.get("last_price")),
+                        pending["reason"],
+                    )
+                else:
+                    self._confirm_exit(
+                        position, number(position.get("last_price")),
+                        pending["reason"])
             else:
                 position["qty"] = min(int(position["qty"]), actual_qty)
                 position["phase"] = "HOLD"
@@ -2341,6 +2344,82 @@ class Strategy06Engine:
         position["retry_after_epoch"] = time.time() + 5
         self._event("SELL_NOT_CREATED", code=code, name=position["name"],
                     reason="fills/open orders/balance unchanged")
+
+    def _confirm_partial_exit(
+        self,
+        position: Dict[str, Any],
+        sold_qty: int,
+        fill_price: float,
+        reason: str,
+        *,
+        shadow: bool = False,
+    ) -> None:
+        """★[S06-COMMON-EXIT 2026-08-25] 부분매도 확정 — S02 와 같은 처리.
+
+        남는 수량이 없으면 전량매도로 넘긴다. 남으면 보유로 되돌리고 공통
+        매도상태의 수량·꼭지 타이머를 S02 와 같은 방식으로 갱신한다.
+        """
+        current_qty = int(position.get("qty") or 0)
+        sold_qty = min(max(0, int(sold_qty)), current_qty)
+        remaining = current_qty - sold_qty
+        if sold_qty <= 0:
+            return
+        if remaining <= 0:
+            self._confirm_exit(position, fill_price, reason, shadow=shadow)
+            return
+        entry = Decimal(str(number(position.get("entry_price"))))
+        exit_price = Decimal(str(number(fill_price, number(position.get("last_price")))))
+        exit_at = kst_now()
+        self._update_excursion(position, float(exit_price), exit_at)
+        gross = (
+            (exit_price / entry - Decimal("1")) * Decimal("100")
+            if entry > 0 and exit_price > 0 else Decimal("0")
+        )
+        net = (
+            (
+                exit_price * (Decimal("1") - SELL_FEE - SELL_TAX)
+                / (entry * (Decimal("1") + BUY_FEE))
+                - Decimal("1")
+            ) * Decimal("100")
+            if entry > 0 and exit_price > 0 else Decimal("0")
+        )
+        hold_state = self.exit_adapter.load(position)
+        if hold_state is not None:
+            hold_state.quantity = remaining
+            hold_state.peak_partial_taken = True
+            hold_state.peak_flow_since = None
+            hold_state.peak_recovery_since = None
+            hold_state.sell_latched = False
+            hold_state.sell_action = HoldSellAction.SELL
+            hold_state.sell_reason = ""
+            hold_state.sell_latched_at = None
+            hold_state.sell_latched_price = Decimal("0")
+            self.exit_adapter.save(position, hold_state)
+        position.update({
+            "phase": "HOLD",
+            "qty": remaining,
+            "pending": None,
+            "retry_after_epoch": time.time() + 2,
+            "last_price": float(exit_price),
+        })
+        position.setdefault("partial_exits", []).append({
+            "quantity": sold_qty,
+            "price": float(exit_price),
+            "at": exit_at.isoformat(timespec="seconds"),
+            "reason": reason,
+            "gross_return_pct": float(gross),
+            "estimated_net_return_pct_before_slippage": float(net),
+        })
+        self._refresh_recovery_blocked()
+        self._event(
+            "SHADOW_SELL_PARTIAL" if shadow else "SELL_PARTIAL_CONFIRMED",
+            code=position["code"], name=position["name"],
+            price=float(exit_price), quantity=sold_qty,
+            reason=(
+                f"{reason} remaining={remaining} gross={gross:.3f}% "
+                f"net_before_slippage={net:.3f}%"
+            ),
+        )
 
     def _confirm_exit(
         self,
@@ -2376,6 +2455,8 @@ class Strategy06Engine:
             "gross_return_pct": float(gross),
             "estimated_net_return_pct_before_slippage": float(net),
         })
+        # 청산된 포지션의 공통 매도상태를 정리한다(같은 종목 재진입과 섞이지 않게).
+        self.exit_adapter.drop(position)
         self._refresh_recovery_blocked()
         self._event(
             "SHADOW_SELL" if shadow else "SELL_CONFIRMED",

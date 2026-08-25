@@ -91,7 +91,8 @@ class UnifiedHoldSellEngineTests(unittest.TestCase):
 
     def test_all_strategy_profiles_exist(self):
         self.assertEqual(set(STRATEGY_PROFILES), set(StrategyId))
-        self.assertEqual(len(STANDARD_STRATEGIES), 11)
+        # ★[S06-COMMON-EXIT 2026-08-25] S06 을 공통 매도엔진에 등록해 11 -> 12.
+        self.assertEqual(len(STANDARD_STRATEGIES), 12)
         self.assertEqual(len(VALLEY_STRATEGIES), 3)
         self.assertEqual(len(EARLY_STRATEGIES), 3)
         self.assertEqual(STRATEGY_PROFILES[StrategyId.RAID].ma3_mode, MA3Mode.HOLD_LOCK)

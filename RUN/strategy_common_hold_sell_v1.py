@@ -35,6 +35,9 @@ class StrategyId(str, Enum):
     S02_LOW_BUY_SELL_EXHAUSTION = "S02_LOW_BUY_SELL_EXHAUSTION"
     S04_PULLBACK = "S04_PULLBACK"
     S05_BASE_BREAKOUT = "S05_BASE_BREAKOUT"
+    # ★[S06-COMMON-EXIT 2026-08-25 친구님 지시] S06 매도를 공통 엔진으로 옮긴다.
+    #   정책은 S02 와 동일(아래 STRATEGY_PROFILES · S02_POLICY_STRATEGIES 참조).
+    S06_CRASH_LOW_CHASE = "S06_CRASH_LOW_CHASE"
     EARLY_DIRECT_ONSET = "EARLY_DIRECT_ONSET"
     EARLY_GAP_ONSET = "EARLY_GAP_ONSET"
     EARLY_DIP_RECLAIM = "EARLY_DIP_RECLAIM"
@@ -323,6 +326,26 @@ STRATEGY_PROFILES = {
         #   정상 호흡이라 승자를 본전에서 잘라낸다. 상승보유로 오래 들고 가자는
         #   같은 날 결정과 자기모순이다. stop_ladder 는 설정하지 않는다(=None, 고정 손절).
     ),
+    # ★[S06-COMMON-EXIT 2026-08-25 친구님 지시 "S02가 쓰는 동일 엔진·동일 정책"]
+    #   위 S02 항목과 **글자 그대로 같은 인자**를 쓴다. 값을 하나라도 다르게 적으면
+    #   그 순간 '규칙 복사'가 되어 지시를 어긴다. 어긋남은 단위테스트가 막는다
+    #   (tests/test_strategy_06_common_exit_v1.py 의 프로필 동일성 검사).
+    #   ⚠️S06 의 진입·수량·주문복구·강제청산(15:20 HARD_FLAT)은 이 프로필과 무관하며
+    #     strategy_06_crash_low_chase_v1.py 안에서 종전 그대로 돈다.
+    StrategyId.S06_CRASH_LOW_CHASE: _profile(
+        StrategyId.S06_CRASH_LOW_CHASE,
+        early=None,
+        stop="-2.0",
+        strong_stop="-2.0",
+        rider_before_trail=True,
+        trail_needs_sell_pressure=True,
+        trail_eval_interval_sec=50,
+        supported_weak_peak_confirm_sec=3,
+        supported_weak_peak_active_date="*",
+        supported_weak_peak_arm_return_pct="5",
+        supported_weak_peak_drop_pct="1.2",
+        supported_weak_peak_score=1,
+    ),
     StrategyId.S04_PULLBACK: _profile(
         StrategyId.S04_PULLBACK,
         stop="-2.0",
@@ -443,6 +466,19 @@ STANDARD_STRATEGIES = frozenset(set(StrategyId) - {
     StrategyId.VALLEY_BASE_BREAKOUT,
 })
 VALLEY_STRATEGIES = frozenset(set(StrategyId) - set(STANDARD_STRATEGIES))
+
+# ★[S06-COMMON-EXIT 2026-08-25 친구님 지시] "S02 동일 정책 매핑만 최소 추가".
+#   프로필(위)만으로는 S02 와 같아지지 않는다 — 아래 세 규칙이 프로필이 아니라
+#   strategy_id 로 직접 걸려 있기 때문이다(S02_MA5_TREND_HOLD 2곳 · 오후 약손실 1곳).
+#   그래서 '어느 전략이 S02 정책을 쓰는가'를 이 한 곳으로 모으고, 세 곳은
+#   `is S02` -> `in S02_POLICY_STRATEGIES` 로만 바꾼다.
+#   ⚠️규칙의 내용·문턱·순서는 한 글자도 바꾸지 않았다. S02 를 포함한 기존 전략의
+#     판정 결과는 이 변경 전후로 100% 동일하다(집합에 S02 가 그대로 들어 있다).
+#   되돌리기: 이 집합에서 S06 을 빼면 S06 만 종전(정책 미적용)으로 돌아간다.
+S02_POLICY_STRATEGIES = frozenset({
+    StrategyId.S02_LOW_BUY_SELL_EXHAUSTION,
+    StrategyId.S06_CRASH_LOW_CHASE,
+})
 
 
 
@@ -999,7 +1035,7 @@ class UnifiedHoldSellEngine:
                 or observation.observed_at.strftime("%Y%m%d")
                 == self.config.s02_ma5_trend_hold_active_date
             )
-            and state.strategy_id is StrategyId.S02_LOW_BUY_SELL_EXHAUSTION
+            and state.strategy_id in S02_POLICY_STRATEGIES
             and state.quantity == 1
             and self._return_pct(state, observation.price) > 0
             and observation.price_above_ma5
@@ -1175,7 +1211,7 @@ class UnifiedHoldSellEngine:
                 or observation.observed_at.strftime("%Y%m%d")
                 == self.config.s02_ma5_trend_hold_active_date
             )
-            and state.strategy_id is StrategyId.S02_LOW_BUY_SELL_EXHAUSTION
+            and state.strategy_id in S02_POLICY_STRATEGIES
             and state.quantity == 1
             and return_pct > 0
             and observation.price_above_ma5
@@ -1343,7 +1379,7 @@ class UnifiedHoldSellEngine:
     ) -> Optional[HoldSellDecision]:
         return_pct = self._return_pct(state, observation.price)
         setup = bool(
-            state.strategy_id is StrategyId.S02_LOW_BUY_SELL_EXHAUSTION
+            state.strategy_id in S02_POLICY_STRATEGIES
             and observation.observed_at.time()
             >= self.config.s02_afternoon_soft_loss_start_at
             and return_pct <= self.config.s02_afternoon_soft_loss_pct
