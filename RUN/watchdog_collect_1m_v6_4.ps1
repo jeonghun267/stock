@@ -122,6 +122,7 @@ $SCRIPT_PATTERN = "collect_prices_1m_kiwoom_opt10080_v*.py"
 $SCRIPT = ""
 try {
     $found = Get-ChildItem -Path $safeRun -Filter $SCRIPT_PATTERN -ErrorAction Stop |
+             Where-Object { $_.BaseName -notmatch '_before_' } |
              Sort-Object LastWriteTime -Descending |
              Select-Object -First 1
     if ($found) {
@@ -728,6 +729,9 @@ function Get-RestartDecision {
     if ($hbInfo.status -eq "DEAD") { return @{ need=$true; reason="ZOMBIE_HEARTBEAT_DEAD"; severity="CRITICAL" } }
     if ($hbInfo.status -eq "STALE" -and $csvIdleSec -gt $MAX_IDLE_SEC) {
         return @{ need=$true; reason="ZOMBIE_STALE_AND_CSV_IDLE"; severity="HIGH" }
+    }
+    if ($processAlive -and $hbInfo.status -eq "ALIVE" -and $csvOk -and (Get-Date).TimeOfDay -lt [TimeSpan]"09:00") {
+        return @{ need=$false; reason="PREOPEN_CSV_GRACE"; severity="NONE" }
     }
     if ($csvIdleSec -gt ($MAX_IDLE_SEC * 2) -and $hbInfo.status -eq "ALIVE") {
         # [PATCH] CSV idle > 240초 + heartbeat ALIVE = "도는 척" 상태

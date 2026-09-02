@@ -19,6 +19,7 @@ from strategy_06_crash_low_chase_v1 import (  # noqa: E402
     ChaseState,
     Config,
     Strategy06Engine,
+    atrp10_pct,
 )
 
 KST = ZoneInfo("Asia/Seoul")
@@ -111,6 +112,65 @@ class ChaseMachineTest(unittest.TestCase):
         self.assertEqual(codes, [CODE, other, outside])
         self.assertEqual(block, "")
 
+    def test_tick_skips_active_s03_claim_without_delaying_free_codes(self) -> None:
+        with (
+            patch.object(self.engine, "_universe", return_value=([CODE], "")),
+            patch(
+                "strategy_06_crash_low_chase_v1.crash_claim.s03_claim_status",
+                return_value="CLAIMED",
+            ),
+            patch.object(self.engine, "_chase_tick") as chase_tick,
+        ):
+            self.engine.tick(self.now)
+
+        chase_tick.assert_not_called()
+
+    def test_preorder_rechecks_s03_claim(self) -> None:
+        chase = ChaseState(low=18000.0)
+        point = {"price": 18300.0}
+        with (
+            patch(
+                "strategy_06_crash_low_chase_v1.crash_claim.s03_claim_status",
+                return_value="ORDERING",
+            ),
+            patch.object(self.engine, "_event") as event,
+        ):
+            result = self.engine._try_entry(
+                CODE, "테스트", point, chase, self.now)
+        self.assertEqual(result, "RETRY")
+        self.assertIn("PREORDER", event.call_args.kwargs["reason"])
+
+    def test_board_universe_unions_high_range_and_moneyflow(self) -> None:
+        """★[BOARD-UNION 2026-08-26 친구님 확정] 관찰은 합집합(∪).
+
+        고저폭 계열과 던짐/매도세 어느 한쪽에만 있어도 보고,
+        양쪽에 겹치는 종목(CODE: 고저폭+왕관+던짐)은 한 번만 들어간다.
+        최초 배선(교집합)은 8/26 실측 겹침 1종목으로 폐기됨."""
+        other = "654320"
+        outside = "777770"
+        mflow_path = self.base / "mflow.json"
+        write_json(self.config.watch_path, {
+            "codes": [CODE, other], "crown_codes": [CODE],
+            "for_date": self.today, "source_stale": False,
+        })
+        write_json(mflow_path, {
+            "rows": [
+                {"code": CODE, "grade": "🔴던짐"},
+                {"code": outside, "grade": "🔵매도세"},
+            ],
+        })
+        write_json(self.config.snapshot_path, {
+            "codes": {outside: {}, other: {}, CODE: {}},
+        })
+        config = replace(
+            self.config, universe_mode="BOARD", mflow_board_path=mflow_path,
+        )
+        engine = Strategy06Engine(config)
+        codes, block = engine._universe(self.now)
+        self.assertEqual(sorted(codes), sorted([CODE, other, outside]))
+        self.assertEqual(codes.count(CODE), 1)
+        self.assertEqual(block, "")
+
     def test_snapshot_empty_reuses_only_fresh_previous_payload(self) -> None:
         fresh = {"ts": self.now.isoformat(), "codes": {CODE: {}}}
         self.engine._snapshot_cache = (0.0, fresh)
@@ -155,13 +215,17 @@ class ChaseMachineTest(unittest.TestCase):
         self.assertEqual(self.config.quantity, 1)
         self.assertEqual(self.config.max_slots, 6)
 
-    def test_default_entry_band_is_half_to_one_point_five_percent(self) -> None:
-        self.assertEqual(self.config.rebound_pct, 0.5)
-        self.assertEqual(self.config.entry_floor_pct, 0.5)
-        self.assertEqual(self.config.chase_cap_pct, 1.5)
+    def test_default_entry_band_is_one_to_two_point_five_percent(self) -> None:
+        # ★[2026-08-26 현행화] 승인 실전값: 반등 1.5 / 바닥 1.0 / 추격상한 2.5
+        #   (chase_cap 2.0->2.5 는 8/26 10:15 친구님 지시로 실전 변경·봉인됨).
+        self.assertEqual(self.config.rebound_pct, 1.5)
+        self.assertEqual(self.config.entry_floor_pct, 1.0)
+        self.assertEqual(self.config.chase_cap_pct, 2.5)
 
-    def test_default_take_profit_is_five_percent(self) -> None:
-        self.assertEqual(self.config.tp_pct, 5.0)
+    def test_no_strategy_local_take_profit_field(self) -> None:
+        # ★[2026-08-26 현행화] 익절은 공용매도(strategy_06_common_exit_adapter →
+        #   strategy_common_hold_sell)로 이관 — S06 자체 tp_pct 필드는 삭제됐다.
+        self.assertFalse(hasattr(self.config, "tp_pct"))
 
     def test_under_10000_is_observed_but_order_is_blocked(self) -> None:
         write_json(self.config.snapshot_path, {
@@ -246,20 +310,20 @@ class ChaseMachineTest(unittest.TestCase):
         self.engine._cleanup_terminal()
         self.assertEqual(slots.released, [(CODE, state_day)])
 
-    def test_first_rebound_enters_one_share_inside_early_band(self) -> None:
+    def test_first_rebound_early_entry_fail_closed_without_flow(self) -> None:
+        # ★[2026-08-26 현행화] early-entry 는 기본 꺼짐(cap 0.0, 생산 재생 통과
+        #   전)이고, opt-in(1.8)을 해도 수급 흐름 자료가 없는 가격 모양만으로는
+        #   진입하지 않는다(fail-closed). 이 픽스처는 흐름이 비어 있으므로
+        #   포지션이 없어야 현재 계약이다.
         self.engine.config = replace(
             self.config,
             early_entry_cap_pct=1.8,
         )
         self.feed(price=20_000, hr_low=20_000)
         self.feed(price=18_200, hr_low=18_200)
-        self.feed(price=18_480, hr_low=18_200)  # +1.538%: early entry
+        self.feed(price=18_480, hr_low=18_200)  # +1.538%: 흐름 자료 없음
 
-        position = self.pos(1)
-        self.assertIsNotNone(position)
-        self.assertEqual(position["phase"], "HOLD")
-        self.assertEqual(position["qty"], 1)
-        self.assertEqual(position["entry_reason"], "FIRST_REBOUND_EARLY_ENTRY")
+        self.assertIsNone(self.pos(1))
 
     def test_first_rebound_above_early_band_keeps_legacy_observe(self) -> None:
         self.engine.config = replace(
@@ -346,9 +410,28 @@ class ChaseMachineTest(unittest.TestCase):
         self.assertIsNotNone(position)
         self.assertEqual(position["phase"], "HOLD")
         self.assertFalse(position["real"])
-        # 1발 뒤 재무장 — DONE이 아니라 CHASE + "산 저점보다 1% 깊은" 문턱이 걸려야 한다
+        # 1발 뒤 재무장 — 일봉 자료가 없으면 손절폭 2%가 최소 문턱이다.
         self.assertEqual(self.chase()["phase"], "CHASE")
-        self.assertAlmostEqual(float(self.chase()["dead_low"]), 18200.0 * 0.99)
+        self.assertAlmostEqual(float(self.chase()["dead_low"]), 18200.0 * 0.98)
+        self.assertAlmostEqual(
+            float(self.chase()["rearm_required_drop_pct"]), 2.0)
+
+    def test_rearm_uses_larger_atrp10_distance(self) -> None:
+        rows = ["date,code,high,low,close"]
+        start = datetime(2026, 7, 1, tzinfo=KST)
+        for index in range(11):
+            day = start + timedelta(days=index)
+            rows.append(f"{day:%Y%m%d},{CODE},110,90,100")
+        self.config.eod_bars_path.write_text(
+            "\n".join(rows) + "\n", encoding="utf-8")
+        self.engine._daily_atrp_cache = ("", {})
+        self.buy_shadow()
+        self.assertAlmostEqual(atrp10_pct([(110, 90, 100)] * 11), 20.0)
+        self.assertAlmostEqual(
+            float(self.chase()["rearm_atrp10_pct"]), 20.0)
+        self.assertAlmostEqual(
+            float(self.chase()["rearm_required_drop_pct"]), 15.0)
+        self.assertAlmostEqual(float(self.chase()["dead_low"]), 18200.0 * 0.85)
 
     def test_staircase_resets_low(self) -> None:
         self.feed(price=20000, hr_low=20000)
@@ -366,7 +449,7 @@ class ChaseMachineTest(unittest.TestCase):
     def test_giveup_above_chase_cap(self) -> None:
         self.feed(price=20000, hr_low=20000)
         self.feed(price=18200, hr_low=18200)
-        self.feed(price=18570, hr_low=18200)          # 저점+2% 초과 — 포기
+        self.feed(price=18700, hr_low=18200)          # 저점+2.5%(cap, 8/26 2.0->2.5) 초과 — 포기
         self.assertAlmostEqual(float(self.chase()["dead_low"]), 18200.0)
         self.assertEqual(self.engine._positions(), {})
         self.feed(price=18480, hr_low=18200)
@@ -419,7 +502,7 @@ class ChaseMachineTest(unittest.TestCase):
     def test_rearm_second_entry_needs_lower_low(self) -> None:
         self.buy_shadow()                              # 1발째
         self.assertEqual(self.chase()["phase"], "CHASE")
-        # 산 저점보다 1% 깊어지기 전에는 죽은 저점이 유지되고, 더 깊어지면 재무장한다.
+        # 산 저점보다 최소 손절폭 2% 깊어지기 전에는 죽은 저점이 유지된다.
         self.feed(price=18100, hr_low=18100, advance_sec=20,
                   buy_cum=2900, sell_cum=5000)
         self.assertGreater(float(self.chase()["dead_low"]), 0.0)
@@ -468,64 +551,50 @@ class ChaseMachineTest(unittest.TestCase):
         self.engine._daily_ma_cache = ("", {})
         self.engine._bars_cache = (-1.0, {})
 
-    def test_take_profit_5_same_day(self) -> None:
+    def test_same_day_plus_five_percent_holds_no_local_take_profit(self) -> None:
+        # ★[2026-08-26 현행화] 자체 익절(TP 5%)은 공용매도 이관으로 삭제 —
+        #   흐름 자료 없는 단순 +5.1% 상승에서는 계속 보유가 현재 계약이다.
         position = self.buy_shadow()
         entry = float(position["entry_price"])
         self.now += timedelta(seconds=60)
         self.snap(entry * 1.051, self.now)
         self.engine._evaluate_exit(position, self.now)
-        self.assertEqual(position["phase"], "CLOSED")
-        self.assertIn("TAKE_PROFIT", position["exit_reason"])
+        self.assertEqual(position["phase"], "HOLD")
 
-    def test_no_intraday_sell_without_tp(self) -> None:
+    def test_intraday_minus_ten_percent_hard_stops(self) -> None:
+        # ★[2026-08-26 현행화] 종전 계약("TP 없으면 장중 매도 없음")은 폐기 —
+        #   공용매도 하드스톱이 큰 손실을 즉시 정리한다.
         position = self.buy_shadow()
         entry = float(position["entry_price"])
         self.now += timedelta(seconds=60)
         self.snap(entry * 0.90, self.now)
         self.engine._evaluate_exit(position, self.now)
-        self.assertEqual(position["phase"], "HOLD")
+        self.assertEqual(position["phase"], "CLOSED")
+        self.assertIn("HARD_STOP", position["exit_reason"])
 
-    def test_next_morning_does_not_sell_immediately_at_0901(self) -> None:
+    def test_next_morning_flattens_without_trail(self) -> None:
+        # ★[2026-08-26 친구님 확정 "트레일은 안 해"] 익일 아침 트레일 보유
+        #   (NEXT_MORNING_PROFIT_TRAIL)는 제거가 승인 사항이다. 밤샘 포지션은
+        #   다음날 아침 평탄화(LEGACY_OVERNIGHT_FLAT)로 정리된다.
+        #   (종전 3개 테스트 — 0901 보유·MA 상승 보유·트레일 매도 — 는 제거된
+        #    기능의 계약이라 이 테스트 하나로 대체.)
         position = self.buy_shadow()
         entry = float(position["entry_price"])
         next_morning = datetime(2026, 8, 4, 9, 1, 0, tzinfo=KST)
         self.snap(entry * 0.97, next_morning)
         self.engine._evaluate_exit(position, next_morning)
-        self.assertEqual(position["phase"], "HOLD")
-        self.assertAlmostEqual(position["morning_peak_price"], entry * 0.97)
-
-    def test_next_morning_rising_ma_holds_after_peak_pullback(self) -> None:
-        position = self.buy_shadow()
-        entry = float(position["entry_price"])
-        peak_at = datetime(2026, 8, 4, 9, 2, 0, tzinfo=KST)
-        pullback_at = datetime(2026, 8, 4, 9, 5, 0, tzinfo=KST)
-        with patch(
-            "strategy_06_crash_low_chase_v1.ma3_rider_permit",
-            return_value=True,
-        ):
-            self.snap(entry * 1.10, peak_at, buy_cum=1000, sell_cum=1000)
-            self.engine._evaluate_exit(position, peak_at)
-            self.snap(entry * 1.0835, pullback_at, buy_cum=1100, sell_cum=1400)
-            self.engine._evaluate_exit(position, pullback_at)
-        self.assertEqual(position["phase"], "HOLD")
-        self.assertTrue(position["morning_daily_ma_permit"])
-
-    def test_next_morning_peak_trail_sells_on_seller_dominance(self) -> None:
-        position = self.buy_shadow()
-        entry = float(position["entry_price"])
-        peak_at = datetime(2026, 8, 4, 9, 2, 0, tzinfo=KST)
-        self.snap(entry * 1.10, peak_at, buy_cum=1000, sell_cum=1000)
-        self.engine._evaluate_exit(position, peak_at)
-        pullback_at = datetime(2026, 8, 4, 9, 5, 0, tzinfo=KST)
-        self.snap(entry * 1.075, pullback_at, buy_cum=1100, sell_cum=1400)
-        self.engine._evaluate_exit(position, pullback_at)
         self.assertEqual(position["phase"], "CLOSED")
-        self.assertIn("NEXT_MORNING_PROFIT_TRAIL", position["exit_reason"])
+        self.assertIn("LEGACY_OVERNIGHT_FLAT", position["exit_reason"])
 
-    def test_no_unapproved_force_exit_at_0930(self) -> None:
+    def test_no_unapproved_same_day_force_exit(self) -> None:
+        # ★[2026-08-26 현행화] 승인 없는 "시간 기반 당일 강제 정리"는 없다 —
+        #   본전 부근이면 두 시간이 지나도 보유. (익일 아침 평탄화는 별개 계약,
+        #   위 test_next_morning_flattens_without_trail 참조.)
         position = self.buy_shadow()
-        observed_at = datetime(2026, 8, 4, 9, 30, 0, tzinfo=KST)
-        self.engine._evaluate_exit(position, observed_at)
+        entry = float(position["entry_price"])
+        later = self.now + timedelta(hours=2)
+        self.snap(entry, later)
+        self.engine._evaluate_exit(position, later)
         self.assertEqual(position["phase"], "HOLD")
 
     def test_signal_record_has_flow_columns(self) -> None:

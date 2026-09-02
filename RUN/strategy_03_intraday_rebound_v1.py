@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Deque, Protocol
 
@@ -16,22 +16,25 @@ from typing import Any, Deque, Protocol
 FLOW_GATES_OFF = os.environ.get("S03_FLOW_GATES_OFF", "YES").strip().upper() == "YES"
 
 from strategy_03_signal_contract_v1 import (
+    FIRST_REBOUND_PCT,
     INTRADAY_CRASH_ALGORITHM,
     INTRADAY_CRASH_LANE,
+    INTRADAY_MAX_DRAWDOWN_PCT,
     INTRADAY_MAX_REBOUND_PCT,
     INTRADAY_MIN_DRAWDOWN_PCT,
     INTRADAY_MIN_REBOUND_PCT,
-    SIGNAL_MODE,
-    FIRST_REBOUND_PCT,
     MIN_HIGHER_LOW_PCT,
     MIN_PULLBACK_PCT,
     MIN_SECOND_REBOUND_PCT,
+    SIGNAL_MODE,
 )
+from strategy_03_flow_turn_fast_v1 import seller_exhaustion_fast_decision
 
 
 class IntradayPoint(Protocol):
     ts: datetime
     price: float
+    minute_low: float
     # ★[S03-OPENPRICE-FIX 2026-08-06 친구님 지시 "셋 다 고쳐"] 당일 시가.
     #   실제로 넘어오는 객체(골짜기_급반등.py MicroPoint)에는 원래 있었는데
     #   여기 규약에 없어서 신호 행에 안 실렸다. 그 결과 회전엔진 선별기가
@@ -79,8 +82,13 @@ class IntradayReboundConfig:
     #   되돌리기: RUN\backup\strategy_03_intraday_rebound_v1_20260731_firstbull.py 복원
     high_window_sec: float = 10 * 60
     min_drawdown_pct: float = INTRADAY_MIN_DRAWDOWN_PCT
+    max_drawdown_pct: float = INTRADAY_MAX_DRAWDOWN_PCT
     min_rebound_pct: float = INTRADAY_MIN_REBOUND_PCT
     max_rebound_pct: float = INTRADAY_MAX_REBOUND_PCT
+    first_rebound_pct: float = FIRST_REBOUND_PCT
+    pullback_min_pct: float = MIN_PULLBACK_PCT
+    higher_low_buffer_pct: float = MIN_HIGHER_LOW_PCT
+    second_rebound_pct: float = MIN_SECOND_REBOUND_PCT
     # ★[S03-LANE2 2026-08-06 친구님 지시 "2초 관찰, 바로 상승해야 되고, 1분 안에 바로
     #   상승하지 않으면 매수 금지야. 급락 후 바로 급상승하는 거 잡기 위함이야"]
     #   관찰 3초 → 2초, 확인창 180초 → 60초. 저점이 생기고 1분 안에 반등(+0.5~1.0%)과
@@ -137,7 +145,11 @@ class IntradayReboundConfig:
     max_signals_per_code: int = 2
 
     def __post_init__(self) -> None:
-        if self.high_window_sec < 600 or self.min_drawdown_pct <= 0:
+        if (
+            self.high_window_sec < 600
+            or self.min_drawdown_pct <= 0
+            or self.max_drawdown_pct <= self.min_drawdown_pct
+        ):
             raise ValueError("invalid intraday crash window")
         if not 0 < self.min_rebound_pct < self.max_rebound_pct:
             raise ValueError("invalid rebound range")
@@ -250,6 +262,17 @@ class IntradayReboundDetector:
             state.points.popleft()
         return None
 
+    @staticmethod
+    def _effective_low_point(point: IntradayPoint) -> IntradayPoint:
+        """Use the forming one-minute low as the anchor, with tick-price fallback."""
+        minute_low = abs(float(getattr(point, "minute_low", 0.0) or 0.0))
+        if minute_low <= 0 or minute_low >= point.price:
+            return point
+        try:
+            return replace(point, price=minute_low)
+        except TypeError:
+            return point
+
     def _money_rate(self, point: IntradayPoint, seconds: float) -> float:
         prior = [
             row for row in list(self.state.points)[:-1]
@@ -301,6 +324,85 @@ class IntradayReboundDetector:
             and recent_buy > recent_sell
             and recent_sell <= prev_sell
         )
+
+    def _seller_exhaustion_fast(
+        self,
+        point: IntradayPoint,
+        low: IntradayPoint,
+        rebound_pct: float,
+    ) -> dict[str, Any]:
+        """Confirm a fast bottom before buy flow has to overtake sell flow."""
+        rows = list(self.state.points)
+        if len(rows) < 4:
+            decision = seller_exhaustion_fast_decision(
+                rapid_drop_pct=0.0,
+                rebound_pct=rebound_pct,
+                sell_rate_old=0.0,
+                sell_rate_mid=0.0,
+                sell_rate_now=0.0,
+                price_up_ticks=0,
+                ask_depleting=False,
+                best_bid_share=0.0,
+                spread_bps=0.0,
+                microprice_edge_bps=0.0,
+                new_low=point.price <= low.price,
+            )
+            decision["metrics"] = {"sample_count": len(rows)}
+            return decision
+
+        old, mid, recent, end = rows[-4:]
+
+        def sell_rate(left: IntradayPoint, right: IntradayPoint) -> float:
+            elapsed = (right.ts - left.ts).total_seconds()
+            delta = right.sell_money_cum - left.sell_money_cum
+            return max(0.0, delta) / elapsed if elapsed > 0 else 0.0
+
+        sell_rate_old = sell_rate(old, mid)
+        sell_rate_mid = sell_rate(mid, recent)
+        sell_rate_now = sell_rate(recent, end)
+        post_low_rows = [row for row in rows if row.ts >= low.ts]
+        price_up_ticks = 0
+        for left, right in reversed(list(zip(post_low_rows[:-1], post_low_rows[1:]))):
+            if right.price <= left.price:
+                break
+            price_up_ticks += 1
+        ask_depleting = bool(
+            len(post_low_rows) >= 3
+            and post_low_rows[-3].best_ask_qty > 0
+            and post_low_rows[-2].best_ask_qty > 0
+            and post_low_rows[-1].best_ask_qty > 0
+            and post_low_rows[-2].best_ask_qty < post_low_rows[-3].best_ask_qty
+            and post_low_rows[-1].best_ask_qty < post_low_rows[-2].best_ask_qty
+        )
+        book_total = end.best_bid_qty + end.best_ask_qty
+        best_bid_share = end.best_bid_qty / book_total if book_total > 0 else 0.0
+        spread_bps, microprice_edge_bps = self._book_metrics(point)
+        rapid_drop_pct = max(
+            0.0,
+            (1.0 - low.price / self.state.high_price) * 100.0
+            if self.state.high_price > 0 else 0.0,
+        )
+        decision = seller_exhaustion_fast_decision(
+            rapid_drop_pct=rapid_drop_pct,
+            rebound_pct=rebound_pct,
+            sell_rate_old=sell_rate_old,
+            sell_rate_mid=sell_rate_mid,
+            sell_rate_now=sell_rate_now,
+            price_up_ticks=price_up_ticks,
+            ask_depleting=ask_depleting,
+            best_bid_share=best_bid_share,
+            spread_bps=spread_bps,
+            microprice_edge_bps=microprice_edge_bps,
+            new_low=point.price <= low.price,
+        )
+        decision["metrics"] = {
+            "sell_rate_old": round(sell_rate_old, 4),
+            "sell_rate_mid": round(sell_rate_mid, 4),
+            "sell_rate_now": round(sell_rate_now, 4),
+            "price_up_ticks": price_up_ticks,
+            "best_bid_share": round(best_bid_share, 4),
+        }
+        return decision
 
     def _sell_decel_buy_flip_staircase(
         self, point: IntradayPoint, low: IntradayPoint, pullback_ts,
@@ -430,6 +532,24 @@ class IntradayReboundDetector:
                 "dip_drop_pct": round(drawdown, 3),
             }
             dip_meta.update(state.low_gauges)  # ★[2026-08-06] 계기판 3종(기록만)
+        first_rebound = (
+            (state.first_rebound_peak / low.price - 1.0) * 100.0
+            if low is not None and low.price > 0 and state.first_rebound_peak > 0
+            else 0.0
+        )
+        pullback_depth = (
+            (state.first_rebound_peak / state.pullback_low - 1.0) * 100.0
+            if state.first_rebound_peak > 0 and state.pullback_low > 0 else 0.0
+        )
+        higher_low = (
+            (state.pullback_low / low.price - 1.0) * 100.0
+            if low is not None and low.price > 0 and state.pullback_low > 0
+            else 0.0
+        )
+        second_rebound = (
+            (point.price / state.pullback_low - 1.0) * 100.0
+            if state.pullback_low > 0 else 0.0
+        )
         row: dict[str, Any] = {
             "ts": point.ts.isoformat(timespec="milliseconds"),
             "action": action,
@@ -460,6 +580,10 @@ class IntradayReboundDetector:
             ),
             "intraday_drawdown_pct": round(drawdown, 4),
             "rebound_pct": round(rebound, 4),
+            "first_rebound_pct": round(first_rebound, 4),
+            "pullback_depth_pct": round(pullback_depth, 4),
+            "higher_low_pct": round(higher_low, 4),
+            "second_rebound_pct": round(second_rebound, 4),
             "spread_bps": round(spread_bps, 4),
             "microprice_edge_bps": round(microprice_edge_bps, 4),
         }
@@ -513,36 +637,36 @@ class IntradayReboundDetector:
             return self._row(point, "DONE", "CODE_DAILY_ENTRY_LIMIT_2")
 
         if state.phase in {"SCAN", "EMITTED", "WAIT_NEW_LOW"}:
-            # ★[S03-DAYHIGH-FIX 2026-08-06 친구님 "장중 고점 잘못된 거야 / 당일 고점으로"]
-            #   종전: max(state.points) = 10분 창 안의 최대값 → 당일 고점이 아니다.
-            #   지금: 그날 내내 갱신한 day_high_price.
-            #   자료가 아직 없으면(0) 예전처럼 창 최대값으로 물러선다.
-            if state.day_high_price > 0:
-                high_price, high_ts = state.day_high_price, state.day_high_ts
-            else:
-                fallback = max(state.points, key=lambda row: row.price)
-                high_price, high_ts = fallback.price, fallback.ts
-            drawdown = (point.price / high_price - 1.0) * 100.0
+            # 2026-08-27 owner approval: this lane means an actual fast crash,
+            # so measure from the rolling 10-minute high, not the all-day high.
+            rolling_high = max(state.points, key=lambda row: row.price)
+            high_price, high_ts = rolling_high.price, rolling_high.ts
+            low_candidate = self._effective_low_point(point)
+            drawdown = (low_candidate.price / high_price - 1.0) * 100.0
             new_cycle_low = (
                 state.last_emitted_low <= 0
-                or point.price < state.last_emitted_low
+                or low_candidate.price < state.last_emitted_low
             )
             if drawdown > -self.config.min_drawdown_pct or not new_cycle_low:
                 state.phase = "SCAN"
-                return self._row(point, "WAIT", "INTRADAY_DRAWDOWN_LT_3PCT")
+                return self._row(point, "WAIT", "INTRADAY_DRAWDOWN_LT_REQUIRED")
+            if drawdown <= -self.config.max_drawdown_pct:
+                state.phase = "WAIT_NEW_LOW"
+                state.dead_low = low_candidate.price
+                return self._row(point, "WAIT", "INTRADAY_DRAWDOWN_S06_ZONE")
             # ★[S03-LANE2 2026-08-06] 폐기된 저점보다 낮아져야만 새 사이클 —
             #   "1분 안에 안 튄 저점은 매수 금지"를 지키는 빗장.
-            if state.dead_low > 0 and point.price >= state.dead_low:
+            if state.dead_low > 0 and low_candidate.price >= state.dead_low:
                 state.phase = "SCAN"
                 return self._row(point, "WAIT", "DEAD_LOW_REQUIRES_LOWER_LOW")
             state.dead_low = 0.0
             state.phase = "LOW_CONFIRM"
             state.high_price = high_price
             state.high_ts = high_ts
-            state.low_point = point
+            state.low_point = low_candidate
             state.low_updated_at = point.ts
             state.low_reset_steps = 0        # ★새 급락 시작 = 계단 수 초기화
-            state.low_gauges = self._compute_low_gauges(point)  # ★계기판(기록만)
+            state.low_gauges = self._compute_low_gauges(low_candidate)  # ★계기판(기록만)
             state.first_rebound_peak = 0.0
             state.pullback_seen = False
             state.pullback_low = 0.0
@@ -552,14 +676,28 @@ class IntradayReboundDetector:
         if low is None or state.high_price <= 0:
             state.phase = "SCAN"
             return self._row(point, "RESET", "INTRADAY_STATE_INVALID_RESET")
-        if point.price < low.price:
-            state.low_point = point
-            state.low_updated_at = point.ts
-            state.low_reset_steps += 1       # ★저점이 한 계단 더 내려감
-            state.low_gauges = self._compute_low_gauges(point)  # ★계단마다 다시 잰다
+        low_candidate = self._effective_low_point(point)
+        candidate_drawdown = (
+            (low_candidate.price / state.high_price - 1.0) * 100.0
+            if state.high_price > 0 else 0.0
+        )
+        if candidate_drawdown <= -self.config.max_drawdown_pct:
+            state.phase = "WAIT_NEW_LOW"
+            state.dead_low = low_candidate.price
             state.first_rebound_peak = 0.0
             state.pullback_seen = False
             state.pullback_low = 0.0
+            state.pullback_low_ts = None
+            return self._row(point, "WAIT", "INTRADAY_DRAWDOWN_S06_ZONE")
+        if low_candidate.price < low.price:
+            state.low_point = low_candidate
+            state.low_updated_at = point.ts
+            state.low_reset_steps += 1       # ★저점이 한 계단 더 내려감
+            state.low_gauges = self._compute_low_gauges(low_candidate)  # ★계단마다 다시 잰다
+            state.first_rebound_peak = 0.0
+            state.pullback_seen = False
+            state.pullback_low = 0.0
+            state.pullback_low_ts = None
             return self._row(point, "RESET", "INTRADAY_NEW_LOW_RESET")
 
         elapsed = (point.ts - low.ts).total_seconds()
@@ -577,24 +715,24 @@ class IntradayReboundDetector:
         if stable < self.config.low_stable_sec:
             return row
 
-        # 첫 반등 하나를 바닥으로 확정하지 않는다. 기존 OPEN_CRASH와 같은
-        # 눌림→높은 두 번째 저점→재반등 모양을 확인한 뒤에만 수급 판정으로 간다.
-        higher_low_floor = low.price * (1.0 + MIN_HIGHER_LOW_PCT / 100.0)
+        higher_low_floor = low.price * (
+            1.0 + self.config.higher_low_buffer_pct / 100.0)
         if state.first_rebound_peak <= 0:
-            if rebound < FIRST_REBOUND_PCT:
+            if rebound < self.config.first_rebound_pct:
                 return row
             state.first_rebound_peak = point.price
             return self._row(point, "WAIT", "FIRST_REBOUND_WAIT_RETEST")
         if not state.pullback_seen:
             state.first_rebound_peak = max(state.first_rebound_peak, point.price)
             pullback_trigger = state.first_rebound_peak * (
-                1.0 - MIN_PULLBACK_PCT / 100.0)
+                1.0 - self.config.pullback_min_pct / 100.0)
             if point.price <= pullback_trigger:
                 if point.price < higher_low_floor:
                     state.first_rebound_peak = 0.0
                     state.pullback_low = 0.0
                     state.pullback_low_ts = None
-                    return self._row(point, "WAIT", "PULLBACK_BELOW_HIGHER_LOW_FLOOR")
+                    return self._row(
+                        point, "WAIT", "PULLBACK_BELOW_HIGHER_LOW_FLOOR")
                 state.pullback_seen = True
                 state.pullback_low = point.price
                 state.pullback_low_ts = point.ts
@@ -609,7 +747,7 @@ class IntradayReboundDetector:
             state.pullback_low = point.price
             state.pullback_low_ts = point.ts
         if point.price < state.pullback_low * (
-            1.0 + MIN_SECOND_REBOUND_PCT / 100.0
+            1.0 + self.config.second_rebound_pct / 100.0
         ):
             return self._row(point, "WAIT", "NO_SECOND_REBOUND")
         if not self.config.min_rebound_pct <= rebound <= self.config.max_rebound_pct:
@@ -629,12 +767,13 @@ class IntradayReboundDetector:
         buy_rate10 = self._money_rate(point, 10.0)
         buy_rate30 = self._money_rate(point, 30.0)
         spread_bps, microprice_edge_bps = self._book_metrics(point)
-        # ★[S03-LANE2 2026-08-06] 매수 방법 공유 관문 — 매도 감속 + 매수 가속 + 매수 우위
-        #   (1레인 급행과 동일)가 이 순간 확인돼야만 산다. 닷새 전수 근거는 config 주석 참조.
-        # ★[2026-08-13] 계단(재눌림) 경로는 계단 앵커 기준시점으로 같은 관문을 본다.
-        if not self._sell_decel_buy_flip_staircase(
-                point, low, state.pullback_low_ts):
-            return self._row(point, "WAIT", "NO_SELL_DECEL_BUY_FLIP")
+        # The first rebound is observation-only. Enter only after the higher-low
+        # retest and second rebound, with seller exhaustion and book confirmation.
+        seller_exhaustion = self._seller_exhaustion_fast(point, low, rebound)
+        if not seller_exhaustion["ready"]:
+            wait_row = self._row(point, "WAIT", "SELLER_EXHAUSTION_FAST_WAIT")
+            wait_row["seller_exhaustion_fast"] = seller_exhaustion
+            return wait_row
         # ★[2026-07-31 친구님 지시 "먼저 있던 것은 폐기해야 돼"] 8겹 관문 중
         #   '확인 조건' 5개를 폐기한다(FLOW_GATES_OFF=YES 가 기본).
         #   폐기 대상: 진입대금 1천만원 · 매수체결비중 · 매수대금비중 · 30초 매수흐름 ·
@@ -693,8 +832,9 @@ class IntradayReboundDetector:
         row = self._row(
             point,
             "BUY_READY",
-            "INTRADAY_CRASH+LOW_STABLE+EXACT_SHORT_BUY_DOMINANCE+BOOK_CONFIRM",
+            "INTRADAY_CRASH+STAIRCASE_RETEST+SECOND_REBOUND+SELLER_EXHAUSTION_FAST+BOOK_CONFIRM",
         )
+        row["seller_exhaustion_fast"] = seller_exhaustion
         row["anchor_id"] = (
             f"{state.high_ts.isoformat(timespec='seconds') if state.high_ts else ''}:"
             f"{state.high_price:.4f}:"

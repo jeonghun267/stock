@@ -1,0 +1,28 @@
+프로그램 정리 1차 기록 — 2026-08-26 저녁 (친구님 실행, Claude 검증)
+================================================================
+방식: 휴지통 이동 (전부 복원 가능 — 휴지통에서 우클릭 > 복원)
+규칙: (A) RUN\backup 중 7일 이상 지난 백업
+      (B) 이미 적용 끝난 일회용 명부 스크립트 (오늘 20260826 것 제외)
+      (C) 무참조 확정 1개 (captain2 — stockbot_live_broadcast_v1로 대체된 옛 중계기)
+
+결과 [실측]: 총 21개 휴지통 이동
+- RUN\backup: 194 -> 181개 (13개, 전부 8/19 이전 백업, git 미추적이라 복원은 휴지통에서만)
+- 일회용 스크립트 7개 (git 추적 파일 — 휴지통 외에 git으로도 복원 가능):
+    update_common_broker_low_rebound_manifest_20260820.py
+    update_common_relative_strength_shadow_manifest_20260821.py
+    update_s01_v3_shadow_manifest_20260820.py
+    update_s02_adaptive_depth_manifest_20260820.py
+    update_s03_deep_crash_ledger_manifest_20260821.py
+    update_s03_deep_crash_shadow_manifest_20260821.py
+    update_s03_flow_turn_manifest_20260820.py
+- captain2_live_broadcast.py (git 추적)
+
+보존한 것:
+- 최근 7일 백업 181개 (오늘 실전 변경들의 롤백 경로)
+- update_s03_board_universe_manifest_20260826.py (오늘 적용분)
+
+2차(추가 정리) 참고: RUN 최상위 285개 전수 대조 결과 무참조는 captain2 단 1개.
+나머지는 명부·예약작업·런처·코드 어딘가에 이름이 있어 정적 검사로는 못 버림.
+더 정리하려면 "진입점 도달 가능성" 분석 필요 (보고서\프로그램정리_후보목록_20260826.txt 참조).
+검증 기준: 내일 아침점검 정상 기동이면 1차 정리 무사고 확정.
+================================================================

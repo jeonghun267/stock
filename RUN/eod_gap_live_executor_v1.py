@@ -12,6 +12,7 @@ sys.path.insert(0, r"C:\stock_bot\RUN")
 sys.path.insert(0, r"C:\stock_bot\MONITOR")
 import os
 import eod_gap_track_shadow_v1 as G   # _intraday, _load_opt10032_aft, _load_memb, _load_block 재사용
+from eod_gap_score_common_v1 import calculate_raw_score
 
 EOD = r"C:\stock_bot\data\eod_daily_bars.csv"
 POS = Path(r"C:\stock_bot\DATA\eod_gap_positions.json")
@@ -39,6 +40,10 @@ LOCKED_D2_PRIORITY_UNTIL = os.environ.get(
 #   기존 _supply_net(당일 opt10059)은 그림자 기록만, 우선순위 정렬은 supply_signal D-lag(기본2)로 교체.
 SUPPLY_LAG = int(os.environ.get("EOD_GAP_SUPPLY_LAG", "2"))
 MIN_SCORE = float(os.environ.get("EOD_GAP_MIN_SCORE", "75"))
+_MAX_SCORE_RAW = os.environ.get("EOD_GAP_MAX_SCORE", "").strip()
+MAX_SCORE = float(_MAX_SCORE_RAW) if _MAX_SCORE_RAW else None
+if MAX_SCORE is not None and MAX_SCORE <= MIN_SCORE:
+    raise ValueError("EOD_GAP_MAX_SCORE must be greater than EOD_GAP_MIN_SCORE")
 # [통일 종가점수 연결 2026-07-02 친구님 "선별방법 더 구체적으로 만들어 실행기에 연결·그림자 먼저·내일 실전"]
 #   ★daily_leader_board 종가점수 방법(마감+상승+추세+거래량+유동성+D-2)을 오늘 15:17 데이터로 이식해 후보 랭킹.
 #   기본 NO=그림자(실매수 vs 통일점수 top 로그만·매수 무변경). YES=통일점수로 재랭킹(라이브). 롤백 setx EOD_GAP_UNIFIED_PICK NO.
@@ -163,15 +168,33 @@ AUCTION_FIDS = "21;23;24;121;125"
 AUCTION_AUDIT_DIR = Path(r"C:\stock_bot\data\audit\eod_gap_auction")
 AUCTION_REPLAY_DIR = Path(r"C:\stock_bot\data\audit\eod_gap_auction_replay")
 LIVE_BOARD_CACHE = Path(r"C:\stock_bot\DATA\eod_gap_live_board_cache.json")
+ENTRY_AUDIT_DIR = Path(r"C:\stock_bot\data\audit\eod_gap_entry")
+ENTRY_REPLAY_DIR = Path(r"C:\stock_bot\reports\verified_replay")
+ENTRY_CAPTURE = os.environ.get("EOD_GAP_CAPTURE_INPUTS", "NO").strip().upper() == "YES"
+_ENTRY_AUDIT_PATH = None
+_ENTRY_AUDIT_HASH = ""
+_ENTRY_AUDIT_SEQ = 0
 ACCOUNT = os.environ.get("SWING_ACCOUNT", "").strip()
 LAST_ORDER_STATUS = ""
 PORTFOLIO_ROUTE_TAGS = {}
 SELL_RETRY_COUNT = 3
 SELL_RETRY_INTERVAL_SEC = 2.0
+SELL_DEFER_MAX_SEC = 120.0
+SELL_MARKET_MAX_SLIP_PCT = 3.0
+SELL_FORCE_MARKET_HHMM = 930
+SELL_QUOTE_MAX_AGE_SEC = 30.0
+SELL_AUDIT_DIR = Path(r"C:\stock_bot\data\audit\eod_gap_sell_guard")
+_SELL_STARTED_AT = {}
+_SELL_LAST_PLAN = {}
+_SELL_FILL_AUDITED = set()
 LIVE_BOARD_MAX_AGE_SEC = float(os.environ.get("EOD_GAP_BOARD_MAX_AGE_SEC", "120"))
 LIVE_BOARD_CACHE_FALLBACK = os.environ.get(
     "EOD_GAP_BOARD_CACHE_FALLBACK", "NO"
 ).strip().upper() == "YES"
+ORDER_MIN_PRICE = float(os.environ.get("SAFEPLUS_MIN_PRICE", "10000") or "10000")
+ORDER_MIN_MARKETCAP = float(
+    os.environ.get("SAFEPLUS_MIN_MARKETCAP", "100000000000") or "100000000000"
+)
 
 
 def _pick_window_open(now=None):
@@ -180,16 +203,36 @@ def _pick_window_open(now=None):
     return (15, 0) <= (now.hour, now.minute) < (15, 29)
 
 
+def _score_gate_reason(score):
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return "SCORE_INVALID"
+    if value < MIN_SCORE:
+        return "SCORE_FLOOR"
+    if MAX_SCORE is not None and value >= MAX_SCORE:
+        return "SCORE_ABOVE_MAX"
+    return ""
+
+
 def _passes_final_score(score):
-    """One immutable score floor shared by every EOD_GAP buy route.
+    """One immutable score band shared by every non-LOCKED EOD_GAP buy route.
 
     ★[2026-08-14] 단 LOCKED(상한가) 경로만 예외다 — _passes_locked_score 를 쓴다.
       상한가는 거래가 잠겨 거래대금 점수를 못 받아 이 문턱을 구조적으로 못 넘는다.
     """
-    try:
-        return float(score) >= MIN_SCORE
-    except (TypeError, ValueError):
-        return False
+    return not _score_gate_reason(score)
+
+
+def _log_final_score_block(code, score):
+    reason = _score_gate_reason(score)
+    if reason == "SCORE_ABOVE_MAX":
+        _log(
+            f"[FINAL-SCORE-GATE] {code} "
+            f"SCORE_ABOVE_MAX({float(score):g}/{MAX_SCORE:g}) -> NO_TRADE")
+    else:
+        _log(f"[FINAL-SCORE-GATE] {code} {score} < {MIN_SCORE} -> NO_TRADE")
+    return reason
 
 
 def _passes_locked_score(score):
@@ -200,25 +243,49 @@ def _passes_locked_score(score):
         return False
 
 
-def _passes_locked_marketcap(cand):
-    """LOCKED PICK 전에 BrokerClient와 같은 시총 하한을 미리 적용한다."""
+def _passes_order_universe(cand):
+    """Broker gateway와 같은 가격·시총 하한을 주문 전에 fail-closed로 적용한다."""
     try:
         from broker_client import _load_shares_cache
         code = str(cand[1]).zfill(6)
         price = float(cand[4] or 0)
-        shares = float(_load_shares_cache().get(code, 0) or 0)
-        if price <= 0 or shares <= 0:  # BrokerClient와 동일한 fail-open
-            return True
-        marketcap = shares * price
-        if marketcap < LOCKED_MIN_MARKETCAP:
-            _log(
-                f"[LOCKED-MCAP] {code} {marketcap/1e8:.0f}억<1000억 "
-                "→ PICK 사전제외"
-            )
+        if price < ORDER_MIN_PRICE:
+            _entry_audit_append({"record_type": "order_universe", "code": code,
+                                 "passed": False, "reason": "PRICE_FLOOR",
+                                 "price": price, "shares": None})
+            _log(f"[ORDERABLE] {code} 가격 {price:.0f}<{ORDER_MIN_PRICE:.0f} → 다음 후보")
             return False
+        shares = float(_load_shares_cache().get(code, 0) or 0)
+        if shares <= 0:
+            _entry_audit_append({"record_type": "order_universe", "code": code,
+                                 "passed": False, "reason": "SHARES_MISSING",
+                                 "price": price, "shares": shares})
+            _log(f"[ORDERABLE] {code} 상장주식수 없음 → 다음 후보")
+            return False
+        marketcap = shares * price
+        if marketcap < ORDER_MIN_MARKETCAP:
+            _entry_audit_append({"record_type": "order_universe", "code": code,
+                                 "passed": False, "reason": "MARKETCAP_FLOOR",
+                                 "price": price, "shares": shares,
+                                 "marketcap": marketcap})
+            _log(f"[ORDERABLE] {code} 시총 {marketcap/1e8:.0f}억"
+                 f"<{ORDER_MIN_MARKETCAP/1e8:.0f}억 → 다음 후보")
+            return False
+        _entry_audit_append({"record_type": "order_universe", "code": code,
+                             "passed": True, "reason": "PASS", "price": price,
+                             "shares": shares, "marketcap": marketcap})
         return True
-    except Exception:
-        return True
+    except Exception as exc:
+        _entry_audit_append({"record_type": "order_universe",
+                             "code": str(cand[1]).zfill(6), "passed": False,
+                             "reason": "CHECK_ERROR", "error": str(exc)})
+        _log(f"[ORDERABLE] {str(cand[1]).zfill(6)} 검증실패({exc}) → 다음 후보")
+        return False
+
+
+def _passes_locked_marketcap(cand):
+    """이전 호출부 호환: 모든 경로와 동일한 주문가능성 검사를 사용한다."""
+    return _passes_order_universe(cand)
 
 
 def _save_live_board_cache(rows, now=None):
@@ -371,8 +438,8 @@ def _broker():
     return BrokerClient()
 
 
-def _order(bc, code, qty, side, tag):
-    """검증된 send_order_real(최유리06). side=BUY/SELL. LIVE=NO면 모의."""
+def _order(bc, code, qty, side, tag, hoga_gb=None, price=None):
+    """BUY=최유리06. SELL 호가·가격은 보호 단계가 명시하며 기본은 06."""
     global LAST_ORDER_STATUS
     LAST_ORDER_STATUS = ""
     # ★[2026-07-01 대장주 순위표 게이트] 종가매수도 전날 종가 대장주 순위표 안에서만.
@@ -405,6 +472,8 @@ def _order(bc, code, qty, side, tag):
         if not ACCOUNT:
             _log(f"[{tag}] 계좌없음 → 주문불가"); return False
         ot = 1 if side == "BUY" else 2
+        hoga_gb = str(hoga_gb or "06")
+        price = 0 if price is None else int(float(price))
         # ★[2026-07-31] 매수만 고정 키 — uuid 면 게이트웨이 중복주문 차단(TTL 5분)이 안 걸린다.
         #   매도는 uuid 유지: 실패 응답도 캐시되므로(broker_gateway_v1.py:2087) 고정하면
         #   직전 실패에 막혀 재시도가 안 나간다 — 못 파는 쪽이 더 나쁘다.
@@ -412,7 +481,7 @@ def _order(bc, code, qty, side, tag):
                  else f"eodgap_{side.lower()}_{code}_{uuid.uuid4()}")
         r = bc.send_order_real(idempotency_key=_idem,
                                account=ACCOUNT, code=code, qty=int(qty), order_type=ot,
-                               price=0, hoga_gb="06", rqname=f"EODGAP_{side}_{code}", screen_no="9703")
+                               price=price, hoga_gb=hoga_gb, rqname=f"EODGAP_{side}_{code}", screen_no="9703")
         try:
             _raw_response = json.dumps(r, ensure_ascii=False, default=str)
         except Exception:
@@ -487,6 +556,117 @@ def _cancel_sell_order(bc, code, order_no, remaining):
         return False
 
 
+def _sell_audit_append(event):
+    """Append-only market-sell guard evidence. Audit failure never changes an order."""
+    try:
+        now = datetime.now()
+        payload = {"ts": now.isoformat(timespec="milliseconds"), **dict(event)}
+        SELL_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        path = SELL_AUDIT_DIR / f"sell_guard_{now:%Y%m%d}.jsonl"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:
+        _log(f"[SELL-AUDIT] write failed {type(exc).__name__}: {exc}")
+
+
+def _sell_quote_guard(code, now=None):
+    """Return a fresh current/best-bid snapshot and current-to-bid slippage."""
+    now = now or datetime.now()
+    snap = _read_micro(code) or {}
+    try:
+        cur = abs(float(snap.get("cur") or 0))
+        bid = abs(float(snap.get("best_bid_px") or 0))
+        raw_ts = str(snap.get("ob_ts") or snap.get("ts") or "")
+        stamp = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).replace(tzinfo=None)
+        age = max(0.0, (now.replace(tzinfo=None) - stamp).total_seconds())
+    except (TypeError, ValueError):
+        return {"ok": False, "reason": "QUOTE_MISSING", "cur": 0.0,
+                "bid": 0.0, "slip_pct": None, "quote_ts": ""}
+    if cur <= 0 or bid <= 0:
+        return {"ok": False, "reason": "QUOTE_ZERO", "cur": cur,
+                "bid": bid, "slip_pct": None, "quote_ts": raw_ts}
+    slip_pct = ((cur - bid) / cur) * 100.0
+    if age > SELL_QUOTE_MAX_AGE_SEC:
+        return {"ok": False, "reason": f"QUOTE_STALE({age:.1f}s)", "cur": cur,
+                "bid": bid, "slip_pct": slip_pct, "quote_ts": raw_ts}
+    return {"ok": True, "reason": "QUOTE_FRESH", "cur": cur, "bid": bid,
+            "slip_pct": slip_pct, "quote_ts": raw_ts}
+
+
+def _sell_order_plan(code, attempt, now=None):
+    """06 -> best-bid limit(00) -> guarded market(03); force market at 09:30."""
+    now = now or datetime.now()
+    quote = _sell_quote_guard(code, now=now)
+    force_due = (now.hour * 100 + now.minute) >= SELL_FORCE_MARKET_HHMM
+    if attempt <= 0:
+        return {**quote, "action": "ORDER", "stage": "BEST_LIMIT_06",
+                "hoga_gb": "06", "price": 0, "force_due": force_due}
+    if force_due:
+        return {**quote, "action": "ORDER", "stage": "FORCE_MARKET_03",
+                "hoga_gb": "03", "price": 0, "force_due": True}
+    if attempt == 1:
+        if quote["ok"]:
+            return {**quote, "action": "ORDER", "stage": "BEST_BID_LIMIT_00",
+                    "hoga_gb": "00", "price": int(quote["bid"]), "force_due": False}
+        return {**quote, "action": "DEFER", "stage": "WAIT_FOR_BEST_BID",
+                "hoga_gb": "", "price": 0, "force_due": False}
+    if quote["ok"] and quote["slip_pct"] <= SELL_MARKET_MAX_SLIP_PCT:
+        return {**quote, "action": "ORDER", "stage": "GUARDED_MARKET_03",
+                "hoga_gb": "03", "price": 0, "force_due": False}
+    reason = quote["reason"] if not quote["ok"] else (
+        f"SLIP_ABOVE_MAX({quote['slip_pct']:.3f}/{SELL_MARKET_MAX_SLIP_PCT:.3f})")
+    return {**quote, "action": "DEFER", "stage": "SLIPPAGE_WAIT",
+            "reason": reason, "hoga_gb": "", "price": 0, "force_due": False}
+
+
+def _sell_defer_expired(code, now=None):
+    """Bound one symbol's DEFER so later holdings keep their protected sequence."""
+    now = now or datetime.now()
+    started = _SELL_STARTED_AT.get(str(code).zfill(6))
+    if not started:
+        return False, 0.0
+    elapsed = max(0.0, (now - started).total_seconds())
+    return elapsed >= SELL_DEFER_MAX_SEC, elapsed
+
+
+def _audit_sell_fill(code):
+    """Join the pre-order quote with the broker's permanent FID910 fill ledger."""
+    key = (datetime.now().strftime("%Y%m%d"), str(code).zfill(6))
+    if key in _SELL_FILL_AUDITED:
+        return
+    started = _SELL_STARTED_AT.get(str(code).zfill(6))
+    fill_path = Path(r"C:\stock_bot\LOG") / f"fills_{key[0]}.csv"
+    matched = None
+    try:
+        with fill_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                if str(row.get("code") or "").zfill(6) != key[1]:
+                    continue
+                if "매도" not in str(row.get("otype") or ""):
+                    continue
+                fill_ts = datetime.strptime(str(row.get("ts")), "%Y-%m-%d %H:%M:%S")
+                if started is None or fill_ts >= started.replace(microsecond=0):
+                    matched = dict(row)
+        if matched:
+            plan = dict(_SELL_LAST_PLAN.get(key[1]) or {})
+            bid = float(plan.get("bid") or 0)
+            fill_px = float(matched.get("fill_px") or 0)
+            fill_vs_bid_pct = ((fill_px - bid) / bid * 100.0) if bid > 0 else None
+            _sell_audit_append({
+                "provenance": "[BROKER_FILL]", "event": "SELL_FILL", "code": key[1],
+                "source_data": str(fill_path), "order_no": matched.get("order_no"),
+                "fill_ts": matched.get("ts"), "fill_qty": matched.get("fill_qty"),
+                "fill_px": matched.get("fill_px"), "quote": plan,
+                "fill_vs_bid_pct": fill_vs_bid_pct,
+            })
+            _SELL_FILL_AUDITED.add(key)
+            return
+    except Exception as exc:
+        _log(f"[SELL-AUDIT] fill lookup failed {code} {type(exc).__name__}: {exc}")
+    _sell_audit_append({"provenance": "[UNVERIFIED]", "event": "SELL_FILL_MISSING",
+                        "code": key[1], "source_data": str(fill_path)})
+
+
 def _portfolio_v2_select(cands, theme_map, d2_map, held_codes, max_pos, unified=None):
     """Owner-approved portfolio: <=1 locked, remaining non-locked, <=1 per theme."""
     unified = unified or {}
@@ -558,18 +738,23 @@ def _portfolio_v2_select(cands, theme_map, d2_map, held_codes, max_pos, unified=
 
 
 def _sell_with_recovery(bc, code, quantity):
-    """Initial sell plus three cancel/replace retries; close only when flat."""
+    """Four order attempts with price protection; defer guarded market until safe/09:30."""
+    code = str(code).zfill(6)
+    _SELL_STARTED_AT[code] = datetime.now()
     ambiguous = False
-    for attempt in range(SELL_RETRY_COUNT + 1):
+    attempt = 0
+    while attempt <= SELL_RETRY_COUNT:
         if attempt:
             time.sleep(SELL_RETRY_INTERVAL_SEC)
         truth = _sell_truth(bc, code)
         if truth is None:
             _log(f"[SELL-RETRY {attempt}/{SELL_RETRY_COUNT}] {code} truth unavailable; wait")
+            attempt += 1
             continue
         holding, open_orders = truth
         if holding <= 0:
             _log(f"[SELL-FILLED] {code} broker balance=0")
+            _audit_sell_fill(code)
             return True
         if open_orders:
             for order_no, remaining in open_orders.items():
@@ -589,13 +774,37 @@ def _sell_with_recovery(bc, code, quantity):
             holding = confirmed[0]
             ambiguous = False
             if holding <= 0:
+                _audit_sell_fill(code)
                 return True
-        _order(bc, code, min(int(quantity), int(holding)), "SELL", f"SELL-{attempt + 1}")
+        plan = _sell_order_plan(code, attempt)
+        _SELL_LAST_PLAN[code] = dict(plan)
+        _sell_audit_append({"provenance": "[UNVERIFIED]", "event": "SELL_ORDER_PLAN",
+                            "code": code, "attempt": attempt + 1, **plan})
+        _log(f"[SELL-GUARD] {code} stage={plan['stage']} action={plan['action']} "
+             f"cur={plan.get('cur')} bid={plan.get('bid')} slip={plan.get('slip_pct')} "
+             f"reason={plan.get('reason')}")
+        if plan["action"] == "DEFER":
+            defer_expired, defer_elapsed = _sell_defer_expired(code)
+            if defer_expired:
+                _sell_audit_append({
+                    "provenance": "[UNVERIFIED]", "event": "SELL_DEFER_TIMEOUT",
+                    "code": code, "elapsed_sec": defer_elapsed,
+                    "max_sec": SELL_DEFER_MAX_SEC, "reason": plan.get("reason"),
+                })
+                _log(f"[SELL-DEFER-TIMEOUT] {code} elapsed={defer_elapsed:.1f}s "
+                     f">={SELL_DEFER_MAX_SEC:.1f}s; OPEN retained, continue next symbol")
+                return False
+            time.sleep(SELL_RETRY_INTERVAL_SEC)
+            continue
+        _order(bc, code, min(int(quantity), int(holding)), "SELL", f"SELL-{attempt + 1}",
+               hoga_gb=plan["hoga_gb"], price=plan["price"])
         ambiguous = LAST_ORDER_STATUS == "TIMEOUT"
+        attempt += 1
     time.sleep(SELL_RETRY_INTERVAL_SEC)
     final_truth = _sell_truth(bc, code)
     if final_truth is not None and final_truth[0] <= 0:
         _log(f"[SELL-FILLED] {code} broker balance=0 after final retry")
+        _audit_sell_fill(code)
         return True
     remaining = "UNKNOWN" if final_truth is None else final_truth[0]
     _log(f"[SELL-RETRY-EXHAUSTED] {code} remaining={remaining}; OPEN retained")
@@ -851,6 +1060,274 @@ def _sha256(path):
     return h.hexdigest()
 
 
+def _entry_jsonable(value):
+    """Convert pandas/numpy scalar values at the decision boundary to stable JSON."""
+    if isinstance(value, dict):
+        return {str(k): _entry_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_entry_jsonable(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+        return None
+    return value
+
+
+def _entry_audit_append(event):
+    """Append one canonical hash-chained decision-boundary observation."""
+    global _ENTRY_AUDIT_HASH, _ENTRY_AUDIT_SEQ
+    if not ENTRY_CAPTURE or _ENTRY_AUDIT_PATH is None:
+        return
+    payload = _entry_jsonable(dict(event))
+    payload["seq"] = _ENTRY_AUDIT_SEQ
+    payload["prev_sha256"] = _ENTRY_AUDIT_HASH
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"), allow_nan=False).encode("utf-8")
+    digest = hashlib.sha256(canonical).hexdigest()
+    payload["record_sha256"] = digest
+    with _ENTRY_AUDIT_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                allow_nan=False) + "\n")
+        handle.flush()
+    _ENTRY_AUDIT_HASH = digest
+    _ENTRY_AUDIT_SEQ += 1
+
+
+def _entry_config_snapshot():
+    return {
+        "LIVE": LIVE, "MAX_POS": MAX_POS, "QTY_ONE_ALL": QTY_ONE_ALL,
+        "MIN_SCORE": MIN_SCORE, "MAX_SCORE": MAX_SCORE,
+        "DR_CEIL": DR_CEIL, "VR_MIN": VR_MIN,
+        "STRATA_ON": STRATA_ON, "STRATB_ON": STRATB_ON,
+        "UNIFIED_PICK": UNIFIED_PICK, "UNIFIED_MIN": UNIFIED_MIN,
+        "FRI_UNIFIED_MIN": FRI_UNIFIED_MIN, "LIMITUP_ADD": LIMITUP_ADD,
+        "LOCKED_D2_PRIORITY": LOCKED_D2_PRIORITY,
+        "ORDER_MIN_PRICE": ORDER_MIN_PRICE,
+        "ORDER_MIN_MARKETCAP": ORDER_MIN_MARKETCAP,
+        "AUCTION_GATE_MODE": AUCTION_GATE_MODE,
+    }
+
+
+def _start_entry_audit(today, top, cands, positions, raw_score_inputs=None):
+    """Preserve immutable computed observations before candidate selection/order gates."""
+    global _ENTRY_AUDIT_PATH, _ENTRY_AUDIT_HASH, _ENTRY_AUDIT_SEQ
+    if not ENTRY_CAPTURE:
+        return None
+    now = datetime.now()
+    day_dir = ENTRY_AUDIT_DIR / str(today)
+    day_dir.mkdir(parents=True, exist_ok=True)
+    _ENTRY_AUDIT_PATH = day_dir / f"entry_{now:%H%M%S_%f}.jsonl"
+    _ENTRY_AUDIT_HASH = ""
+    _ENTRY_AUDIT_SEQ = 0
+    source_files = []
+    for source in (Path(EOD), LIVE_BOARD_CACHE, Path(r"C:\stock_bot\DATA\shares_outstanding.csv")):
+        if source.exists():
+            source_files.append({"path": str(source), "size": source.stat().st_size,
+                                 "sha256": _sha256(source)})
+    _entry_audit_append({
+        "record_type": "decision_boundary",
+        "schema": "eod_gap_entry_audit_v1",
+        "provenance": "[UNVERIFIED]",
+        "date": str(today),
+        "captured_at": now.isoformat(timespec="milliseconds"),
+        "production_entry_point": str(Path(__file__).resolve()),
+        "capture_engine_sha256": _sha256(Path(__file__)),
+        "capture_command": (r"C:\python310\python.exe -X utf8 "
+                            r"C:\stock_bot\RUN\eod_gap_live_executor_v1.py pick"),
+        "config": _entry_config_snapshot(),
+        "top": top,
+        "candidates": cands,
+        "raw_score_inputs": raw_score_inputs or {},
+        "positions_before": positions,
+        "source_files": source_files,
+    })
+    _log(f"[ENTRY-AUDIT] decision inputs saved {_ENTRY_AUDIT_PATH}")
+    return _ENTRY_AUDIT_PATH
+
+
+def _previous_trading_day(today=None):
+    day = today or datetime.now().date()
+    holidays = set()
+    try:
+        for line in Path(r"C:\stock_bot\config\krx_holidays.txt").read_text(
+                encoding="utf-8-sig").splitlines():
+            token = line.split("#", 1)[0].strip()
+            if len(token) == 8 and token.isdigit():
+                holidays.add(token)
+    except Exception:
+        pass
+    day -= timedelta(days=1)
+    while day.weekday() >= 5 or day.strftime("%Y%m%d") in holidays:
+        day -= timedelta(days=1)
+    return day.strftime("%Y%m%d")
+
+
+def _read_entry_audit(path):
+    rows = []
+    previous = ""
+    for index, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines()):
+        row = json.loads(line)
+        digest = str(row.pop("record_sha256", ""))
+        canonical = json.dumps(row, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":"), allow_nan=False).encode("utf-8")
+        expected = hashlib.sha256(canonical).hexdigest()
+        if row.get("seq") != index or row.get("prev_sha256") != previous or digest != expected:
+            raise ValueError(f"audit hash chain mismatch seq={index}")
+        row["record_sha256"] = digest
+        rows.append(row)
+        previous = digest
+    if not rows:
+        raise ValueError("empty entry audit")
+    return rows
+
+
+def _replay_candidate_decision(row):
+    """Call the current production _buy_one path using only captured gate observations."""
+    import types
+    obs = dict(row.get("observations") or {})
+    pick = tuple(row.get("pick") or [])
+    if len(pick) < 14:
+        raise ValueError("candidate pick fields missing")
+    setup_route = bool(obs.get("setup_route"))
+    held = {}
+    if obs.get("held_status"):
+        held[str(row.get("code"))] = {"status": obs["held_status"]}
+
+    def _value_or_error(value, passed):
+        if value == "ERROR_FAIL_OPEN":
+            raise RuntimeError("captured fail-open observation")
+        return passed
+
+    trend_value = obs.get("trend_gate")
+    foreign_value = obs.get("foreign_gate")
+    smart_value = obs.get("smart_money_block")
+    fake_modules = {
+        "trend_filter": types.SimpleNamespace(
+            is_jeongbae=lambda *_: _value_or_error(trend_value, trend_value != "BLOCK")),
+        "foreign_supply": types.SimpleNamespace(
+            buy_gate=lambda *_args, **_kwargs: _value_or_error(
+                foreign_value, foreign_value != "BLOCK")),
+        "smart_money": types.SimpleNamespace(
+            dumping=lambda *_: (_value_or_error(
+                smart_value, bool(smart_value) if isinstance(smart_value, bool) else False),
+                obs.get("smart_money_detail", ""))),
+    }
+    saved_modules = {name: sys.modules.get(name) for name in fake_modules}
+    saved_micro = globals()["_eod_micro_skip"]
+    saved_order = globals()["_order"]
+    saved_log = globals()["_log"]
+    saved_live = globals()["LIVE"]
+    saved_capture = globals()["ENTRY_CAPTURE"]
+    try:
+        sys.modules.update(fake_modules)
+        globals()["_eod_micro_skip"] = lambda *_args, **_kwargs: bool(obs.get("micro_block"))
+        globals()["_order"] = lambda *_args, **_kwargs: True
+        globals()["_log"] = lambda *_args, **_kwargs: None
+        globals()["LIVE"] = False
+        globals()["ENTRY_CAPTURE"] = False
+        return bool(_buy_one(object(), pick, str(row.get("date") or ""), held,
+                             setup_route=setup_route))
+    finally:
+        globals()["_eod_micro_skip"] = saved_micro
+        globals()["_order"] = saved_order
+        globals()["_log"] = saved_log
+        globals()["LIVE"] = saved_live
+        globals()["ENTRY_CAPTURE"] = saved_capture
+        for name, module in saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def _replay_entry_audit(audit_path):
+    audit_path = Path(audit_path)
+    report_path = None
+    try:
+        rows = _read_entry_audit(audit_path)
+        header = rows[0]
+        if header.get("record_type") != "decision_boundary":
+            raise ValueError("decision boundary header missing")
+        capture_hash = str(header.get("capture_engine_sha256") or "")
+        replay_hash = _sha256(Path(__file__))
+        if capture_hash != replay_hash:
+            raise ValueError(
+                f"ENGINE_CHANGED_REBASELINE: capture={capture_hash} current={replay_hash}"
+            )
+        captured_config = dict(header.get("config") or {})
+        current_config = _entry_config_snapshot()
+        for key, value in captured_config.items():
+            if key != "LIVE" and current_config.get(key) != value:
+                raise ValueError(f"CONFIG_CHANGED_REBASELINE: {key}")
+        if not header.get("top") or not header.get("candidates"):
+            raise ValueError("candidate observations missing")
+        if len(header.get("source_files") or []) < 3:
+            raise ValueError("source hashes missing")
+
+        by_type = {}
+        for row in rows:
+            by_type.setdefault(row.get("record_type"), []).append(row)
+        attempts_rows = by_type.get("attempt_order") or []
+        decisions = by_type.get("candidate_decision") or []
+        if not by_type.get("selection_context") or not attempts_rows or not decisions:
+            raise ValueError("selection/attempt/gate observations missing")
+        if (captured_config.get("STRATA_ON") or captured_config.get("STRATB_ON")) \
+                and not by_type.get("setup_order"):
+            raise ValueError("A/B ordered observations missing")
+        attempts = attempts_rows[-1].get("ordered_candidates") or []
+        attempt_codes = [str(c[1]).zfill(6) for c in attempts]
+        decision_codes = [str(row.get("code")).zfill(6) for row in decisions]
+        if decision_codes != attempt_codes[:len(decision_codes)]:
+            raise ValueError("candidate attempt order mismatch")
+        universe_pass = {str(row.get("code")).zfill(6) for row in
+                         (by_type.get("order_universe") or []) if row.get("passed")}
+        if any(code not in universe_pass for code in decision_codes):
+            raise ValueError("order-universe observation missing")
+
+        replayed = []
+        eligible = 0
+        for row in decisions:
+            actual = _replay_candidate_decision(row)
+            expected = row.get("decision") == "ORDER_ELIGIBLE"
+            if actual != expected:
+                raise ValueError(f"decision mismatch code={row.get('code')}")
+            eligible += int(actual)
+            replayed.append({"code": str(row.get("code")).zfill(6),
+                             "decision": "PASS" if actual else "BLOCK"})
+        date = str(header.get("date") or "")
+        out_dir = ENTRY_REPLAY_DIR / date
+        out_dir.mkdir(parents=True, exist_ok=True)
+        report_path = out_dir / f"eod_gap_entry_replay_{date}.json"
+        report = {
+            "provenance": "[PROD_REPLAY]", "date": date,
+            "source_data": str(audit_path.resolve()), "status": "PASS",
+            "command": (r"C:\python310\python.exe -X utf8 "
+                        r"C:\stock_bot\RUN\eod_gap_live_executor_v1.py entry_replay_auto"),
+            "production_entry_point": str(Path(__file__).resolve()),
+            "source_sha256": _sha256(audit_path),
+            "capture_engine_sha256": capture_hash,
+            "replay_engine_sha256": replay_hash,
+            "performance_scope": "DECISION_ONLY",
+            "eligible_candidates": eligible,
+            "decisions": replayed,
+        }
+        tmp = report_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(str(tmp), str(report_path))
+        from trading_report_truth_gate_v1 import validate
+        ok, reason = validate(report)
+        if not ok:
+            raise ValueError(f"truth gate failed: {reason}")
+        return True, "PASS", report_path
+    except Exception as exc:
+        return False, str(exc), report_path
+
+
 def _auction_replay_report_path(now=None):
     now = now or datetime.now()
     return AUCTION_REPLAY_DIR / f"auction_replay_{now:%Y%m%d}.json"
@@ -1002,11 +1479,21 @@ def _supply_shadow(today, c, inst, frgn):
         pass
 
 
-def _buy_one(bc, pick, today, held):
+def _buy_one(bc, pick, today, held, setup_route=False):
     """[MULTIPOS] pick 1건 매수+기록(held 딕셔너리 mutate·RT_OPEN 갱신). 성공 True. 중복/실패시 False."""
     sc, code, nm, eok, px, pv, pc, pb, _lim, w52, ma20over, _dret, _vr, _vrt, *_rest = pick
+    observations = {"price": px, "score": sc, "setup_route": bool(setup_route),
+                    "is_locked": bool(_lim)}
+
+    def _decision(passed, reason):
+        _entry_audit_append({"record_type": "candidate_decision", "date": today,
+                             "code": code, "pick": pick,
+                             "decision": "ORDER_ELIGIBLE" if passed else "BLOCK",
+                             "reason": reason, "observations": observations})
+        return bool(passed)
+
     if px <= 0:
-        _log(f"{code} 가격0 → skip"); return False
+        _log(f"{code} 가격0 → skip"); return _decision(False, "PRICE_ZERO")
     # ★[LOCKED-FLOOR-2 2026-08-14 친구님 승인] 점수 관문이 두 겹이었다.
     #   LOCKED-FIRST 경로(:968)에서 LOCKED_MIN_SCORE 로 통과시켜도 여기서 다시
     #   MIN_SCORE(70)로 잘려 결국 NO_TRADE 였다 — 상한가는 거래가 잠겨 거래대금
@@ -1014,13 +1501,20 @@ def _buy_one(bc, pick, today, held):
     #   상한가만 LOCKED_MIN_SCORE, 일반 후보는 종전 MIN_SCORE 그대로.
     #   MAX_POS·상한가 1주(LOCKED_QTY_ONE)·후보순위·주문방식·매도조건은 무변경.
     #   백업: eod_gap_live_executor_v1_20260814_before_buyone_locked_floor.py
-    _floor_ok = _passes_locked_score(sc) if bool(_lim) else _passes_final_score(sc)
+    # 전략 A/B는 자체 패턴이 진입 게이트다. 일반 점수구간은 재적용하지 않는다.
+    _floor_ok = True if (setup_route and not bool(_lim)) else (
+        _passes_locked_score(sc) if bool(_lim) else _passes_final_score(sc)
+    )
+    if not _floor_ok and not bool(_lim):
+        reason = _log_final_score_block(code, sc)
+        return _decision(False, reason)
     if not _floor_ok:
         _log(f"[FINAL-SCORE-GATE] {code} {sc} < "
              f"{LOCKED_MIN_SCORE if bool(_lim) else MIN_SCORE} -> NO_TRADE")
-        return False
+        return _decision(False, "SCORE_FLOOR")
     if code in held and held[code].get("status") in ("OPEN", "PENDING"):
-        return False                              # 이미 보유 → 중복방지
+        observations["held_status"] = held[code].get("status")
+        return _decision(False, "ALREADY_HELD")  # 이미 보유 → 중복방지
     qty = max(1, int(CAP // px))
     # ★[2026-07-29 친구님 지시 "상한가도 무조건 1주로 해줘 15만원 아니야"]
     #   상한가는 익일 변동폭이 크다(1년 950건 최악 -29.14%). CAP 15만원어치가 아니라 1주만 산다.
@@ -1029,42 +1523,63 @@ def _buy_one(bc, pick, today, held):
         qty = 1
     if QTY_ONE_ALL:
         qty = 1
-    if _eod_micro_skip(bc, code, reference_px=px, is_locked=bool(_lim)):
-        return False                              # ★종가 매도우위 → 매수보류
+    micro_block = _eod_micro_skip(bc, code, reference_px=px, is_locked=bool(_lim))
+    observations["micro_block"] = bool(micro_block)
+    if micro_block:
+        return _decision(False, "MICRO_OR_AUCTION_GATE")
     if AUCTION_GATE_MODE == "LIVE":
         replay_ok, replay_reason = _auction_replay_ready()
+        observations["auction_replay_ready"] = bool(replay_ok)
+        observations["auction_replay_reason"] = replay_reason
         if not replay_ok:
             _log(f"★EOD_GAP 매수보류 {code}: [PROD-REPLAY-GATE] {replay_reason}")
-            return False
-    # [2026-07-17 친구님 "종가매수 통합" 정배열 면제 전면 폐지] 전략A/B 무관 무조건 5>20>60 확인. 데이터없으면 통과(fail-open).
+            return _decision(False, "AUCTION_REPLAY_NOT_READY")
+    # [2026-08-27 owner approved] 전략 A/B는 자체 패턴을 진입 게이트로 사용하므로
+    # 일반 후보용 strict 정배열을 다시 적용하지 않는다. 일반 후보는 기존 strict를 유지한다.
     # ★[2026-07-29 친구님 지시 "상한가만 정배열 면제해"] 상한가(_lim)만 이 관문을 건너뛴다.
     #   근거(일봉 1년·상한가 950건·익일 시가매도·비용 0.38% 차감):
     #     정배열 통과 512건 +6.117%/승률 75.4%  vs  탈락 438건 +5.783%/승률 76.3%
     #     차이 0.334%p뿐이고 승률은 오히려 탈락이 높다 = 상한가에 선별력이 없는데 기회의 46%를 버린다.
     #   비-LOCKED 는 종전대로 관문 유지(거기선 검증하지 않았다). 롤백: setx EOD_GAP_JB_EXEMPT_LOCKED NO
-    if bool(_lim) and JB_EXEMPT_LOCKED:
+    if setup_route:
+        observations["trend_gate"] = "EXEMPT_SETUP"
+        _log(f"EOD_GAP {code} 정배열 strict 면제(전략 A/B 자체 게이트)")
+    elif bool(_lim) and JB_EXEMPT_LOCKED:
+        observations["trend_gate"] = "EXEMPT_LOCKED"
         _log(f"EOD_GAP {code} 정배열 면제(상한가·근거 950건 성과차 0.33%p)")
     else:
         try:
             import trend_filter as _tf
-            if not _tf.is_jeongbae(code, "strict"):
-                _log(f"EOD_GAP {code} 스킵(정배열 strict 5>20>60 아님)"); return False
-        except Exception:
-            pass
+            trend_ok = bool(_tf.is_jeongbae(code, "strict"))
+            observations["trend_gate"] = "PASS" if trend_ok else "BLOCK"
+            if not trend_ok:
+                _log(f"EOD_GAP {code} 스킵(정배열 strict 5>20>60 아님)")
+                return _decision(False, "TREND_STRICT")
+        except Exception as exc:
+            observations["trend_gate"] = "ERROR_FAIL_OPEN"
+            observations["trend_error"] = str(exc)
     # [FOREIGN-GATE 2026-06-28 친구님] 거래원 외국계 매도우세 게이트(env FOREIGN_GATE: LOG/BLOCK)
     try:
         import foreign_supply as _fs
-        if not _fs.buy_gate(code, log=_log, tag="EOD_GAP"):
-            return False
-    except Exception:
-        pass
+        foreign_ok = bool(_fs.buy_gate(code, log=_log, tag="EOD_GAP"))
+        observations["foreign_gate"] = "PASS" if foreign_ok else "BLOCK"
+        if not foreign_ok:
+            return _decision(False, "FOREIGN_GATE")
+    except Exception as exc:
+        observations["foreign_gate"] = "ERROR_FAIL_OPEN"
+        observations["foreign_error"] = str(exc)
     try:                                           # ★[2026-07-06] 스마트머니 던지기 회피(공용·외국인금액+프로그램 실시간·구foreign버그 보완)
         import smart_money as _SM
         _blk, _smi = _SM.dumping(bc, code, px)
+        observations["smart_money_block"] = bool(_blk)
+        observations["smart_money_detail"] = _smi
         if _blk:
-            _log(f"⛔ EOD_GAP {code} 스마트머니 던지기 차단 [{_smi}] — 매수스킵"); return False
-    except Exception:
-        pass
+            _log(f"⛔ EOD_GAP {code} 스마트머니 던지기 차단 [{_smi}] — 매수스킵")
+            return _decision(False, "SMART_MONEY_DUMPING")
+    except Exception as exc:
+        observations["smart_money_block"] = "ERROR_FAIL_OPEN"
+        observations["smart_money_error"] = str(exc)
+    _decision(True, "ALL_ENTRY_GATES_PASS")
     _log(f"★EOD_GAP 매수 {code} {nm} {sc}점 @{px:,.0f} x{qty}={qty*px:,}원 (캡{CAP:,})")
     order_ok = _order(bc, code, qty, "BUY", "PICK")
     if LIVE and LAST_ORDER_STATUS in ("OK", "TIMEOUT"):
@@ -1079,6 +1594,8 @@ def _buy_one(bc, pick, today, held):
         _log("매수 실패/모의 → 기록보류" if LIVE else "모의매수")
         if LIVE:
             return False
+    if not LIVE:
+        return True
     held[code] = {"code": code, "name": nm, "qty": qty, "buy_price": px, "score": sc,
                   "date": today, "status": "OPEN", "live": LIVE,
                   "route_tags": PORTFOLIO_ROUTE_TAGS.get(str(code).zfill(6), []),
@@ -1090,6 +1607,11 @@ def _buy_one(bc, pick, today, held):
                     "_chejan_ts": datetime.now().isoformat()}
         _jsave(RT_OPEN, rt)
     return True
+
+
+def _stop_after_pending(position):
+    """Accepted orders may continue; ambiguous TIMEOUT must stop the batch."""
+    return str((position or {}).get("order_status") or "").upper() == "TIMEOUT"
 
 
 def _unified_scores(cands, today, lag):
@@ -1210,7 +1732,7 @@ def mode_pick():
             val_eok = float(d.get("val", 0)) / 100.0
             if VAL_CEIL_EOK > 0 and val_eok >= VAL_CEIL_EOK:
                 _log(f"[FROM_RUNNER] ②{rank} {code} {nm} 거래대금{val_eok:.0f}억 ≥ 상한{VAL_CEIL_EOK:.0f}억 → skip(갭다운위험)"); continue
-            qty = max(1, int(CAP // px))
+            qty = 1 if QTY_ONE_ALL else max(1, int(CAP // px))
             ok, msg = _buyable(code, qty)
             if not ok:
                 _log(f"[FROM_RUNNER] ②{rank} {code} {nm} 못삼: {msg} → 다음 순번"); continue
@@ -1231,7 +1753,7 @@ def mode_pick():
                 pass
             runner_score = round(float(d.get("score2", 0)))
             if not _passes_final_score(runner_score):
-                _log(f"[FINAL-SCORE-GATE] {code} {runner_score} < {MIN_SCORE} -> NO_TRADE")
+                _log_final_score_block(code, runner_score)
                 continue
             _log(f"★[FROM_RUNNER] ②{rank} {code} {nm} @{px:,} x{qty}={qty*px:,}원 {msg} "
                  f"(거래대금{d.get('val',0)/100:.0f}억·종가{d.get('cp',0)*100:.0f}%·상승{d.get('chg',0):+.0f}%·가속{d.get('late_vacc',0):.1f})")
@@ -1247,6 +1769,9 @@ def mode_pick():
             if not order_ok:
                 _log("매수 실패/모의" if LIVE else "모의매수")
                 if LIVE: return
+            if not LIVE:
+                bought = True
+                break
             held[code] = {"code": code, "name": nm, "qty": qty, "buy_price": px,
                           "score": runner_score, "date": today, "status": "OPEN",
                           "live": LIVE, "src": "RUNNER", "rank": rank, "ts": datetime.now().isoformat()}
@@ -1259,14 +1784,16 @@ def mode_pick():
         cached_top = _load_fresh_live_board_cache()
         if cached_top and LIVE_BOARD_CACHE_FALLBACK:
             top = cached_top
-            _log(f"[LIVE-BOARD-CACHE] opt10032 실패 → 당일 2분 이내 캐시 {len(top)}종목 사용")
+            _log(f"[LIVE-BOARD-CACHE] opt10032 실패 → 당일 "
+                 f"{LIVE_BOARD_MAX_AGE_SEC/60:.0f}분 이내 캐시 {len(top)}종목 사용")
         else:
             if cached_top:
                 _log(
                     f"[LIVE-BOARD-CACHE-SHADOW] fresh cache {len(cached_top)} rows available; "
                     "fallback disabled pending production replay"
                 )
-            _log("[LIVE-BOARD-GATE] opt10032 empty/error; no same-day <=2m cache -> NO_TRADE")
+            _log(f"[LIVE-BOARD-GATE] opt10032 empty/error; no same-day "
+                 f"<={LIVE_BOARD_MAX_AGE_SEC/60:.0f}m cache -> NO_TRADE")
             return
     # ★[LIMITUP-ADD 2026-07-29] 상한가는 거래가 잠겨 거래대금 상위 N 밖으로 밀린다 → 따로 보탠다.
     limitup_px = {}     # ★유니버스 밖 상한가는 분봉(im)이 없다 → 현재가를 여기서 받아 day_ret 계산에 쓴다
@@ -1298,6 +1825,7 @@ def mode_pick():
             vrank[c] = i
     ntop = len(top)
     cands = []
+    raw_score_inputs = {}
     for rank0, (code, nm, v) in enumerate(top):
         eok = v / 100.0
         if code in block:
@@ -1312,35 +1840,35 @@ def mode_pick():
             if im["upper_wick"] >= 0.5: continue
             if im["late_drop"] <= -3.0: continue
             if im["close_pos"] < 0.3 and im["late_drop"] <= -1.5: continue
-        # 점수(공급우선순위 D-2 정렬/타이브레이크용 — 손대지 않음)
-        vr = (v / pe["v20"]) if (pe.get("v20") and pe["v20"] > 0) else 0   # 거래대금/20일
-        p_val_abs = (1.0 - rank0 / max(ntop, 1)) * 20                      # opt10032 거래대금 순위(1위=만점)
-        p_val_20 = 10 if vr >= 3 else 7 if vr >= 2 else 4 if vr >= 1.5 else max(0, (vr - 1) / 0.5 * 4)
         oa = opt_aft.get(code)
-        if oa and oa["n"] >= 2:
-            p_aft = min(oa["aft_ratio"] / 0.4, 1.0) * 5 + min(oa["late_ratio"] / 0.15, 1.0) * 3 + (2 if oa["sustained"] else 0)
-        elif im:
-            p_aft = min(im["aft_val_eok"] / 50.0, 1.0) * 5 + min(im["pm_ratio"] / 0.4, 1.0) * 5
-        else:
-            p_aft = 0
-        p_aft = min(p_aft, 10)
-        p_value = p_val_abs + p_val_20 + p_aft
-        cpos = im["close_pos"] if im else 0.5
-        p_close = (8 if (im and im["vwap_over"]) else 0) + cpos * 7 \
-            + (5 if im and im["late_drop"] >= -1 else 0) + (max(0, 1 - (im["upper_wick"] if im else 0.3) / 0.5) * 5)
-        p_boom = 0
-        if im:
-            p_boom = min((5 if im["big13"] else 0) + (7 if im["big1430"] else 0) + (5 if im["big_spike"] else 0)
-                        + (5 if im["follow"] else 0) + (3 if im["vwap_over"] else 0), 20)
         vrt = vrank.get(code, 99)
-        p_theme = 6 if vrt == 1 else 4 if vrt == 2 else 0
         # ★[LIMITUP-ADD 2026-07-29] 유니버스 밖에서 보탠 상한가는 분봉(im)이 없다.
         #   im 이 없으면 cur_close=cl_prev 가 되어 day_ret=0 → is_locked 가 영원히 False 였다.
         #   opt10027 에서 받아둔 현재가로 채워 상한가 판정이 되게 한다.
         cur_close = im["close"] if im else (limitup_px.get(code) or cl_prev)
-        p_rs = (3 if (pe.get("c5") and cur_close > pe["c5"]) else 0) + 2
-        score = round(p_value + p_close + p_boom + p_theme + p_rs, 1)
-        day_ret = (cur_close / cl_prev - 1) if cl_prev else 0   # 당일 상승률
+        raw = calculate_raw_score(
+            rank0, ntop, v, pe.get("v20"), oa, im, vrt,
+            cur_close, cl_prev, pe.get("c5"),
+        )
+        def _audit_number(value):
+            try:
+                number = float(value)
+                return number if number == number and abs(number) != float("inf") else None
+            except (TypeError, ValueError):
+                return None
+        raw_score_inputs[code] = {
+            "rank0": int(rank0), "universe_size": int(ntop),
+            "turnover": _audit_number(v), "value20": _audit_number(pe.get("v20")),
+            "opt_after": oa, "intraday": im, "theme_rank": int(vrt),
+            "current_close": _audit_number(cur_close),
+            "close_prev": _audit_number(cl_prev), "close5": _audit_number(pe.get("c5")),
+        }
+        score = raw["score"]
+        p_value = raw["value_score"]
+        p_close = raw["close_score"]
+        p_boom = raw["boom_score"]
+        vr = raw["volume_ratio"]
+        day_ret = raw["day_return"]   # 당일 상승률
         is_locked = bool(cl_prev and day_ret >= 0.285)   # 종가 상한가(LOCKED)
         _ma5 = pe.get("ma5"); _ma20 = pe.get("ma20"); _ma60 = pe.get("ma60")
         _uw = im["upper_wick"] if im else 0.3
@@ -1388,18 +1916,22 @@ def mode_pick():
         _log(f"[LOCKED-PRIORITY] 풀내 LOCKED {n_locked}개 → LOCKED 우선(점수순 유지)")
     else:
         cands.sort(key=lambda x: x[0], reverse=True)
+    _start_entry_audit(today, top, cands, _existing, raw_score_inputs)
     _log(f"opt10032 {len(top)} → 후보 {len(cands)}")
     for c in cands[:5]:
         _log(f"  {c[1]} {c[2][:8]} {c[0]}점{'★L' if c[8] else ''} (거래대금{c[5]:.0f}+종가{c[6]:.0f}+폭발{c[7]:.0f}) {c[3]:.0f}억 w52={c[9]}")
     # [LEADER-ONLY SHADOW 2026-06-24] 대장(테마거래대금1위 vrt==1)+배수≥LEAD_VR_MIN 선별 — 항상 계산(그림자), LEADER_ONLY=YES면 라이브 교체
     _lead = [c for c in cands if len(c) > 13 and c[13] == 1 and c[12] >= LEAD_VR_MIN
-             and not c[8] and c[0] >= MIN_SCORE and (LEAD_VR_CEIL <= 0 or c[12] < LEAD_VR_CEIL)]
+             and not c[8] and _passes_final_score(c[0])
+             and (LEAD_VR_CEIL <= 0 or c[12] < LEAD_VR_CEIL)]
     leader_pick = _lead[0] if _lead else None   # cands는 점수순 정렬됨 → 첫째=최고점
     _log(f"[LEADER-ONLY·{'LIVE' if LEADER_ONLY else 'shadow'}] 대장+배수≥{LEAD_VR_MIN:g} 후보 {len(_lead)}"
          + (f" → {leader_pick[1]} {leader_pick[2][:8]} {leader_pick[0]}점 배수{leader_pick[12]:.1f}" if leader_pick else " → 없음"))
     # [통일 종가점수 연결 2026-07-02] 오늘 데이터로 통일점수 계산(그림자/라이브 공용). 실패=빈dict(무영향).
     uni = _unified_scores(cands, today, SUPPLY_LAG)
     _isfri = datetime.now().weekday() == 4    # 금요일=주말 홀드
+    _entry_audit_append({"record_type": "selection_context",
+                         "unified_scores": uni, "is_friday": _isfri})
     if uni:
         _utop = sorted(uni.items(), key=lambda kv: -kv[1])[:5]
         _unm = {c[1]: c[2] for c in cands}
@@ -1407,6 +1939,7 @@ def mode_pick():
         _frtag = "·금요일엄선" if (_isfri and UNIFIED_PICK and FRI_UNIFIED_MIN > 0) else ("·금요일(그림자)" if _isfri else "")
         _log(f"[통일점수·{_mode}{_frtag}] top5: " + ", ".join(f"{c} {(_unm.get(c,'') or '')[:6]} {s:.0f}" for c, s in _utop))
     picks = None   # [MULTIPOS] setup분기=리스트 / 레거시분기=단일 pick→아래서 [pick] 변환
+    setup_route_codes = set()
     if PORTFOLIO_V2:
         global PORTFOLIO_ROUTE_TAGS
         _held_codes = {
@@ -1467,7 +2000,7 @@ def mode_pick():
             _log("[LOCKED-FIRST] 상한가 %d개 있으나 점수<%g 또는 대금상한 초과 → 종전 경로"
                  % (n_locked, LOCKED_MIN_SCORE))
     if picks is None and (STRATA_ON or STRATB_ON):
-        # [2026-07-17 친구님 "종가매수 통합"] 전략A(횡보후돌파) OR 전략B(수렴선) 2택1. 중복종목 제거 안 함.
+        # [2026-08-27 owner approved] 전략A/B 중복 종목은 한 번만 시도한다.
         _setup = []
         if STRATA_ON:
             _setup += [("A", c) for c in cands if len(c) > 17 and c[17]
@@ -1516,9 +2049,9 @@ def mode_pick():
                     return body * 30.0 + ret * 1.5 + max(dev, 0.0) * 1.0 + vr * 3.0 + ov2
                 except Exception:
                     return 0.0
-            # [평일/금요일 다른 기준 2026-07-02 친구님 "평일 점수하고 금요일 점수 다르게"] 통일점수 floor:
-            #   평일=UNIFIED_MIN · 금요일=FRI_UNIFIED_MIN(주말 홀드라 더 높게=더 엄선). ★UNIFIED_PICK 무관하게 항상 적용(>0일 때).
-            if uni:
+            # [평일/금요일 다른 기준] 통일점수 라이브를 켰을 때만 floor를 적용한다.
+            # 전략 A/B 자체 게이트 경로는 UNIFIED_PICK=NO이면 통일점수로 추가 차단하지 않는다.
+            if UNIFIED_PICK and uni:
                 _floor = FRI_UNIFIED_MIN if _isfri else UNIFIED_MIN
                 if _floor > 0:
                     _before = len(_coil)
@@ -1532,6 +2065,19 @@ def mode_pick():
                 _coil.sort(key=lambda tc: (-_d2net(tc[1][1]), -_eod_today(tc[1]), -tc[1][3]))
             _npos = sum(1 for _t, _c in _coil if _d2net(_c[1]) > 0)
             _log(f"[SUPPLY-D{SUPPLY_LAG}] 셋업후보 {len(_coil)}개 중 기관 {SUPPLY_LAG}일전 순매수>0 {_npos}개 우선정렬(당일수급=그림자기록·랭킹배제)")
+        # 정렬된 우선순위를 보존하면서 A/B 중복 종목을 합친다.
+        _unique = {}
+        _route_tags = {}
+        for _tag, _c in _coil:
+            _code = _c[1]
+            _unique.setdefault(_code, _c)
+            if _tag not in _route_tags.setdefault(_code, []):
+                _route_tags[_code].append(_tag)
+        _coil = [("/".join(_route_tags[_code]), _c) for _code, _c in _unique.items()]
+        _entry_audit_append({"record_type": "setup_order",
+                             "ordered_setup": [{"route": tag, "candidate": c}
+                                               for tag, c in _coil]})
+
         # [MULTIPOS] 이미 보유 종목/수 파악 → 남은 슬롯(MAX_POS - 보유)만큼 상위 종목 선별
         _opos = {c for c, p in _jload(POS).items() if isinstance(p, dict) and p.get("status") == "OPEN"}
         _slots = MAX_POS - len(_opos)
@@ -1539,16 +2085,29 @@ def mode_pick():
             _log(f"이미 EOD_GAP {len(_opos)}/{MAX_POS} 보유중 → 신규없음"); return
         picks = []
         for tag, c in _coil:
-            if len(picks) >= _slots:
-                break
             if c[4] <= 0 or c[1] in _opos:
                 continue
+            if not _passes_order_universe(c):
+                continue
             picks.append(c)
-            _log(f"[전략{tag}] 매수확정 {c[1]} {c[2][:8]} {c[0]}점 거래대금{c[3]:.0f}억 ({len(picks)}/{_slots}슬롯)")
+            setup_route_codes.add(c[1])
+            _log(f"[전략{tag}] 주문후보 {c[1]} {c[2][:8]} {c[0]}점 "
+                 f"거래대금{c[3]:.0f}억 (후보 {len(picks)})")
+        # A/B 후보가 후단 게이트에서 막혀도 일반 비잠김 후보를 이어서 시도한다.
+        _picked_codes = {c[1] for c in picks}
+        _general = [c for c in cands if c[1] not in _picked_codes and c[1] not in _opos
+                    and not c[8] and _passes_final_score(c[0])
+                    and (DR_CEIL <= 0 or c[11] < DR_CEIL)
+                    and (VR_MIN <= 0 or c[12] >= VR_MIN)
+                    and _passes_order_universe(c)]
+        if _general:
+            picks.extend(_general)
+            _log(f"[전략A/B→일반] 후단 실패 대비 일반 후보 {len(_general)}개 연결")
         _shadow_log(today, picks[0] if picks else None, leader_pick, True)
         if not picks:
-            _log(f"[전략A/B] 통과 {len(_coil)}개 — 매수가능 없음(중복/유동성/0개) → NO_TRADE"); return
-    elif picks is not None:
+            _log(f"[전략A/B] 통과 {len(_coil)}개 — 주문가능 후보 없음 → 일반 비잠김 경로로 폴백")
+            picks = None
+    if picks is not None:
         pass                    # ★LOCKED-FIRST 로 이미 골랐다 — 아래 레거시 분기 타지 않는다
     elif LEADER_ONLY:
         _shadow_log(today, leader_pick, leader_pick, True)
@@ -1558,16 +2117,19 @@ def mode_pick():
     elif SKIP_LOCKED:
         # ★잠긴 상한가(호가0=못삼)는 건너뛰고 '살 수 있는' 비잠김 강세주 중 점수≥MIN_SCORE 최고.
         #   + DR_CEIL>0이면 당일 +DR_CEIL%↑ 과열주도 제외(다음날 갭다운 함정).
-        buyable = [c for c in cands if not c[8] and c[0] >= MIN_SCORE
-                   and (DR_CEIL <= 0 or c[11] < DR_CEIL) and (VR_MIN <= 0 or c[12] >= VR_MIN)]
+        buyable = [c for c in cands if not c[8] and _passes_final_score(c[0])
+                   and (DR_CEIL <= 0 or c[11] < DR_CEIL)
+                   and (VR_MIN <= 0 or c[12] >= VR_MIN)
+                   and _passes_order_universe(c)]
         if not buyable:
             top_lk = next((c for c in cands if c[8]), None)
-            n_over = sum(1 for c in cands if not c[8] and c[0] >= MIN_SCORE and DR_CEIL > 0 and c[11] >= DR_CEIL)
-            n_weakvr = sum(1 for c in cands if not c[8] and c[0] >= MIN_SCORE and VR_MIN > 0 and c[12] < VR_MIN)
+            n_over = sum(1 for c in cands if not c[8] and _passes_final_score(c[0]) and DR_CEIL > 0 and c[11] >= DR_CEIL)
+            n_weakvr = sum(1 for c in cands if not c[8] and _passes_final_score(c[0]) and VR_MIN > 0 and c[12] < VR_MIN)
             _shadow_log(today, None, leader_pick, False)
             _log(f"살수있는 후보 없음 (과열제외 {n_over}·배수<{VR_MIN}제외 {n_weakvr}"
                  f"{' · 잠긴1등 '+str(top_lk[1])+' '+str(top_lk[0]) if top_lk else ''}) → NO_TRADE(약한날 skip)"); return
         pick = buyable[0]
+        picks = buyable  # 첫 후보가 주문단계에서 실패하면 다음 주문가능 후보를 계속 확인한다.
         if DR_CEIL > 0 or VR_MIN > 0:
             _log(f"[필터] 과열<{DR_CEIL:.0%}·배수≥{VR_MIN} → {pick[1]} (당일{pick[11]*100:+.1f}% 배수{pick[12]:.1f})")
         skipped = [c for c in cands if c[8] and c[0] > pick[0]]
@@ -1575,10 +2137,25 @@ def mode_pick():
             _log(f"[SKIP_LOCKED] 잠긴 상위 {len(skipped)}개 건너뜀(예:{skipped[0][1]} {skipped[0][0]}점) → 살수있는 {pick[1]} {pick[0]}점 매수")
     else:
         pick_floor = MIN_SCORE
-        if not cands or cands[0][0] < pick_floor:
+        if not cands or (bool(cands[0][8]) and cands[0][0] < pick_floor):
             _shadow_log(today, None, leader_pick, False)
             _log(f"1등 {cands[0][0] if cands else '-'} < {pick_floor}{'(LOCKED)' if (cands and cands[0][8]) else ''} → NO_TRADE"); return
-        pick = cands[0]
+        if bool(cands[0][8]):
+            pick = cands[0]
+            eligible = [pick]
+        else:
+            eligible = [
+                c for c in cands
+                if not bool(c[8]) and _passes_final_score(c[0])
+            ]
+        if not eligible:
+            _shadow_log(today, None, leader_pick, False)
+            if cands and not bool(cands[0][8]):
+                _log_final_score_block(cands[0][1], cands[0][0])
+            else:
+                _log("점수구간 통과 후보 없음 → NO_TRADE")
+            return
+        pick = eligible[0]
     if picks is None:   # [MULTIPOS] 레거시분기(leader_only/skip_locked/else)=단일 pick → 리스트화
         if not (LEADER_ONLY or STRATA_ON or STRATB_ON):
             _shadow_log(today, pick, leader_pick, False)
@@ -1609,17 +2186,28 @@ def mode_pick():
     except Exception as _ge:
         _log(f"[GLOBAL-BUDGET] skip({_ge})")
     bought = 0
+    _entry_audit_append({"record_type": "attempt_order",
+                         "ordered_candidates": picks,
+                         "setup_route_codes": sorted(setup_route_codes),
+                         "open_now": open_now, "global_remaining": _grem,
+                         "max_positions": MAX_POS})
     for pk in picks:
         if open_now + bought >= MAX_POS or bought >= _grem:
             break
-        if _buy_one(bc, pk, today, held):
+        if _buy_one(bc, pk, today, held, setup_route=pk[1] in setup_route_codes):
             bought += 1
             if held.get(pk[1], {}).get("status") == "PENDING":
                 _jsave(POS, held)
-                break
-            _jsave(POS, held)          # [즉시저장 2026-06-29] 매수 직후 영구화 → 크래시시 broker/RT_OPEN/POS 불일치 방지
+                if _stop_after_pending(held[pk[1]]):
+                    break
+                continue
+            if LIVE:
+                _jsave(POS, held)      # [즉시저장] 실전 매수만 영구화
     if bought:
-        _log(f"기록완료 {bought}건 (보유 {open_now + bought}/{MAX_POS}) → {POS}")
+        if LIVE:
+            _log(f"기록완료 {bought}건 (보유 {open_now + bought}/{MAX_POS}) → {POS}")
+        else:
+            _log(f"모의통과 {bought}건 (POS 미저장)")
     else:
         _log("매수 0건 (중복/실패/보류)")
 
@@ -1674,6 +2262,20 @@ def mode_prefetch():
         if attempt < 2:
             time.sleep(1.0)
     _log("[PREFETCH] failed; live fallback remains disabled")
+
+
+def mode_entry_replay_auto():
+    """Validate the immediately previous trading day's immutable entry audit."""
+    expected = _previous_trading_day()
+    audit_dir = ENTRY_AUDIT_DIR / expected
+    audits = sorted(audit_dir.glob("entry_*.jsonl")) if audit_dir.exists() else []
+    if not audits:
+        raise RuntimeError(f"previous-trading-day entry audit missing: {expected}")
+    audit = audits[-1]
+    ok, reason, report = _replay_entry_audit(audit)
+    _log(f"[ENTRY-PROD-REPLAY] date={expected} ok={ok} reason={reason} report={report}")
+    if not ok:
+        raise RuntimeError(f"entry replay failed: {reason}")
 
 
 def mode_auction_replay():
@@ -1754,6 +2356,8 @@ if __name__ == "__main__":
             mode_sell()
         elif mode == "prefetch":
             mode_prefetch()
+        elif mode == "entry_replay_auto":
+            mode_entry_replay_auto()
         elif mode == "auction_replay":
             mode_auction_replay()
         else:

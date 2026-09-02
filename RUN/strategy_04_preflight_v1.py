@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -33,6 +34,10 @@ AUDIT = ROOT / "data" / "strategy_04_preflight_v1.json"
 APPROVAL = ROOT / "config" / "strategy_04_live_approved.flag"
 OFF = ROOT / "config" / "strategy_04_off.flag"
 MANUAL_BLOCK = ROOT / "config" / "manual_buy_block.flag"
+# 로그 라벨. S05 preflight 가 이 모듈을 재사용하며 상수만 갈아끼우므로(shared.LABEL),
+# 종전에는 S05 로그에도 "STRATEGY04_..." 가 찍혀 판독을 헷갈리게 했다(2026-08-27 수리).
+LABEL = "STRATEGY04"
+
 REQUIRED_TASKS = (
     "SAFEPLUS_WATCHDOG_BROKER",
     "SAFEPLUS_STRATEGY_WATCHLIST",
@@ -86,16 +91,50 @@ def _number(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _task_enabled(name: str) -> bool:
-    result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-Command",
-         f"(Get-ScheduledTask -TaskName '{name}' -ErrorAction SilentlyContinue).Settings.Enabled"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=8,
+def _tasks_enabled(names: tuple[str, ...]) -> dict[str, bool]:
+    """예약작업 활성 여부를 PowerShell 한 번으로 모두 조회한다.
+
+    2026-08-27 수리: 종전에는 이름마다 PowerShell 을 띄워(8개 = 8프로세스) 아침 혼잡에
+    timeout=8 을 한 번만 넘겨도 사전점검 전체가 FAIL 했다(8/27 실제 발생 —
+    `STRATEGY04_PREFLIGHT_FAIL TimeoutExpired`). 태스크가 09:00 으로 앞당겨져
+    all-preflight·S01/S03 LIVE·S02 와 겹치면서 위험이 커졌다.
+    호출을 1회로 줄이고 시간을 늘리고 1회 재시도한다.
+
+    판정은 종전대로 fail-closed — 끝내 확인이 안 되면 전부 False 로 돌려 FAIL 시킨다.
+    (LIVE 런처는 12:00 까지 승인을 기다리므로 재시도에 쓸 시간 여유는 충분하다.)
+    """
+    quoted = ",".join("'" + name.replace("'", "''") + "'" for name in names)
+    command = (
+        f"Get-ScheduledTask -TaskName @({quoted}) -ErrorAction SilentlyContinue"
+        ' | ForEach-Object { "$($_.TaskName)=$($_.Settings.Enabled)" }'
     )
-    return result.returncode == 0 and result.stdout.strip().lower() == "true"
+    for attempt in range(2):
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", command],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=25,
+            )
+        except subprocess.TimeoutExpired:
+            if attempt == 0:
+                time.sleep(1.0)
+                continue
+            print(f"{LABEL}_PREFLIGHT_TASK_QUERY_TIMEOUT", flush=True)
+            return {name: False for name in names}
+        if result.returncode == 0:
+            found: dict[str, bool] = {}
+            for line in result.stdout.splitlines():
+                key, sep, value = line.strip().partition("=")
+                if sep:
+                    found[key.strip()] = value.strip().lower() == "true"
+            if found:
+                return {name: found.get(name, False) for name in names}
+        if attempt == 0:
+            time.sleep(1.0)
+    print(f"{LABEL}_PREFLIGHT_TASK_QUERY_EMPTY", flush=True)
+    return {name: False for name in names}
 
 
 def _approval_date(path: Path) -> str:
@@ -211,7 +250,7 @@ def validate(now: datetime) -> dict[str, Any]:
     except SelftestFailure as exc:
         raise PreflightFailure(
             f"PREFLIGHT_CONTEXT_SELFTEST:{exc}") from exc
-    tasks = {name: _task_enabled(name) for name in REQUIRED_TASKS}
+    tasks = _tasks_enabled(REQUIRED_TASKS)
     missing = [name for name, enabled in tasks.items() if not enabled]
     if missing:
         raise PreflightFailure("TASK_MISSING_OR_DISABLED:" + ",".join(missing))
@@ -309,13 +348,13 @@ def run(*, activate: bool = False, now: datetime | None = None) -> int:
         payload["passed"] = True
         payload["finished_at"] = datetime.now().isoformat(timespec="seconds")
         _write_json(AUDIT, payload)
-        print("STRATEGY04_PREFLIGHT_PASS" + (" APPROVED" if activate else ""))
+        print(f"{LABEL}_PREFLIGHT_PASS" + (" APPROVED" if activate else ""))
         return 0
     except Exception as exc:
         payload["error"] = f"{type(exc).__name__}:{exc}"
         payload["finished_at"] = datetime.now().isoformat(timespec="seconds")
         _write_json(AUDIT, payload)
-        print(f"STRATEGY04_PREFLIGHT_FAIL {payload['error']}")
+        print(f"{LABEL}_PREFLIGHT_FAIL {payload['error']}")
         return 2
 
 

@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common_high_range_watchlist_v1 import build_and_publish
 from strategy_high_range_top5_low_shadow_v1 import run_once as run_top5_low_shadow_once
 from bollinger_high_range30_shadow_v1 import run_once as run_bollinger_shadow_once
+from high_range_direction_shadow_v1 import build_direction_board
 
 
 DEFAULT_BASE = Path(r"C:\stock_bot")
@@ -356,7 +357,8 @@ def _fmt_pct(value) -> str:
     return f"{value:+.2f}%"
 
 
-def _row_html(candidate: dict, live: dict) -> str:
+def _row_html(candidate: dict, live: dict, direction: dict | None = None) -> str:
+    direction = direction or {}
     current = _number(live.get("current"))
     low = _number(live.get("low"))
     change = _pct(current, _number(candidate.get("prev_close")))
@@ -382,11 +384,20 @@ def _row_html(candidate: dict, live: dict) -> str:
     risk_text = " · ".join(risks) or "특이없음"
     age = live.get("age_sec")
     status_text = risk_text if age is None else f"{risk_text}<small>{status} {_number(age):.0f}초</small>"
+    direction_text = str(direction.get("direction") or "확인대기")
+    direction_class = {
+        "상승전환": "dir-turn", "상승지속": "dir-up",
+        "진입함정": "dir-fake",
+        "하락위험": "dir-down", "확인대기": "dir-wait",
+    }.get(direction_text, "dir-wait")
+    direction_detail = " · ".join(direction.get("fake_rebound_reasons") or []) or str(direction.get("flow_state") or "유입없음")
     return (
         f"<tr class='{row_class}'>"
         f"<td class='rank'>{crown}{candidate['rank']}</td>"
         f"<td class='name'><b>{html.escape(candidate['name'])}</b>"
         f"<small>{html.escape(candidate['code'])}</small></td>"
+        f"<td class='{direction_class}'><b>{direction_text}</b>"
+        f"<small>{html.escape(direction_detail)}</small></td>"
         f"<td>{html.escape(candidate['stage'])}<small>{candidate['streak']}일 지속</small></td>"
         f"<td>{volatility}</td>"
         f"<td>{value_text}</td>"
@@ -402,9 +413,12 @@ def _row_html(candidate: dict, live: dict) -> str:
     )
 
 
-def render_html(payload: dict, state: dict, now: datetime) -> str:
+def render_html(payload: dict, state: dict, now: datetime, direction_payload: dict | None = None) -> str:
+    direction_map = {
+        row.get("code"): row for row in ((direction_payload or {}).get("rows") or [])
+    }
     rows = "\n".join(
-        _row_html(candidate, state.get("codes", {}).get(candidate["code"], {}))
+        _row_html(candidate, state.get("codes", {}).get(candidate["code"], {}), direction_map.get(candidate["code"]))
         for candidate in payload.get("candidates", [])
     )
     filters = payload.get("filters") or {}
@@ -431,6 +445,7 @@ td.rank{{font-weight:700}}
 td small{{display:block;color:#8fa5b9;font-size:14px;margin-top:2px}}
 tr.crown{{background:#3a2f05;color:#fff4b0;font-weight:700}}
 .live{{color:#57e389}} .wait{{color:#f4c95d}} .stale{{color:#ff6b6b}}
+.dir-turn{{color:#f4c95d}} .dir-up{{color:#57e389}} .dir-fake{{color:#ff9b63;background:#30160b}} .dir-down{{color:#ff7b7b}} .dir-wait{{color:#8fa5b9}}
 .foot{{margin-top:10px;color:#9fb0c8;font-size:15px}}
 </style></head><body>
 <h1>고저폭 실시간 선별판</h1>
@@ -444,7 +459,7 @@ tr.crown{{background:#3a2f05;color:#fff4b0;font-weight:700}}
 <span class="rule">👑 5일 지속·평균대금 <b>{filters.get('core_avg_5d_value_min_eok',0):.0f}억↑</b></span>
 </div>
 <div class="wrap"><table><thead><tr>
-<th>순위</th><th class="name">종목</th><th>단계·지속</th><th>전일폭 / 5일폭</th>
+<th>순위</th><th class="name">종목</th><th>방향·돈흐름</th><th>단계·지속</th><th>전일폭 / 5일폭</th>
 <th>전일 / 5일대금</th><th>현재가</th><th>등락</th><th>오늘저가</th><th>저가시각</th>
 <th>저점반등</th><th>상대대금속도</th><th>수급</th><th>회전율</th><th>변동성품질</th><th>위험·상태</th>
 </tr></thead><tbody>{rows}</tbody></table></div>
@@ -563,8 +578,21 @@ def run_once(base: Path, desktop: Path, now: datetime | None = None) -> tuple[di
     except Exception as exc:
         _log_error(base, f"BOLLINGER TOP30 SHADOW failed: {type(exc).__name__}: {exc}")
     _atomic_write(state_path, json.dumps(state, ensure_ascii=False, indent=2))
+    direction_path = base / "data" / "high_range_direction_shadow_v1.json"
+    direction_payload = build_direction_board(
+        payload, state,
+        _read_json(base / "data" / "돈흐름_선별판.json", {}),
+        snapshot,
+        _read_json(base / "data" / "kosdaq_index.json", {}).get("chg"),
+        now,
+        _read_json(direction_path, {}),
+    )
+    _atomic_write(
+        direction_path,
+        json.dumps(direction_payload, ensure_ascii=False, indent=2),
+    )
     html_path = desktop / "고저폭_왕관후보.html"
-    _atomic_write(html_path, render_html(payload, state, now))
+    _atomic_write(html_path, render_html(payload, state, now, direction_payload))
     return payload, state, html_path
 
 

@@ -20,6 +20,7 @@ import threading
 from pathlib import Path
 from datetime import datetime
 sys.path.insert(0, r"C:\stock_bot\RUN")
+from money_flow_common_state_v1 import build_common_flow_tags
 
 MODE = os.environ.get("MF_BOARD_MODE", "SHADOW").strip().upper()   # 라벨(OFF면 미실행)
 
@@ -92,6 +93,7 @@ OUT_JSON   = Path(r"C:\stock_bot\data\돈흐름_선별판.json")
 OUT_TXT    = Path(r"C:\stock_bot\data\돈흐름_관찰.txt")
 CACHE      = Path(r"C:\stock_bot\data\돈흐름_수급캐시.json")     # 수급 캐시(code→수급+ts)·워밍스타트/영속
 CHE_STATE  = Path(r"C:\stock_bot\data\돈흐름_che_state.json")   # 저점반등 재진입용 che 저점(min)/표본(n)·당일저점(lo) 누적
+FLOW_TAG_STATE = Path(r"C:\stock_bot\data\돈흐름_flow_tag_state_v1.json")  # 표시 전용 공통 유입태그 상태
 MCAP_CACHE = Path(r"C:\stock_bot\data\돈맥_시총캐시.json")       # 시총 일1회 캐시(code→억)
 PREV_POOL  = Path(r"C:\stock_bot\data\돈맥_전일상위풀.json")     # [보충풀] 전일 거래대금 상위 700(코스닥) 일1회 캐시(TR 0·CSV는 하루 1번만 읽음)
 
@@ -739,6 +741,35 @@ def _publish_micro_watch(snap):
     _MW["ts"] = now
     try:
         pcm = {c: px for c, px, _v in _prev_top_pool(datetime.now().strftime("%Y%m%d"))}
+        # [MFLOW-SUPPLY 2026-08-28] Publish registered deep bottoms separately.
+        # The gateway consumes this on an isolated screen, so no other strategy
+        # loses a slot and the recorder can build the required 1-minute bars.
+        deep_rows = []
+        try:
+            che_state = json.loads(CHE_STATE.read_text(encoding="utf-8-sig"))
+            deep_drop = float(os.environ.get("MF_DEEP_DROP_PCT", "-5.0"))
+            for raw_code, state in che_state.items():
+                if not isinstance(state, dict):
+                    continue
+                code = str(raw_code).zfill(6)
+                pc = float(pcm.get(code, 0) or 0)
+                lo = float(state.get("lo", 0) or 0)
+                if pc <= 0 or lo <= 0:
+                    continue
+                lo_pct = (lo / pc - 1) * 100
+                if lo_pct <= deep_drop:
+                    deep_rows.append((lo_pct, code))
+        except Exception:
+            deep_rows = []
+        deep_rows.sort()
+        deep_watch = Path(r"C:\stock_bot\IPC\micro_watch_moneyflow_deep.json")
+        deep_tmp = deep_watch.with_suffix(".tmp")
+        deep_tmp.write_text(json.dumps({
+            "for_date": datetime.now().strftime("%Y%m%d"),
+            "ts": datetime.now().isoformat(),
+            "codes": [code for _depth, code in deep_rows],
+        }, ensure_ascii=False), encoding="utf-8")
+        os.replace(deep_tmp, deep_watch)
         thr = float(os.environ.get("MF_MICRO_WATCH_DROP", "-2.0"))
         rows = []
         for code in _UNIV[0]:
@@ -1166,6 +1197,17 @@ def _rank_and_save(snap, regime_ok, rtag):
         rows.sort(key=lambda x: -x["big"])
     for i, x in enumerate(rows, 1):
         x["rank"] = i
+    # 표시 전용 공통 유입태그. 행 순서/등수/선별/매매 조건에는 관여하지 않는다.
+    try:
+        _flow_prev = json.loads(FLOW_TAG_STATE.read_text(encoding="utf-8-sig")) if FLOW_TAG_STATE.exists() else {}
+        rows, _flow_next, _flow_counts = build_common_flow_tags(rows, snap, _flow_prev)
+        _flow_tmp = FLOW_TAG_STATE.with_suffix(".tmp")
+        _flow_tmp.write_text(json.dumps(_flow_next, ensure_ascii=False), encoding="utf-8")
+        os.replace(_flow_tmp, FLOW_TAG_STATE)
+    except Exception:
+        _flow_counts = {"유입지속": 0, "유입전환": 0, "유입없음": len(rows)}
+        for x in rows:
+            x.setdefault("common_flow_state", "유입없음")
     # [7/10 장중 친구님 "선별기가 저점에서 매수세 들어오는 것도 봐야 — 지금 해"] 깊은바닥 등재 순간 주체별 수급 기준점 —
     #   '등재(저점) 이후 신규 유입'을 측정하기 위한 기록 전용(선별·매매 무영향·종목당 하루 1회 첫 관측시).
     #   저녁 검증 후 관문화 예정. 한계: 정원 rows에 든 종목만 기록(정원 밖 등재종목은 편입시 기록).
@@ -1190,6 +1232,8 @@ def _rank_and_save(snap, regime_ok, rtag):
         pass
     OUT_JSON.write_text(json.dumps({"ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "regime": rtag,
                                     "mode": MODE, "univ": len(_UNIV[0]),
+                                    "common_flow_mode": "SHADOW_ONLY",
+                                    "common_flow_counts": _flow_counts,
                                     # ★[7/12 친구님 "선별기에서 전체를 봐야 돼 — 던짐이나 선별된 거나 상관없어·
                                     #   모두가 급락 후보자야·여기는 테마 대장주들이 거의 많이 들어와"]
                                     #   깊은바닥 감시 유니버스로 매매기가 쓴다. 지금까지는 대장주 순위표(66종목)만 봐서
@@ -1223,7 +1267,8 @@ def _rank_and_save(snap, regime_ok, rtag):
                  + (" 🤝" if x.get("acc10") else "")
                  + (" 📈" if x.get("gc") else "")
                  + ((" 👑" + ("2" if x.get("crown") == "대금2등" else "")) if x.get("crown") else "")
-                 + (f" 🕳{x['deep']['lo_pct']:+.1f}%" if x.get("deep") else ""))
+                 + (f" 🕳{x['deep']['lo_pct']:+.1f}%" if x.get("deep") else "")
+                 + f" · {x.get('common_flow_state', '유입없음')}")
     # [7/9 친구님 "저점공략도 ★처럼 실시간·돈흐름도 선별기에"] 🕳 깊은바닥 감시 섹션 —
     #   등재 전 종목(순위 하단 포함)·저점깊이/저점서 반등/어느 주체가 돈 넣는 중(±3억 기준). 매매기 관문과 같은 데이터.
     _deeps = [x for x in rows if x.get("deep")]

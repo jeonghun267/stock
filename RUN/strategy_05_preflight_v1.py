@@ -17,6 +17,7 @@ ROOT = Path(r"C:\stock_bot")
 
 
 def configure() -> None:
+    shared.LABEL = "STRATEGY05"
     shared.ROOT = ROOT
     shared.WATCH = ROOT / "IPC" / "micro_watch_strategy05.json"
     shared.SNAPSHOT = ROOT / "IPC" / "live_micro_snapshot.json"

@@ -23,6 +23,9 @@ SIGNAL_MODE = "SIGNAL_ONLY_ORDER_ZERO"
 ENTRY_V3_MODE = os.environ.get("S01_ENTRY_V3_MODE", "SHADOW").strip().upper()
 if ENTRY_V3_MODE not in {"SHADOW", "LIVE"}:
     ENTRY_V3_MODE = "SHADOW"
+LEGACY_ENTRY_LIVE = os.environ.get(
+    "S01_LEGACY_ENTRY_LIVE", "YES"
+).strip().upper() == "YES"
 TREND_PRIORITY_MODE = os.environ.get(
     "S01_TREND_PRIORITY_MODE", "SHADOW"
 ).strip().upper()
@@ -200,6 +203,8 @@ def select_fresh_signals(
     source_rows = list(payload.get("signals") or [])
     if ENTRY_V3_MODE == "LIVE":
         source_rows = list(payload.get("entry_v3_signals") or [])
+    elif not LEGACY_ENTRY_LIVE:
+        source_rows = []
     for raw in source_rows:
         if not isinstance(raw, Mapping):
             continue
@@ -217,6 +222,9 @@ def select_fresh_signals(
             continue
         row = dict(raw)
         row["code"] = code
+        row["entry_stage"] = str(
+            row.get("entry_stage") or row.get("stage") or ""
+        )
         row["signal_id"] = signal_id
         row["strategy_id"] = STRATEGY_ID
         row["strategy_name"] = STRATEGY_NAME

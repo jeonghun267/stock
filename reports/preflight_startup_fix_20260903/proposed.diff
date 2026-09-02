@@ -1,0 +1,63 @@
+--- /dev/null
++++ RUN/strategy_07_morning_launcher_v1.py
+@@ -0,0 +1,15 @@
++# -*- coding: utf-8 -*-
++"""Start the existing S07 engine with its local module path initialized."""
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++RUN_DIR = Path(__file__).resolve().parent
++if str(RUN_DIR) not in sys.path:
++    sys.path.insert(0, str(RUN_DIR))
++
++from strategy_07_morning_trend_v1 import main
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+--- RUN/hidden/SAFEPLUS_S07_MORNING.cmd
++++ RUN/hidden/SAFEPLUS_S07_MORNING.cmd
+@@ -8,6 +8,6 @@
+ set S07M_DAY1_OVERRIDE=20260903
+ set S07M_ARM=YES
+ set S07M_LIVE=YES
+-"C:\python310\python.exe" -B -X utf8 "C:\stock_bot\RUN\strategy_07_morning_trend_v1.py" replay_auto >> C:\stock_bot\data\LOG\sched_S07_MORNING.log 2>&1
+-"C:\python310\python.exe" -B -X utf8 "C:\stock_bot\RUN\strategy_07_morning_trend_v1.py" shadow --loop-sec 2 --until 11:35 >> C:\stock_bot\data\LOG\sched_S07_MORNING.log 2>&1
++"C:\python310\python.exe" -B -X utf8 "C:\stock_bot\RUN\strategy_07_morning_launcher_v1.py" replay_auto >> C:\stock_bot\data\LOG\sched_S07_MORNING.log 2>&1
++"C:\python310\python.exe" -B -X utf8 "C:\stock_bot\RUN\strategy_07_morning_launcher_v1.py" shadow --loop-sec 2 --until 11:35 >> C:\stock_bot\data\LOG\sched_S07_MORNING.log 2>&1
+ endlocal
+--- config/live_approved_hashes_v1.json
++++ config/live_approved_hashes_v1.json
+@@ -289,11 +289,15 @@
+       },
+       {
+         "path": "RUN/hidden/SAFEPLUS_S07_MORNING.cmd",
+-        "sha256": "449b1795c092187187358c434297c55669e6970ddaa4bcf1abc7f5f03b3366b4"
++        "sha256": "0cb5161c979c4a91a7411be7259b32fa99a78ce41148bbcf7c422a97bd601cd1"
++      },
++      {
++        "path": "RUN/strategy_07_morning_launcher_v1.py",
++        "sha256": "acb527966b02090516b2044523807bad53f41681231dd1718c222dd6026262c6"
+       }
+     ]
+   },
+-  "manifest_sha": "df6e313307f726ea17dc25932e383324177f4aa46681611a4dfaec4852a687b7",
++  "manifest_sha": "6ca791e176db216d079c06bc8e8d1a33a5a5e1be618c62081f82b9021e7fbcdb",
+   "last_written_at": "2026-09-02T20:22:39+09:00",
+   "updated_by": "claude_s02_repair_reseal_20260902",
+   "live_features": {
+--- config/elevated_path_hashes.json
++++ config/elevated_path_hashes.json
+@@ -17,10 +17,10 @@
+     "RUN\\hidden\\SAFEPLUS_STRATEGY01_SIGNAL.cmd": "9a53fe18c3db5e5a221d03a64462700d47fcb245bf03ff52feb4f36288b44b0c",
+     "RUN\\hidden\\SAFEPLUS_STRATEGY02_LIVE.cmd": "b43df7c12644b671fa8a3ce02607ae147a4a029f642d2e5b307b5e12feb886ab",
+     "RUN\\hidden\\SAFEPLUS_STRATEGY02_SIGNAL.cmd": "a49fe4d1b5ada732234ea0da80875c141308cd92b8baa3441a0cd78d6e4bc20f",
+-    "RUN\\hidden\\SAFEPLUS_STRATEGY03_LIVE_ASCII.cmd": "b26dc8921f2dd465a806c475fb203952206451fcfff9b92e5eaa577a6fe8add5",
++    "RUN\\hidden\\SAFEPLUS_STRATEGY03_LIVE_ASCII.cmd": "43e0d4d9b5b68f146e4d79e59c4799ebbbbfac70257884518563b561ecf8493d",
+     "RUN\\hidden\\SAFEPLUS_STRATEGY03_PREFLIGHT.cmd": "f0ac896aeb6ca1572dfe5059dcdadd08f11fba8eefb6bcf43c8aff1d5662ddf5",
+     "RUN\\hidden\\SAFEPLUS_STRATEGY03_SIGNAL_ASCII.cmd": "25d63593c7cc4ec0ecaf947767ddd94531f648e2eddda8f03cd953bc34c15d28",
+     "RUN\\broker_gateway_v1.py": "3d3c9b59fac3e764594fdbfc9362cc91e5d8bf1df99a0272655eeffbcd318f64",
+     "RUN\\ipc_order_auth_v1.py": "1af31e9e12e40e17d4415f6baff4afb17bc098fd00f60514623e4a7592d218eb"
+   }
+-}+}

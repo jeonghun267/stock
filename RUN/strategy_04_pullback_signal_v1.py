@@ -22,7 +22,8 @@ from zoneinfo import ZoneInfo
 KST = ZoneInfo("Asia/Seoul")
 SIGNAL_SCHEMA = "strategy_04_deep_w_pullback_signal_v1"
 SIGNAL_MODE = "SIGNAL_ONLY_ORDER_ZERO"
-ENTRY_START = time(10, 0)
+# ★[2026-08-27 친구님 지시 "눌림 시간을 9시부터 시작해 - W자 모양을 잡아야"] 10:00 → 09:00.
+ENTRY_START = time(9, 0)
 ENTRY_END = time(14, 30)
 # ★[2026-07-27 친구님 승인] 관문별 탈락 그림자 계측 열 — 기록 전용(신호 로직 무변경).
 FUNNEL_FIELDS = (
@@ -746,7 +747,7 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
             "valid_topbook_count": valid_points,
             "market_fresh": market_fresh,
             "market_change_pct": market_change,
-            "entry_window": "10:00-14:30",
+            "entry_window": "09:00-14:30",
             "signals": monitor.signals[-1000:],
             "candidates": list(monitor.latest.values()),
         }

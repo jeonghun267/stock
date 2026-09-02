@@ -91,18 +91,27 @@ class AtomicStateReplaceRetryTests(unittest.TestCase):
             self.assertEqual(sleep.call_count, 2)
             self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), {"status": "saved"})
 
-    def test_five_retries_then_returns_false_without_killing_engine(self):
+    def test_s06_unique_temp_retries_then_returns_false(self):
         module = importlib.import_module("strategy_06_crash_low_chase_v1")
         with tempfile.TemporaryDirectory() as temp_dir:
             destination = Path(temp_dir) / "state.json"
-            with patch.object(module.os, "replace", side_effect=PermissionError(5, "locked")) as replace, patch.object(
+            sources = []
+
+            def always_locked(source, target):
+                sources.append(Path(source))
+                raise PermissionError(5, "locked")
+
+            with patch.object(module.os, "replace", side_effect=always_locked), patch.object(
                 module.time, "sleep"
             ) as sleep:
                 saved = module.write_json_atomic(destination, {"status": "blocked"})
 
             self.assertFalse(saved)
-            self.assertEqual(replace.call_count, 6)
-            self.assertEqual(sleep.call_count, 5)
+            self.assertEqual(len(sources), 20)
+            self.assertEqual(sleep.call_count, 19)
+            self.assertNotEqual(sources[0], destination.with_suffix(".json.tmp"))
+            self.assertTrue(sources[0].name.startswith("state.json."))
+            self.assertFalse(sources[0].exists())
 
     def test_live_engine_save_exhaustion_fails_closed(self):
         targets = (

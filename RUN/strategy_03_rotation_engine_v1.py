@@ -31,25 +31,26 @@ from strategy_01_rotation_engine_v2 import (
     Config,
     ProcessLock,
     Strategy01Engine,
+    kst_now,
     number,
     parse_dt,
     read_json,
 )
 from strategy_03_signal_contract_v1 import (
     EARLY_LOW_LANE,
+    EARLY_LOW_LOW_STABLE_SEC,
     EARLY_LOW_MAX_REBOUND_PCT,
     EARLY_LOW_MIN_REBOUND_PCT,
-    EARLY_LOW_FAST_REBOUND_MAX_PCT,
-    EARLY_LOW_FAST_REBOUND_REASON,
+    EARLY_LOW_MIN_UP_TICKS,
+    EARLY_LOW_RAPID_DROP_PCT,
+    EARLY_LOW_REBOUND_TIMEOUT_SEC,
     EarlyLowAuditChain,
     production_file_sha256,
     # ★[S03-LANE-FIX 2026-08-06 친구님 지시 "가로 해"] 2번 레인 잣대를 새로 가져온다.
     INTRADAY_CRASH_LANE,
     INTRADAY_MAX_REBOUND_PCT,
     INTRADAY_MIN_REBOUND_PCT,
-    EXPRESS_NEAR_LOW_PCT,
     OPEN_ARM_DROP_PCT,
-    OPEN_HANDOFF_DROP_PCT,
     OPEN_CRASH_LANE,
     OPEN_MAX_REBOUND_PCT,
     OPEN_MIN_REBOUND_PCT,
@@ -59,6 +60,7 @@ from strategy_03_signal_contract_v1 import (
 )
 from strategy_common_hold_sell_v1 import (
     ExitPolicy,
+    HoldSellAction,
     HoldSellObservation,
     HoldSellState,
     STRATEGY_PROFILES,
@@ -75,13 +77,23 @@ from strategy_03_flow_turn_fast_v1 import (
     bottom_confirm_decision,
     flow_turn_fast_decision,
 )
+import s03_s06_crash_claim_v1 as crash_claim
+from strategy_06_crash_low_chase_v1 import atrp10_pct
 
 # ★[DROP-REASON-LOG 2026-08-19 친구님 지시 "탈락 사유 기록"] 엔진이 신호를 버릴 때
 #   이유를 남기는 기록 전용 경로. 판정 로직은 건드리지 않는다.
 DROP_LOG_DIR = Path(r"C:\stock_bot\data\audit\s03_engine_drop")
+S03_ENTRY_CONTEXT_AUDIT_DIR = Path(r"C:\stock_bot\data\audit\s03_entry_context")
 S03_REGIME_PATH = Path(r"C:\stock_bot\data\BACKTEST\regime_std_shadow.csv")
+S03_KOSDAQ_INDEX_PATH = Path(r"C:\stock_bot\data\kosdaq_index.json")
+S03_KOSDAQ_HISTORY_PATH = Path(r"C:\stock_bot\보고서\코스닥지수_이력.csv")
 S03_ORDER_MIN_PRICE = 10_000.0
+S03_LANE_SLOT_LIMIT = 3
 _REGIME_CACHE: dict[str, Any] = {"mtime_ns": None, "rows": []}
+
+
+class S03CrashClaimNotHeld(RuntimeError):
+    """Abort this S03 tick before broker submission when ownership is lost."""
 
 
 def _market_regime_at(path: Path, now: datetime) -> str:
@@ -114,11 +126,231 @@ def _market_regime_at(path: Path, now: datetime) -> str:
     return prior[-1][1] if prior else "UNKNOWN"
 
 
+def _s03_decimal(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value or "0"))
+    except Exception:
+        return Decimal("0")
+
+
+def _s03_low_break_shadow(
+    reference_low: Any,
+    observation: HoldSellObservation,
+) -> dict[str, Any]:
+    """Return audited S03 low-break evidence for the OPEN_CRASH live exit."""
+    reference = _s03_decimal(reference_low)
+    threshold = reference * Decimal("0.997")
+    sell10 = observation.sell_money_per_sec_10s
+    sell30 = observation.sell_money_per_sec_30s
+    buy10 = observation.buy_money_per_sec_10s
+    flow_data_ready = bool(sell10 > 0 and sell30 > 0)
+    sell_reaccelerating = bool(
+        flow_data_ready
+        and sell10 > buy10
+        and sell10 > sell30 * Decimal("1.2")
+    )
+    would_exit = bool(
+        reference > 0
+        and observation.price <= threshold
+        and sell_reaccelerating
+    )
+    return {
+        "s03_entry_reference_low": str(reference),
+        "s03_low_break_threshold": str(threshold),
+        "s03_low_break_flow_data_ready": flow_data_ready,
+        "s03_sell_reaccelerating": sell_reaccelerating,
+        "would_exit_low_break": would_exit,
+        "s03_low_break_shadow_reason": (
+            "S03_REFERENCE_LOW_BREAK_SELL_REACCEL" if would_exit else ""
+        ),
+    }
+
+
+S03_EARLY_PEAK_ARM_PCT = Decimal("1.0")
+S03_EARLY_PEAK_DROP_PCT = Decimal("0.6")
+S03_EARLY_PEAK_COST_FLOOR_PCT = Decimal("0.25")
+
+
+def _s03_entry_drop_pct(signal: Mapping[str, Any], lane: str) -> float:
+    low = number(signal.get("anchor_low"))
+    if low <= 0:
+        return 0.0
+    basis = (
+        number(signal.get("intraday_high"))
+        if lane == INTRADAY_CRASH_LANE
+        else number(signal.get("open_price"))
+    )
+    if basis <= low:
+        return max(0.0, -number(signal.get("anchor_drop_from_open_pct")))
+    return max(0.0, (basis - low) / basis * 100.0)
+
+
+def _s03_bottom_quality_v2_shadow(
+    signal: Mapping[str, Any],
+    *,
+    entry_price: float,
+    ma20: float,
+    atrp10: float,
+    kosdaq_5m_change_pct: Any,
+) -> dict[str, Any]:
+    """Evaluate S03 bottom quality for audit only; never gates an order."""
+    flow_fields = (
+        "previous_buy_rate_10s",
+        "recent_buy_rate_10s",
+        "recent_sell_rate_10s",
+    )
+    flow_inputs_ready = all(
+        key in signal and signal.get(key) not in {None, ""}
+        for key in flow_fields
+    )
+    previous_buy = number(signal.get("previous_buy_rate_10s"))
+    recent_buy = number(signal.get("recent_buy_rate_10s"))
+    recent_sell = number(signal.get("recent_sell_rate_10s"))
+    buy_accelerating = bool(
+        flow_inputs_ready and recent_buy > 0 and recent_buy > previous_buy
+    )
+    buy_flow_leading = bool(
+        flow_inputs_ready and recent_buy > 0 and recent_buy > recent_sell
+    )
+    ma20_ready = bool(ma20 > 0 and entry_price > 0)
+    ma20_distance_pct = (
+        (entry_price / ma20 - 1.0) * 100.0 if ma20_ready else None
+    )
+    ma20_overheated = bool(
+        ma20_ready and ma20_distance_pct is not None and ma20_distance_pct > 15.0
+    )
+    reference_low = number(signal.get("anchor_low"))
+    rebound_pct = (
+        (entry_price / reference_low - 1.0) * 100.0
+        if entry_price > 0 and reference_low > 0 else None
+    )
+    rebound_atrp_ratio = (
+        rebound_pct / atrp10
+        if rebound_pct is not None and atrp10 > 0 else None
+    )
+    evaluation_ready = bool(flow_inputs_ready and ma20_ready)
+    quality_checks = {
+        "buy_accelerating": buy_accelerating,
+        "buy_flow_leading": buy_flow_leading,
+        "ma20_not_overheated": bool(ma20_ready and not ma20_overheated),
+    }
+    shadow_ready = (
+        all(quality_checks.values()) if evaluation_ready else None
+    )
+    return {
+        "schema": "S03_BOTTOM_QUALITY_V2",
+        "mode": "SHADOW_ORDER_ZERO",
+        "evaluation_ready": evaluation_ready,
+        "shadow_ready": shadow_ready,
+        "would_block_bottom_quality_v2": (
+            not shadow_ready if shadow_ready is not None else None
+        ),
+        "quality_score": sum(quality_checks.values()),
+        "quality_score_max": len(quality_checks),
+        "checks": quality_checks,
+        "previous_buy_rate_10s": previous_buy,
+        "recent_buy_rate_10s": recent_buy,
+        "recent_sell_rate_10s": recent_sell,
+        "ma20": ma20 if ma20 > 0 else None,
+        "ma20_distance_pct": (
+            round(ma20_distance_pct, 6)
+            if ma20_distance_pct is not None else None
+        ),
+        "ma20_overheated_above_15pct": ma20_overheated,
+        "rebound_pct_at_entry": (
+            round(rebound_pct, 6) if rebound_pct is not None else None
+        ),
+        "atrp10_pct": atrp10 if atrp10 > 0 else None,
+        "rebound_atrp_ratio": (
+            round(rebound_atrp_ratio, 6)
+            if rebound_atrp_ratio is not None else None
+        ),
+        "kosdaq_5m_change_pct": kosdaq_5m_change_pct,
+        "kosdaq_observation_only": True,
+    }
+
+
+def _s03_kosdaq_5m_context(
+    index_path: Path,
+    history_path: Path,
+    observed_at: datetime,
+) -> dict[str, Any]:
+    """Read the current index JSON and its prior five-minute archived sample."""
+    local_observed = (
+        observed_at.astimezone().replace(tzinfo=None)
+        if observed_at.tzinfo is not None
+        else observed_at
+    )
+    result: dict[str, Any] = {
+        "kosdaq_5m_change_pct": None,
+        "kosdaq_index_ts": "",
+        "kosdaq_prior_ts": "",
+        "kosdaq_sample_interval_sec": None,
+        "kosdaq_source": "kosdaq_index.json+코스닥지수_이력.csv",
+    }
+    try:
+        current = read_json(index_path, {})
+        current_ts = datetime.fromisoformat(str(current.get("ts") or ""))
+        current_price = number(current.get("price"))
+    except (OSError, ValueError, TypeError):
+        return result
+    if (
+        current_price <= 0
+        or current_ts.date() != local_observed.date()
+        or current_ts > local_observed + timedelta(seconds=10)
+        or local_observed - current_ts > timedelta(minutes=10)
+    ):
+        return result
+    prior_rows: list[tuple[datetime, float]] = []
+    try:
+        with history_path.open(encoding="utf-8-sig", newline="") as handle:
+            for raw in csv.DictReader(handle):
+                try:
+                    ts = datetime.fromisoformat(str(raw.get("지수시각") or ""))
+                    price = number(raw.get("지수"))
+                except ValueError:
+                    continue
+                if (
+                    price > 0
+                    and ts.date() == current_ts.date()
+                    and ts <= current_ts - timedelta(minutes=4)
+                ):
+                    prior_rows.append((ts, price))
+    except OSError:
+        return result
+    if not prior_rows:
+        return result
+    prior_ts, prior_price = max(prior_rows, key=lambda row: row[0])
+    result.update({
+        "kosdaq_5m_change_pct": round(
+            (current_price / prior_price - 1.0) * 100.0, 6
+        ),
+        "kosdaq_index_ts": current_ts.isoformat(sep=" "),
+        "kosdaq_prior_ts": prior_ts.isoformat(sep=" "),
+        "kosdaq_sample_interval_sec": int(
+            (current_ts - prior_ts).total_seconds()
+        ),
+    })
+    return result
+
+
 class Strategy03HoldSellEngine(UnifiedHoldSellEngine):
     """공통 장초반 골짜기 매도에서 S03의 시간청산만 15:10으로 분리."""
 
-    def __init__(self, *, audit_recorder=None) -> None:
+    def __init__(
+        self,
+        *,
+        audit_recorder=None,
+        early_peak_live_enabled: bool | None = None,
+    ) -> None:
         super().__init__(audit_recorder=audit_recorder)
+        self._s03_entry_reference_low = Decimal("0")
+        self._s03_early_peak_watch_since: datetime | None = None
+        self._s03_early_peak_live_enabled = (
+            live_feature_enabled("S03_EARLY_PEAK")
+            if early_peak_live_enabled is None
+            else bool(early_peak_live_enabled)
+        )
         self.open_profile = replace(
             STRATEGY_PROFILES[StrategyId.VALLEY_MORNING_CRASH],
             hard_stop_pct=Decimal("-2.0"),
@@ -143,6 +375,162 @@ class Strategy03HoldSellEngine(UnifiedHoldSellEngine):
             force_exit_at=day_time(15, 10),
         )
 
+    def set_s03_entry_reference_low(self, value: Any) -> None:
+        self._s03_entry_reference_low = _s03_decimal(value)
+
+    def set_s03_early_peak_watch_since(self, value: Any) -> None:
+        if isinstance(value, datetime):
+            self._s03_early_peak_watch_since = value
+            return
+        try:
+            self._s03_early_peak_watch_since = (
+                datetime.fromisoformat(str(value)) if value else None
+            )
+        except (TypeError, ValueError):
+            self._s03_early_peak_watch_since = None
+
+    def get_s03_early_peak_watch_since(self) -> datetime | None:
+        return self._s03_early_peak_watch_since
+
+    def _s03_early_peak_v2(
+        self,
+        state: HoldSellState,
+        observation: HoldSellObservation,
+        common_decision,
+    ) -> dict[str, Any]:
+        """S03 early peak D with shared-flow definitions and four live gates."""
+        peak_return_pct = (
+            (state.peak_price / state.entry_price - Decimal("1"))
+            * Decimal("100")
+        )
+        peak_drop_pct = (
+            (state.peak_price - observation.price)
+            / state.peak_price
+            * Decimal("100")
+        )
+        sell_money_break = (
+            observation.buy_money_per_sec_10s > 0
+            and observation.sell_money_per_sec_10s
+            >= observation.buy_money_per_sec_10s
+            * self.config.common_peak_sell_money_mult
+        )
+        sell_volume_break = (
+            observation.buy_volume_per_sec_5s > 0
+            and observation.sell_volume_per_sec_previous_10s > 0
+            and observation.sell_volume_per_sec_5s
+            >= observation.buy_volume_per_sec_5s
+            * self.config.common_peak_sell_volume_mult
+            and observation.sell_volume_per_sec_5s
+            >= observation.sell_volume_per_sec_previous_10s
+            * self.config.common_peak_sell_volume_accel_mult
+        )
+        buy_fading = (
+            observation.buy_money_per_sec_30s > 0
+            and observation.buy_money_per_sec_10s
+            <= observation.buy_money_per_sec_30s
+            * self.config.common_peak_buy_fade_mult
+        )
+        che_falling = (
+            observation.che_str_change_5s
+            <= -self.config.common_peak_che_drop
+        )
+        flow_break_score = sum((
+            sell_money_break,
+            sell_volume_break,
+            buy_fading,
+            che_falling,
+        ))
+        common_rising_hold = bool(
+            common_decision.action is HoldSellAction.HOLD
+            and (
+                common_decision.reason.endswith("_RIDER_HOLD")
+                or common_decision.reason.endswith("_MA5_TREND_HOLD")
+                or common_decision.reason in {
+                    "COMMON_RISING_HOLD",
+                    "VALLEY_RISING_HOLD",
+                    "VALLEY_PEAK_RECLAIM_HOLD",
+                }
+            )
+        )
+        rising_hold = bool(
+            observation.daily_ma_permit
+            or (
+                observation.buy_money_per_sec_10s
+                > observation.sell_money_per_sec_10s
+            )
+            or common_rising_hold
+        )
+        armed = bool(peak_return_pct >= S03_EARLY_PEAK_ARM_PCT)
+        pulled_back = bool(peak_drop_pct >= S03_EARLY_PEAK_DROP_PCT)
+        # No single fee/tax field exists on this exit path, so the approved
+        # conservative round-trip cost floor remains an explicit 0.25%.
+        cost_floor = (
+            state.entry_price
+            * (
+                Decimal("1")
+                + S03_EARLY_PEAK_COST_FLOOR_PCT / Decimal("100")
+            )
+        )
+        cost_floor_ok = bool(observation.price >= cost_floor)
+        block_reason = ""
+        would_exit = False
+        if not (armed and pulled_back):
+            self._s03_early_peak_watch_since = None
+        elif rising_hold:
+            self._s03_early_peak_watch_since = None
+            block_reason = "RISING_HOLD"
+        elif flow_break_score < 2:
+            self._s03_early_peak_watch_since = None
+            block_reason = "FLOW_SCORE_LOW"
+        elif not cost_floor_ok:
+            self._s03_early_peak_watch_since = None
+            block_reason = "COST_FLOOR_BLOCK"
+        else:
+            if self._s03_early_peak_watch_since is None:
+                self._s03_early_peak_watch_since = observation.observed_at
+            watch_age_sec = max(
+                0.0,
+                (
+                    observation.observed_at
+                    - self._s03_early_peak_watch_since
+                ).total_seconds(),
+            )
+            if watch_age_sec >= 3.0:
+                would_exit = True
+            else:
+                block_reason = "WATCH_PENDING"
+        watch_age_sec = (
+            max(
+                0.0,
+                (
+                    observation.observed_at
+                    - self._s03_early_peak_watch_since
+                ).total_seconds(),
+            )
+            if self._s03_early_peak_watch_since is not None
+            else 0.0
+        )
+        return {
+            "s03_early_peak_variant": "D",
+            "s03_early_peak_arm_pct": str(S03_EARLY_PEAK_ARM_PCT),
+            "s03_early_peak_drop_pct": str(S03_EARLY_PEAK_DROP_PCT),
+            "s03_early_peak_peak_return_pct": str(peak_return_pct),
+            "s03_early_peak_current_drop_pct": str(peak_drop_pct),
+            "s03_early_peak_armed": armed,
+            "s03_early_peak_flow_break_score": flow_break_score,
+            "s03_early_peak_rising_hold": rising_hold,
+            "s03_early_peak_watch_since": (
+                self._s03_early_peak_watch_since.isoformat()
+                if self._s03_early_peak_watch_since is not None
+                else ""
+            ),
+            "s03_early_peak_watch_age_sec": watch_age_sec,
+            "s03_early_peak_cost_floor": str(cost_floor),
+            "s03_early_peak_cost_floor_ok": cost_floor_ok,
+            "s03_early_peak_block_reason": block_reason,
+            "would_exit_s03_early_peak": would_exit,
+        }
+
     def evaluate(
         self,
         state: HoldSellState,
@@ -151,12 +539,48 @@ class Strategy03HoldSellEngine(UnifiedHoldSellEngine):
         if state.strategy_id is not StrategyId.VALLEY_MORNING_CRASH:
             return super().evaluate(state, observation)
         state_before = state.to_dict()
+        shadow = _s03_low_break_shadow(
+            self._s03_entry_reference_low, observation
+        )
+        state_before.update(shadow)
         decision = self._evaluate_strategy03_once(state, observation)
+        early_peak = self._s03_early_peak_v2(
+            state, observation, decision
+        )
+        early_peak["s03_early_peak_live_enabled"] = (
+            self._s03_early_peak_live_enabled
+        )
+        state_before.update(early_peak)
+        if (
+            state.entry_lane == OPEN_CRASH_LANE
+            and shadow["would_exit_low_break"]
+            and not decision.should_sell
+        ):
+            decision = self._latch(
+                state,
+                observation,
+                HoldSellAction.SELL,
+                str(shadow["s03_low_break_shadow_reason"]),
+            )
+        if (
+            self._s03_early_peak_live_enabled
+            and early_peak["would_exit_s03_early_peak"]
+            and not decision.should_sell
+        ):
+            decision = self._latch(
+                state,
+                observation,
+                HoldSellAction.SELL,
+                "S03_EARLY_PEAK",
+            )
+        state_after = state.to_dict()
+        state_after.update(shadow)
+        state_after.update(early_peak)
         self.audit_recorder.record(
             state_before=state_before,
             observation=observation,
             decision=decision,
-            state_after=state.to_dict(),
+            state_after=state_after,
         )
         return decision
 
@@ -601,17 +1025,33 @@ def make_strategy03_signal_selector(
             lane = str(row.get("entry_lane") or OPEN_CRASH_LANE)
             bottom_shadow = _record_bottom_confirm_shadow(lane)
             if lane == EARLY_LOW_LANE:
-                signal_reason = str(row.get("reason") or "")
                 rebound_valid = (
-                    EARLY_LOW_MAX_REBOUND_PCT < rebound <= EARLY_LOW_FAST_REBOUND_MAX_PCT
-                    if signal_reason == EARLY_LOW_FAST_REBOUND_REASON
-                    else EARLY_LOW_MIN_REBOUND_PCT <= rebound <= EARLY_LOW_MAX_REBOUND_PCT
+                    EARLY_LOW_MIN_REBOUND_PCT
+                    <= rebound <= EARLY_LOW_MAX_REBOUND_PCT
                 )
                 if not rebound_valid:
                     _drop(row, "EARLY_LOW_REBOUND_OUT_OF_BAND",
                           price=price, rebound_pct=round(rebound, 4))
                     continue
-                if not _flow_turn_pass():
+                if number(row.get("rapid_drop_pct")) > -EARLY_LOW_RAPID_DROP_PCT:
+                    _drop(row, "EARLY_LOW_3M_DROP_NOT_CONFIRMED")
+                    continue
+                anchor_age = number(row.get("anchor_age_sec"), -1.0)
+                if not 0.0 <= anchor_age <= EARLY_LOW_REBOUND_TIMEOUT_SEC:
+                    _drop(row, "EARLY_LOW_60S_WINDOW_EXPIRED")
+                    continue
+                if number(row.get("low_stable_sec")) < EARLY_LOW_LOW_STABLE_SEC:
+                    _drop(row, "EARLY_LOW_2S_STABILITY_NOT_CONFIRMED")
+                    continue
+                if int(number(row.get("up_ticks"))) < EARLY_LOW_MIN_UP_TICKS:
+                    _drop(row, "EARLY_LOW_TWO_UP_TICKS_NOT_CONFIRMED")
+                    continue
+                ask = abs(number(raw.get("best_ask_px")))
+                bid = abs(number(raw.get("best_bid_px")))
+                ask_qty = abs(number(raw.get("best_ask_qty")))
+                bid_qty = abs(number(raw.get("best_bid_qty")))
+                if not (ask > bid > 0 and ask_qty > 0 and bid_qty > 0):
+                    _drop(row, "EARLY_LOW_TOP_OF_BOOK_INVALID")
                     continue
                 candidate_validated.append(row)
                 if not early_low_live_enabled:
@@ -635,30 +1075,15 @@ def make_strategy03_signal_selector(
                 if open_price <= 0:
                     _drop(row, "OPEN_PRICE_MISSING")
                     continue
-                upper_price = open_price * (1.0 + OPEN_ARM_DROP_PCT / 100.0)
-                # ★[S03-EXPRESS 2026-08-06] 급행 신호는 제 잣대로 재검산 —
-                #   -8% 하한·반등 1.0~1.5% 를 들이대면 급행이 전부 버려진다.
-                #   위 -4% 선(S01·S02 영역 구분)과 저점 과열(+1.5%)만 다시 본다.
-                if str(row.get("reason") or "").startswith("S03_EXPRESS"):
-                    if not 0 < price <= upper_price:
-                        _drop(row, "EXPRESS_PRICE_OUT_OF_BAND",
-                              price=price, upper_price=round(upper_price, 2))
-                        continue
-                    if not 0.0 <= rebound <= EXPRESS_NEAR_LOW_PCT:
-                        _drop(row, "EXPRESS_REBOUND_OUT_OF_BAND",
-                              price=price, rebound_pct=round(rebound, 4))
-                        continue
-                else:
-                    lower_price = open_price * (1.0 + OPEN_HANDOFF_DROP_PCT / 100.0)
-                    if not lower_price < price <= upper_price:
-                        _drop(row, "OPEN_PRICE_OUT_OF_BAND",
-                              price=price, lower_price=round(lower_price, 2),
-                              upper_price=round(upper_price, 2))
-                        continue
-                    if not OPEN_MIN_REBOUND_PCT <= rebound <= OPEN_MAX_REBOUND_PCT:
-                        _drop(row, "OPEN_REBOUND_OUT_OF_BAND",
-                              price=price, rebound_pct=round(rebound, 4))
-                        continue
+                anchor_drop = (anchor_low / open_price - 1.0) * 100.0
+                if not anchor_drop <= OPEN_ARM_DROP_PCT:
+                    _drop(row, "OPEN_ANCHOR_DROP_OUT_OF_BAND",
+                          anchor_drop_pct=round(anchor_drop, 4))
+                    continue
+                if not OPEN_MIN_REBOUND_PCT <= rebound <= OPEN_MAX_REBOUND_PCT:
+                    _drop(row, "OPEN_REBOUND_OUT_OF_BAND",
+                          price=price, rebound_pct=round(rebound, 4))
+                    continue
 
             current_buy = number(raw.get("buy_money_cum"), -1.0)
             current_sell = number(raw.get("sell_money_cum"), -1.0)
@@ -671,7 +1096,7 @@ def make_strategy03_signal_selector(
                 _drop(row, "MONEY_CUM_WENT_BACKWARDS")
                 continue
             signal_at = parse_dt(row.get("ts"), decision_at)
-            if point_at > signal_at:
+            if point_at > signal_at and lane != INTRADAY_CRASH_LANE:
                 delta_buy = current_buy - signal_buy
                 delta_sell = current_sell - signal_sell
                 if delta_buy <= delta_sell:
@@ -723,6 +1148,13 @@ def make_strategy03_signal_selector(
 class Strategy03Engine(Strategy01Engine):
     def __init__(self, config: Config, **kwargs: Any) -> None:
         super().__init__(config, **kwargs)
+        base_signal_selector = self.signal_selector
+
+        def lane_capped_selector(*args: Any, **selector_kwargs: Any):
+            rows = base_signal_selector(*args, **selector_kwargs)
+            return self._apply_lane_slot_limit(rows)
+
+        self.signal_selector = lane_capped_selector
         audit_recorder = self.exit_engine.audit_recorder
         if self.config.audit_enabled:
             audit_recorder = HoldSellAuditRecorder(
@@ -738,16 +1170,317 @@ class Strategy03Engine(Strategy01Engine):
         self.exit_engine = Strategy03HoldSellEngine(
             audit_recorder=audit_recorder)
         self._s03_daily_trend: dict[str, dict[str, float]] | None = None
+        self._s03_atrp10: dict[str, float] | None = None
+        self._s03_confirm_lane = ""
+        self._reconcile_crash_claims()
+
+    def _reconcile_crash_claims(self) -> None:
+        """Restore S03/S06 ownership after the S03 order engine restarts."""
+        if not crash_claim.enabled():
+            return
+        now = kst_now()
+        claims = crash_claim.active_s03_claims(now)
+        phases_by_code: dict[str, set[str]] = {}
+        for position in self._active_positions().values():
+            if self._position_entry_lane(position) != OPEN_CRASH_LANE:
+                continue
+            code = str(position.get("code") or "").zfill(6)
+            phases_by_code.setdefault(code, set()).add(
+                str(position.get("phase") or ""))
+        for code, row in claims.items():
+            state = str(row.get("state") or "")
+            phases = phases_by_code.get(code, set())
+            if state == "ORDERING":
+                if phases & {"HOLD", "SELL_PENDING"}:
+                    crash_claim.mark_bought(
+                        code, now, order_id=str(row.get("order_id") or ""))
+                elif not phases & {"BUY_PENDING", "RECOVERY_BLOCKED"}:
+                    crash_claim.release_s03(
+                        code, now, reason="S03_RESTART_NO_ACTIVE_ORDER")
+            elif state == "BOUGHT" and not phases & {
+                "HOLD", "SELL_PENDING", "RECOVERY_BLOCKED"
+            }:
+                crash_claim.release_s03(
+                    code, now, reason="S03_RESTART_NO_ACTIVE_POSITION")
+
+    @staticmethod
+    def _position_entry_lane(position: Mapping[str, Any]) -> str:
+        lane = str(position.get("entry_lane") or "")
+        if lane in {OPEN_CRASH_LANE, INTRADAY_CRASH_LANE}:
+            return lane
+        entry_at = parse_dt(position.get("entry_at"))
+        return (
+            OPEN_CRASH_LANE
+            if entry_at.time() < day_time(9, 20)
+            else INTRADAY_CRASH_LANE
+        )
+
+    def _apply_lane_slot_limit(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Keep three concurrent S03 slots for each of the two entry lanes."""
+        active = self._active_positions()
+        remaining = {
+            OPEN_CRASH_LANE: S03_LANE_SLOT_LIMIT,
+            INTRADAY_CRASH_LANE: S03_LANE_SLOT_LIMIT,
+        }
+        for position in active.values():
+            lane = self._position_entry_lane(position)
+            remaining[lane] = max(0, remaining[lane] - 1)
+
+        selected: list[dict[str, Any]] = []
+        reserved_codes: set[str] = set()
+        for row in rows:
+            lane = str(row.get("entry_lane") or OPEN_CRASH_LANE)
+            if lane not in remaining:
+                continue
+            code = str(row.get("code") or "").zfill(6)
+            if code in active or code in reserved_codes:
+                selected.append(row)
+                continue
+            if remaining[lane] <= 0:
+                continue
+            remaining[lane] -= 1
+            reserved_codes.add(code)
+            selected.append(row)
+        return selected
+
+    def _event(
+        self,
+        event: str,
+        *,
+        code: str = "",
+        name: str = "",
+        price: float = 0.0,
+        quantity: int = 0,
+        reason: str = "",
+        order_no: str = "",
+    ) -> None:
+        if event in {
+            "BUY_CONFIRMED", "SHADOW_BUY",
+            "BUY_ADD_CONFIRMED", "SHADOW_BUY_ADD",
+        } and self._s03_confirm_lane:
+            reason = f"{reason} lane={self._s03_confirm_lane}"
+        if event in {"BUY_REJECTED", "BUY_NOT_CREATED", "BUY_CANCELLED"} and code:
+            crash_claim.release_s03(code, kst_now(), reason=event)
+        super()._event(
+            event,
+            code=code,
+            name=name,
+            price=price,
+            quantity=quantity,
+            reason=reason,
+            order_no=order_no,
+        )
+
+    def _order_lifecycle(
+        self,
+        event: str,
+        position: Mapping[str, Any],
+        *,
+        fill_quantity: int = 0,
+        fill_price: float = 0.0,
+        fill_source: str = "",
+        observed_at: datetime | None = None,
+    ) -> None:
+        if (
+            event == "BUY_PREPARED"
+            and self._position_entry_lane(position) == OPEN_CRASH_LANE
+            and crash_claim.enabled()
+        ):
+            pending = position.get("pending") or {}
+            claim_ok = crash_claim.mark_ordering(
+                str(position.get("code") or "").zfill(6),
+                observed_at or kst_now(),
+                order_id=str(
+                    pending.get("order_no")
+                    or pending.get("idempotency_key")
+                    or ""),
+            )
+            if not claim_ok:
+                mutable = position if isinstance(position, dict) else None
+                if mutable is not None:
+                    mutable["phase"] = "FAILED"
+                    self._release_slot(mutable)
+                    mutable["slot_reserved"] = False
+                self._event(
+                    "BUY_REJECTED",
+                    code=str(position.get("code") or "").zfill(6),
+                    name=str(position.get("name") or ""),
+                    price=number(position.get("last_price")),
+                    reason="S03_CRASH_CLAIM_NOT_HELD_PREORDER",
+                )
+                self._save()
+                raise S03CrashClaimNotHeld(
+                    str(position.get("code") or "").zfill(6))
+        super()._order_lifecycle(
+            event,
+            position,
+            fill_quantity=fill_quantity,
+            fill_price=fill_price,
+            fill_source=fill_source,
+            observed_at=observed_at,
+        )
+
+    def tick(self, now: datetime | None = None) -> dict[str, Any]:
+        try:
+            return super().tick(now)
+        except S03CrashClaimNotHeld as exc:
+            self.log.error(
+                "S03_CRASH_CLAIM_NOT_HELD_PREORDER code=%s", exc)
+            return self.state
+
+    def _append_s03_entry_context(
+        self,
+        position: Mapping[str, Any],
+        observed_at: datetime,
+        *,
+        shadow: bool,
+    ) -> None:
+        record = {
+            "ts": observed_at.isoformat(),
+            "strategy_id": self.config.strategy_id.value,
+            "event": "S03_ENTRY_CONTEXT",
+            "code": str(position.get("code") or "").zfill(6),
+            "name": str(position.get("name") or ""),
+            "lane": str(position.get("entry_lane") or ""),
+            "shadow_order": bool(shadow),
+            "s03_entry_reference_low": number(
+                position.get("s03_entry_reference_low")
+            ),
+            "atrp10_pct": position.get("s03_atrp10_pct"),
+            "drop_pct": position.get("s03_entry_drop_pct"),
+            "drop_atrp_multiple": position.get("s03_drop_atrp_multiple"),
+            "kosdaq_5m_change_pct": position.get("s03_kosdaq_5m_change_pct"),
+            "kosdaq_index_ts": position.get("s03_kosdaq_index_ts"),
+            "kosdaq_prior_ts": position.get("s03_kosdaq_prior_ts"),
+            "kosdaq_sample_interval_sec": position.get(
+                "s03_kosdaq_sample_interval_sec"
+            ),
+            "kosdaq_source": position.get("s03_kosdaq_source"),
+            "s03_bottom_quality_v2": position.get("s03_bottom_quality_v2"),
+            "shadow_only": {
+                "low_break_exit": False,
+                "atr_normalization": True,
+                "kosdaq_5m_filter": True,
+                "bottom_quality_v2": True,
+            },
+            "live_rules": {"low_break_exit": True},
+        }
+        path = S03_ENTRY_CONTEXT_AUDIT_DIR / f"s03_entry_context_{observed_at:%Y%m%d}.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8", newline="") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            self.log.exception("S03_ENTRY_CONTEXT_AUDIT_WRITE_FAILED")
+
+    def _confirm_entry(
+        self,
+        position: dict[str, Any],
+        quantity: int,
+        fill_price: float,
+        observed_at: datetime,
+        *,
+        shadow: bool = False,
+    ) -> None:
+        signal = position.get("signal_snapshot") or {}
+        claim_order_id = str(
+            ((position.get("pending") or {}).get("order_no") or ""))
+        lane = str(
+            position.get("entry_lane")
+            or signal.get("entry_lane")
+            or self._position_entry_lane(position)
+        )
+        reference_low = number(signal.get("anchor_low"))
+        self._load_s03_daily_trend()
+        atrp = number((self._s03_atrp10 or {}).get(
+            str(position.get("code") or "").zfill(6)
+        ))
+        drop_pct = _s03_entry_drop_pct(signal, lane)
+        kosdaq = _s03_kosdaq_5m_context(
+            S03_KOSDAQ_INDEX_PATH,
+            S03_KOSDAQ_HISTORY_PATH,
+            observed_at,
+        )
+        trend = (self._s03_daily_trend or {}).get(
+            str(position.get("code") or "").zfill(6), {}
+        )
+        bottom_quality_v2 = _s03_bottom_quality_v2_shadow(
+            signal,
+            entry_price=number(fill_price or position.get("last_price")),
+            ma20=number(trend.get("ma20")),
+            atrp10=atrp,
+            kosdaq_5m_change_pct=kosdaq["kosdaq_5m_change_pct"],
+        )
+        position.update({
+            "entry_lane": lane,
+            "s03_entry_reference_low": reference_low,
+            "s03_atrp10_pct": round(atrp, 6) if atrp > 0 else None,
+            "s03_entry_drop_pct": round(drop_pct, 6),
+            "s03_drop_atrp_multiple": (
+                round(drop_pct / atrp, 6) if atrp > 0 else None
+            ),
+            "s03_kosdaq_5m_change_pct": kosdaq["kosdaq_5m_change_pct"],
+            "s03_kosdaq_index_ts": kosdaq["kosdaq_index_ts"],
+            "s03_kosdaq_prior_ts": kosdaq["kosdaq_prior_ts"],
+            "s03_kosdaq_sample_interval_sec": kosdaq[
+                "kosdaq_sample_interval_sec"
+            ],
+            "s03_kosdaq_source": kosdaq["kosdaq_source"],
+            "s03_bottom_quality_v2": bottom_quality_v2,
+        })
+        self._s03_confirm_lane = lane
+        try:
+            super()._confirm_entry(
+                position,
+                quantity,
+                fill_price,
+                observed_at,
+                shadow=shadow,
+            )
+        finally:
+            self._s03_confirm_lane = ""
+        self._append_s03_entry_context(position, observed_at, shadow=shadow)
+        if lane == OPEN_CRASH_LANE:
+            code = str(position.get("code") or "").zfill(6)
+            if shadow:
+                crash_claim.release_s03(
+                    code, observed_at, reason="SHADOW_ORDER_ZERO")
+            else:
+                crash_claim.mark_bought(
+                    code, observed_at, order_id=claim_order_id)
+
+    def _confirm_exit(
+        self,
+        position: dict[str, Any],
+        fill_price: float,
+        reason: str,
+        *,
+        shadow: bool = False,
+    ) -> None:
+        lane = self._position_entry_lane(position)
+        code = str(position.get("code") or "").zfill(6)
+        super()._confirm_exit(
+            position, fill_price, reason, shadow=shadow)
+        if lane == OPEN_CRASH_LANE:
+            crash_claim.release_s03(
+                code, kst_now(), reason="S03_POSITION_CLOSED")
 
     def _load_s03_daily_trend(self) -> None:
         if self._s03_daily_trend is not None:
             return
         self._s03_daily_trend = {}
+        self._s03_atrp10 = {}
         session_day = str(self.state.get("date") or "")
         if len(session_day) != 8 or not session_day.isdigit():
             self.log.warning("S03 daily trend disabled: invalid session date")
             return
         by_code: dict[str, dict[str, float]] = {}
+        by_code_ohlc: dict[str, dict[str, tuple[float, float, float]]] = {}
         try:
             with self.config.eod_bars_path.open(
                 encoding="utf-8-sig", newline=""
@@ -756,6 +1489,8 @@ class Strategy03Engine(Strategy01Engine):
                     code = str(raw.get("code") or "").zfill(6)
                     day = str(raw.get("date") or "").replace("-", "")
                     close = number(raw.get("close"))
+                    high = number(raw.get("high"))
+                    low = number(raw.get("low"))
                     if (
                         len(code) == 6
                         and code.isdigit()
@@ -765,6 +1500,10 @@ class Strategy03Engine(Strategy01Engine):
                         and close > 0
                     ):
                         by_code.setdefault(code, {})[day] = close
+                        if high >= low > 0:
+                            by_code_ohlc.setdefault(code, {})[day] = (
+                                high, low, close
+                            )
         except OSError:
             self.log.warning("S03 daily trend disabled: EOD bars unavailable")
             return
@@ -784,6 +1523,12 @@ class Strategy03Engine(Strategy01Engine):
                 "ma20": ma20,
                 "ma20_prev": ma20_prev,
             }
+        for code, series in by_code_ohlc.items():
+            days = sorted(series)
+            if len(days) >= 10:
+                self._s03_atrp10[code] = atrp10_pct(
+                    [series[day] for day in days]
+                )
 
     def _daily_ma_permit(self, code: str, price: float,
                          buy_side=None) -> bool:
@@ -982,6 +1727,30 @@ class Strategy03Engine(Strategy01Engine):
                 exact_valid and rate10 and rate10[1] > rate10[0]
             ),
         )
+
+    def _evaluate_exit(
+        self,
+        position: dict[str, Any],
+        now: datetime,
+    ) -> None:
+        engine = self.exit_engine
+        if isinstance(engine, Strategy03HoldSellEngine):
+            engine.set_s03_entry_reference_low(
+                position.get("s03_entry_reference_low")
+            )
+            engine.set_s03_early_peak_watch_since(
+                position.get("s03_early_peak_watch_since")
+            )
+        try:
+            super()._evaluate_exit(position, now)
+        finally:
+            if isinstance(engine, Strategy03HoldSellEngine):
+                watch_since = engine.get_s03_early_peak_watch_since()
+                position["s03_early_peak_watch_since"] = (
+                    watch_since.isoformat() if watch_since is not None else ""
+                )
+                engine.set_s03_entry_reference_low(0)
+                engine.set_s03_early_peak_watch_since(None)
 
 
 @dataclass(frozen=True)

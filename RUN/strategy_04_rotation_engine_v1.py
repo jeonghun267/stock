@@ -43,7 +43,8 @@ def build_config() -> Config:
             "S04_BOARD_MAX_AGE_SEC", "8")),
         fill_wait_sec=float(os.environ.get("S04_FILL_WAIT_SEC", "8")),
         loop_sec=float(os.environ.get("S04_LOOP_SEC", "1")),
-        entry_start=day_time(10, 0),
+        # ★[2026-08-27 친구님 지시] 눌림 진입 10:00 → 09:00 (W자 첫 바닥 직후 포착).
+        entry_start=day_time(9, 0),
         entry_end=day_time(14, 30),
         force_exit=day_time(15, 10),
         process_end=day_time(15, 25),

@@ -1,15 +1,19 @@
 # -*- coding: utf-8 -*-
-# ★[SHADOW-B 2026-08-05] 그림자 전용 사본 — 주문 없음, 실전과 무관.
-#   원본 strategy_02_low_buy_signal_v1.py 에서 SIX 경로의 수급 관문
+# ★[SHADOW-B 2026-08-05 / 2026-08-27 리베이스] 그림자 전용 사본 — 주문 없음, 실전과 무관.
+#   현재 실전 strategy_02_low_buy_signal_v1.py 에서 SIX 경로의 수급 관문
 #   3개(수급역전·가속·체결량/체결강도)만 통과시켜 "가격만" 판정을 만든다.
 #   수급 값 계산과 기록은 그대로 남겨 비교에 쓴다.
 #   호가 품질 관문(스프레드·마이크로프라이스·최우선매수비중)은 건드리지 않았다.
+#   ⚠️2026-08-27 재작성 이유: 8/05 사본이 그대로 굳어 실전(124KB)과 47KB 벌어져,
+#     그림자가 재는 것이 "관문 차이"가 아니라 "옛 코드 차이"가 돼 있었다.
+#     옛 사본은 RUNackup\shadow_bc_20260805_stale\ 에 보존.
 """새전략 02 저점매수·매도소진 신호전용 감시기(주문 0)."""
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import msvcrt
 import os
 import sys
 import time as time_module
@@ -24,6 +28,7 @@ RUN_DIR = Path(__file__).resolve().parent
 if str(RUN_DIR) not in sys.path:
     sys.path.insert(0, str(RUN_DIR))
 
+from intraday_anchor_v1 import day_anchor
 from strategy_02_signal_contract_v1 import SIGNAL_MODE, SIGNAL_SCHEMA
 from 저점매수_매도소진 import BottomSignal, MarketPoint, detect_flow_book_exhaustion
 
@@ -33,11 +38,15 @@ KST = ZoneInfo("Asia/Seoul")
 #   09:30 시작이면 그날 가장 좋은 자리를 통째로 놓친다.
 ENTRY_START = time(9, 0)
 MORNING_OPEN_REFERENCE_END = time(9, 30)
+# ★[DAY-LOW 2026-08-05] 정규장 시작. 진짜 당일 저점 기록에만 쓴다(판정 미사용).
+REGULAR_SESSION_START = time(9, 0)
 ENTRY_END = time(14, 20)
 AFTERNOON_START = time(12, 0)
 # 그림자 AFT5F 확정값: 12시 이후 신호가격이 장중 고점 대비 -5% 이상이고
 # 최근 10초 매수대금 속도가 매도대금 속도보다 강할 때만 진입한다.
 AFTERNOON_MIN_SIGNAL_DROP_PCT = 5.0
+S02_SEVERE_BOOK_IMBALANCE = -0.25
+S02_BOOK_RECOVERY_LEVEL = -0.15
 
 
 # ★[2026-07-31 친구님 지시 "2번 이렇게 바꿔"] 매수 판정 전면 교체.
@@ -63,6 +72,19 @@ AFTERNOON_MIN_SIGNAL_DROP_PCT = 5.0
 DIP_MODE = os.environ.get("S02_DIP_MODE", "YES").strip().upper() == "YES"
 MORNING_DIP_DROP_PCT = 3.0   # 09:00~09:29:59 시가 대비 -3% 이하
 INTRADAY_DIP_DROP_PCT = 5.0  # 09:30 이후: 장중 고점 대비 -5% 이하
+# S02/S06 entry split: a day-low decline of 8% or more from open belongs to S06.
+# Candidate selection and signal evaluation stay unchanged; only S02 buy emission is blocked.
+S02_S06_SPLIT_DROP_PCT = 8.0
+# ★[DIRECT-REBOUND 2026-08-13 친구님 지시] 눌림 없는 직접반등 공통 판정 —
+#   정책은 low_rebound_common_v1 한 곳(S06 와 동일 코드 호출). 기본 OFF(기록만).
+from low_rebound_common_v1 import (
+    DirectReboundConfig,
+    judge_direct_rebound,
+)
+from strategy_common_relative_strength_rebound_v1 import (
+    RelativeStrengthReboundShadow,
+)
+
 DIP_REBOUND_PCT = float(os.environ.get("S02_DIP_REBOUND_PCT", "0.5"))  # 저점 +X% 회복 = 신호
 DIP_CHASE_CAP_PCT = float(os.environ.get("S02_DIP_CHASE_CAP", "3.0"))  # 저점 +X% 넘으면 추격 금지
 # ★[2026-08-01 친구님 지시 "2번 저점매수 방법을 6번과 동일하게"] 6번식 매수 확인 이식.
@@ -83,23 +105,111 @@ DIP_CHASE_CAP_PCT = float(os.environ.get("S02_DIP_CHASE_CAP", "3.0"))  # 저점 
 #   기본값 YES 라 환경변수 미설정 시 결과는 종전과 완전히 같다(DIP_MODE 그대로).
 SIX_STYLE = (os.environ.get("S02_SIX_STYLE", "YES").strip().upper() == "YES") and DIP_MODE
 SIX_OBSERVE_SEC = float(os.environ.get("S02_OBSERVE_SEC", "60"))
+# ★[MORNING-FASTPATH 2026-08-06 친구님 지시]
+#   "아침엔 60초 관찰을 피해가야 돼" · "저점 리셋해서 매수 매도가 역전되면 바로 매수해야 돼"
+#   · "1-1.5%, 2%는 추격" · "눌림도 면제(A)"
+#
+#   왜: 아침은 계단이 빨라 60초를 기다리면 저점이 계속 갈아치워진다.
+#   8/6 실측(피에스케이 319660, 09:00~09:20 재생) — 저점 리셋 9회, 단계가 내내 CHASE 였고
+#   OBSERVE 에 처음 들어간 것이 09:20:34 로 아침 창이 끝난 뒤였다. 즉 아침엔 이 경로가
+#   구조적으로 한 건도 못 낸다.
+#
+#   면제하는 것 : 60초 관찰 · 눌림(0.4%) 대기 · 2차반등 확인   ← 전부 '시간을 버는' 조건
+#   그대로 두는 것: 흐름 역전(flow_flip) · 흐름 가속 · 상대 흐름 전환 ← '매수세가 이겼나'의 증거
+#   즉 관찰을 포기하는 게 아니라, 이미 역전이 확인된 순간에는 더 안 기다린다.
+#
+#   구간은 2번 값을 그대로 쓴다(1번도 같은 모듈을 부르므로 전략별 분기를 만들지 않는다):
+#     하한 = SIX_FIRST_REBOUND_PCT(1.0) · 상한 = 아래 1.5 · 2.0 초과는 종전대로 추격(저점 죽임)
+#   ⚠️절대 체결강도(옛 급행의 che 120)는 쓰지 않는다 — 바닥에서는 나올 수 없는 값이다(친구님).
+#
+# ★★[2026-08-06 같은 날 저녁 친구님 지시 "2번은 급락이 없어 / 통합 매수 확인해봐 /
+#   급행 끄고"] 기본값을 YES -> NO 로 되돌린다. 만들어놓고 끄는 이유 둘:
+#
+#   ① 중복이었다. 2번에는 급락용 별도 경로(_detect_money_surge_onset)가 이미 있고
+#      그 경로에는 애초에 60초 관찰이 없다(SURGE_TURN_MAX_SEC=10초).
+#      SIX_OBSERVE_SEC 는 계단 경로 두 곳에만 걸린다.
+#      아침에 그 경로가 안 돌던 진짜 이유는 관찰이 아니라 '태스크가 09:20 에 떠서
+#      프로세스가 없었던 것'이고, 그건 오늘 태스크를 09:00 으로 당겨 이미 고쳤다.
+#   ② 반증이 나왔다(8/6 RFHIC 218410 재생):
+#      급행 자리 09:01:22 @50,000 -> 그 뒤 48,300 까지 -3.4% 밀려 하드스톱.
+#      급행 없는 실제 09:40:37 @49,050 -> 11:47 51,300 매도 +4.587%.
+#      09:01 에 이미 -14.36% 인데 더 빠졌다.
+#
+#   코드는 남긴다 — 며칠 치 재생으로 다시 볼 값이다.
+#   켜기: setx S02_MORNING_FASTPATH YES   (프로세스 재기동 후 적용)
+#   ⚠️환경변수가 아니라 이 기본값이 실전을 정한다. 예약 태스크가 사용자 환경변수를
+#     못 받는 경우가 있어 기본값을 실전 값으로 둔다(8/6 S01 에서 같은 판단).
+MORNING_FASTPATH = (
+    os.environ.get("S02_MORNING_FASTPATH", "NO").strip().upper()
+    in {"YES", "Y", "1", "TRUE", "ON"}
+)
+
+
+def _hhmm(text: str, default: time) -> time:
+    """'0920' -> time(9,20). 형식이 깨지면 기본값으로 물러선다."""
+    raw = str(text or "").strip()
+    if len(raw) == 4 and raw.isdigit():
+        hh, mm = int(raw[:2]), int(raw[2:])
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return time(hh, mm)
+    return default
+
+
+MORNING_FASTPATH_END = _hhmm(
+    os.environ.get("S02_MORNING_FASTPATH_END", "0920"), time(9, 20))
+MORNING_FASTPATH_MAX_REBOUND_PCT = float(
+    os.environ.get("S02_MORNING_FASTPATH_MAX_REBOUND_PCT", "1.5"))
 SIX_REARM_DEEPER_PCT = float(os.environ.get("S02_REARM_DEEPER_PCT", "1.0"))
-# ★[S03-ALIGN 2026-08-05 친구님 지시] 저점 찾는 법을 S03 와 같은 값으로 맞춘다.
-#   S02 의 6번식(SIX_*)은 S03·S06 과 코드 구조가 완전히 같다(low -> dead_low ->
-#   first_rebound_peak -> pullback_low -> 재무장, 필드명까지 동일). 그런데 8/3 에
-#   S03 만 개편되고 S02 는 옛 값으로 남아 있었다 — 복사본이 3개라 한쪽만 고쳐진 것.
-#   9개 값 중 6개는 이미 같았고 어긋난 건 아래 둘 + 관찰시간뿐이었다.
-#     1차 반등 문턱  1.5 -> 1.0  (S03 와 동일)
-#     추격 상한     2.0 -> 1.5  (S03 와 동일)
-#   ⚠️관찰시간(SIX_OBSERVE_SEC=60)은 바꾸지 않는다 — 친구님: "2번은 저점에서
-#     60초 관찰이 있고, 3번은 급반등이라 관찰이 없다". 전략 정체성이라 통일 대상이 아님.
-#   실증: 8/5 원익IPS(240810) 를 저점(96,000 @10:26) 대비 +1.875% 에서 매수했다.
-#     추격 상한이 2.0 이라 통과했지만 S03 값(1.5)이었으면 그 자리는 차단됐다.
-#     10:40 에 +0.73%(거래량 1,048, 조용한 다지기) 자리가 있었는데 1차 반등 문턱
-#     1.5% 를 먼저 봐야 해서 구조적으로 못 샀다(1.5% 도달은 10:50).
-#   되돌리기: backup\strategy_02_low_buy_signal_v1_20260805_before_s03_align.py
+# ★[S03-ALIGN 되돌림 2026-08-05 저녁 친구님 지시 "어제 값 되돌려줘"]
+#   같은 날 낮에 S03 와 같은 값으로 맞췄다(1차반등 1.5->1.0, 추격상한 2.0->1.5).
+#   저녁에 그 근거가 착시였음이 드러나 원래 값으로 되돌린다.
+#
+#   ★무엇이 착시였나 — 낮에 쓴 근거는 "저점(96,000) 대비 +1.875% 에서 매수했다,
+#     상한이 1.5 였으면 차단됐다" 였다. 그런데 96,000 은 당일 저점이 아니다.
+#     _reset_six_cycle 이 새 고점이 찍힐 때마다 six_low 를 현재가로 통째로 갈아치우므로
+#     anchor_low 는 "마지막 고점 이후의 저점"일 뿐이다. 진짜 당일 저점은 95,100(09:10:20).
+#     그래서 문턱을 조일수록 anchor 기준 수치는 좋아 보이는데 실제 매수가는 올라간다.
+#
+#   ★실증 (8/5 원익IPS 240810 · 1초 캡처 재생 · 실제 신호 11:00:09@97,800 재현 확인)
+#     실전 조건(회전엔진 태스크가 09:20:20 에 뜬다) 기준 첫 매수:
+#       반등1.0/상한1.5 (낮에 바꾼 값) : 09:33:48 @98,700
+#                                        계약서 1.439%(1등) / 진짜 3.785%(꼴찌) / 종가대비 -1.013%
+#       반등1.5/상한2.0 (원래 값)      : 11:00:08 @97,800
+#                                        계약서 1.875%     / 진짜 2.839%      / 종가대비 -0.102%
+#     🔑추격상한은 1.5/2.0/2.5/3.0 어떤 값이어도 매수 시각·가격이 같다(09:33:48 @98,700).
+#       실제로 작동한 건 "1차반등 1.5->1.0" 하나뿐이고, 그게 매수를 1시간 26분 앞당겨
+#       900원 비싸게 만들었다. 착시폭 2.347%p.
+#
+#   ⚠️이건 새 문턱을 고른 게 아니라 근거가 착시였던 변경을 무른 것이다.
+#     S03 와는 값이 다시 달라진다 — S02 는 60초 관찰이 있는 다른 전략이라 무방하다.
+#     문턱을 진짜로 고르려면 며칠 쌓아서 봐야 한다(7/31 교훈: 하루로 고르면 실패 반복).
+#   ⚠️관찰시간(SIX_OBSERVE_SEC=60)은 낮에도 안 바꿨고 지금도 안 바꾼다 — 전략 정체성.
+#   기록: memory.md 8/5 저녁 "② S02 저점 대비 % 착시" 항목.
+# ★[2026-08-06 낮 친구님 지시] 1차반등만 1.5 -> 1.0. 추격상한은 2.0 그대로 둔다.
+#   경위: "2번은 1.5/2.0 으로 예외 처리돼 이걸 1-1.5% 똑같이 해" → 1.0/1.5 로 바꿔봤더니
+#   시험 1건이 죽었다 → 원인을 숫자로 보여드린 뒤 친구님이 "1.0/2.0" 을 받아들이셨다.
+#   위 8/5 기록은 지우지 않는다(반대 증거로 남긴다).
+#
+#   ★왜 추격상한 1.5 는 안 되는가 (실측 - test_s06_staircase_full_retest...)
+#     시험 시나리오의 저점은 9,500. 상한 2.0% 면 천장이 9,690, 1.5% 면 9,642.5 다.
+#     문제의 틱은 9,643 - 겨우 0.5원 차이로 1.5% 천장을 넘는다.
+#     그런데 천장을 넘으면 코드가 그 저점을 '죽은 저점'으로 낙인찍는다
+#     (six_dead_low = six_low, 980행). 그 뒤로는 9,500 보다 '더 깊은' 새 저점이
+#     나와야만 다시 보는데 이후 가격은 9,595~9,644 라 영영 안 산다.
+#     ⇒ 늦게 사는 게 아니라 신호가 1건 -> 0건 으로 사라진다.
+#     ⚠️8/5 주석의 "상한은 1.5~3.0 어느 값이어도 결과가 같다" 는 한 종목 하루 이야기였다.
+#       이 시험이 그 반례다.
+#
+#   ★1차반등 1.0 은 그대로 간다 - 8/5 실측에서 '실제로 작동한 건 1차반등 하나뿐'이었고,
+#     친구님의 설계 원칙(저점 찾는 법은 전략끼리 같아야 한다)에 맞춘다.
+#   ⚠️알고 넘어갈 것 - 8/5 원익IPS 재생에서 1차반등 1.0 은 매수를 1시간 26분 앞당겨
+#     900원 비싸게 샀다(종가대비 -1.013% vs -0.102%). 하루·한 종목 표본이다.
+#     며칠 치가 쌓이면 다시 본다.
+#   ⚠️이 값이 바뀌면 계약서 config\lowfind_contract_v1.json 도 같이 바꾼다.
+#     한쪽만 고치면 다음날 08:30 리허설이 잡는다.
+#   롤백: setx S02_SIX_FIRST_REBOUND_PCT 1.5 (프로세스 재기동 후 적용) + 계약서 되돌리기.
 SIX_FIRST_REBOUND_PCT = float(os.environ.get("S02_SIX_FIRST_REBOUND_PCT", "1.0"))
-SIX_CHASE_CAP_PCT = float(os.environ.get("S02_SIX_CHASE_CAP_PCT", "1.5"))
+SIX_CHASE_CAP_PCT = float(os.environ.get("S02_SIX_CHASE_CAP_PCT", "2.0"))
 SIX_PULLBACK_MIN_PCT = float(os.environ.get("S02_SIX_PULLBACK_MIN_PCT", "0.4"))
 SIX_HIGHER_LOW_BUFFER_PCT = float(os.environ.get(
     "S02_SIX_HIGHER_LOW_BUFFER_PCT", "0.3"))
@@ -108,10 +218,55 @@ SIX_SECOND_REBOUND_PCT = float(os.environ.get(
 SIX_ENTRY_FLOOR_PCT = float(os.environ.get("S02_SIX_ENTRY_FLOOR_PCT", "1.0"))
 SIX_FLOW_ACCEL_WINDOW_SEC = float(os.environ.get(
     "S02_SIX_FLOW_ACCEL_WINDOW_SEC", "10"))
+# ★[저점리셋 관문 2026-08-07 친구님 지시 "저점에서 리셋하고 해야 돼"]
+#   8/7 전패(13건 -9.02%) 뒤 1초 캡처로 그날 신호 27건을 재생해 저점 리셋 횟수로 갈랐다.
+#     리셋 1회 0승(2건) · 2~3회 0승(2건) · 4회 이상 65.2%(23건)
+#   리셋이 적은 저점 = 아직 한두 번밖에 안 깨진 저점 = 바닥이 아니다.
+#   오늘 27건 -> 23건. 이익먼저 15건은 하나도 안 잘리고 손절만 3건 줄었다.
+#   ⚠️하루치다(N=27). 문턱 4는 며칠 더 쌓아 확정할 것.
+#   ⚠️낙폭 하한은 넣지 않는다 — 계약서 정답이 5.954% 인데 8/7 패배가 5.90% 라 못 가른다.
+#   폐기 기록(재시도 금지):
+#     · 매도속도 previous_sell>0   재생 -0.02%p · 그날 최고 수익건을 죽임
+#     · 봉 전환 판정(직전봉 음봉+양봉전환+봉내 매수우위+매도감속)
+#                                 통과 50.0% vs 탈락 63.2% = 방향이 반대
+#     · 낙폭 하한 6.0%            계약서 정답(5.954%)을 막아 잠금시험 파괴
+#   롤백: setx S02_MIN_LOW_RESET_STEPS 0  (= 종전과 완전히 동일)
+#         또는 RUN\backup\strategy_02_low_buy_signal_v1_20260807_lowreset.py 복원
+#
+# ★[철회 2026-08-07 밤 친구님 지시 "전으로 되돌려"] 기본값을 4 -> 0 으로 내렸다.
+#   친구님 원문: "내가 의도한 대로 안 만들고 제맘대로 만들었어". 원하신 것은 리셋
+#   횟수 세기가 아니라 "반등해 올라오는 사이 매도와 흡수가 어떻게 변해 가는지 보고
+#   살지 말지 판단"이다. 관문 자체가 의도와 다른 물건이었다.
+#   ⚠️기본값을 0 으로 내린 이유: 되돌림이 사용자 환경변수 하나에만 걸려 있으면,
+#     그 값이 프로세스에 안 실리는 순간(프로필 초기화·다른 계정으로 수동 실행·
+#     다른 세션이 값 삭제) 철회한 관문이 조용히 되살아난다. 신호가 사라져도 로그에
+#     "관문 때문"이라는 흔적이 없어 원인 추적이 안 된다. 그래서 코드가 기본으로
+#     꺼져 있게 한다 — 켜려면 명시적으로 켜야 한다.
+#   다시 켜려면: setx S02_MIN_LOW_RESET_STEPS 4  (친구님 승인 후에만)
+#   ⚠️12일 재생(7/23~8/7 신호 1107건)에서 이 축은 승패를 못 갈랐다 —
+#     리셋 횟수 중앙이 승자 12회 · 패자 12회로 같다. 되살릴 근거가 없다.
+MIN_LOW_RESET_STEPS = int(os.environ.get("S02_MIN_LOW_RESET_STEPS", "0"))
 SIX_OBSERVE_MAX_SEC = float(os.environ.get("S02_SIX_OBSERVE_MAX_SEC", "720"))
+S02_DIRECT_MIN_NO_NEW_LOW_SEC = 60.0
+S02_DIRECT_MAX_NO_NEW_LOW_SEC = 240.0
+
+
+def _direct_rebound_age_route(no_new_low_sec: float) -> str:
+    """WAIT < 60s, DIRECT through 240s, then use the existing RETEST path."""
+    if no_new_low_sec < S02_DIRECT_MIN_NO_NEW_LOW_SEC:
+        return "WAIT"
+    if no_new_low_sec > S02_DIRECT_MAX_NO_NEW_LOW_SEC:
+        return "RETEST"
+    return "DIRECT"
+
+
 # 급락 직후 첫 장대양봉 초입을 잡는 별도 경로. 기존 6번식 계단 저점 경로는 유지한다.
 MONEY_SURGE_ENABLED = (
     os.environ.get("S02_MONEY_SURGE_ENABLED", "YES").strip().upper() == "YES"
+)
+FLOW_BOOK_SHADOW_ENABLED = (
+    os.environ.get("S02_FLOW_BOOK_SHADOW_ENABLED", "YES").strip().upper()
+    in {"YES", "Y", "1", "TRUE", "ON"}
 )
 SURGE_DROP_WINDOW_SEC = float(os.environ.get("S02_SURGE_DROP_WINDOW_SEC", "30"))
 SURGE_MIN_DROP_PCT = float(os.environ.get("S02_SURGE_MIN_DROP_PCT", "3.0"))
@@ -128,9 +283,15 @@ SURGE_PREVIOUS_SEC = float(os.environ.get("S02_SURGE_PREVIOUS_SEC", "10"))
 RANGE_KEYS = (
     "hr_prev_range", "hr_avg5_range", "hr_min5_range",
     "hr_streak", "hr_rank", "hr_crown",
+    "hr_money_speed_ratio", "hr_turnover_pct", "hr_volatility_quality",
+    "hr_quality_risks", "hr_live_status",
 )
-# ★[2026-07-31 친구님 지시 "전략 2하고 3부터 고저폭으로 좁혀줘"]
-#   S02 감시대상을 고저폭 TOP30(hr_rank 가 실린 종목)으로 제한한다.
+MONEY_FLOW_KEYS = (
+    "mf_inst", "mf_frgn", "mf_prog", "mf_che", "mf_chg",
+)
+S02_CANDIDATE_LIMIT = 50
+# ★[2026-08-27 사용자 승인] S02 감시대상은 고저폭·돈흐름 선별판 합집합 최대 50개.
+#   두 판에 모두 든 종목을 먼저 두고, 나머지는 고저폭 순위·돈흐름 순으로 채운다.
 #   근거 — 일봉 1년 코스닥 전수(12만건·왕복비용 0.38% 차감)로 S02 진입을 근사
 #   (당일 저가 +1% 매수 → 당일 종가 매도) 했을 때:
 #       고저폭 조건 밖   +1.251% / 승률 58.8%  (11.4만건)
@@ -141,11 +302,143 @@ RANGE_KEYS = (
 #       2.4배 크고, 다음날에도 10%↑ 로 움직일 확률이 12.5% → 72.0% 라서다.
 #   ⚠️같은 자료에서 "시가 매수 → 당일 종가"(S01 급상승 근사)는 고저폭을 붙이면
 #     오히려 나빠진다(-0.75% → -1.47%). 저점에서 사는 전략에만 유효한 제한이다.
-#   안전장치: 고저폭 목록이 통째로 비면(08:40 생성 실패 등) 제한을 걸지 않는다
-#     — 안 그러면 전 종목이 차단된다(fail-open).
+#   안전장치: 두 후보 소스가 모두 비면 전건 차단한다(fail-closed).
+#   기존 환경변수 이름은 호환을 위해 유지한다.
 #   롤백: setx S02_HIGH_RANGE_ONLY NO + 신호기 재기동
 #         또는 backup\strategy_02_low_buy_signal_v1_20260731_hronly.py 복원
 HIGH_RANGE_ONLY = os.environ.get("S02_HIGH_RANGE_ONLY", "YES").strip().upper() == "YES"
+
+
+def _select_candidate_codes(
+    watch: Mapping[str, Any],
+    candidate_meta: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    """고저폭·돈흐름 선별판 합집합을 최대 50개로 제한한다."""
+    source_tags = watch.get("source_tags") or {}
+    high_range_codes = {
+        code for code, meta in candidate_meta.items()
+        if meta.get("hr_rank") is not None
+    }
+    money_flow_codes = {
+        str(code).zfill(6)
+        for code, tags in source_tags.items()
+        if "moneyflow_selector" in set(tags or [])
+    }
+
+    def money_score(code: str) -> float:
+        meta = candidate_meta.get(code) or {}
+        return sum(max(0.0, _number(meta.get(key))) for key in (
+            "mf_inst", "mf_frgn", "mf_prog",
+        ))
+
+    def high_rank(code: str) -> int:
+        rank = _number((candidate_meta.get(code) or {}).get("hr_rank"), 9999)
+        return int(rank) if rank > 0 else 9999
+
+    overlap = high_range_codes & money_flow_codes
+    high_only = high_range_codes - overlap
+    money_only = money_flow_codes - overlap
+    ordered = (
+        sorted(overlap, key=lambda code: (high_rank(code), -money_score(code), code))
+        + sorted(high_only, key=lambda code: (high_rank(code), code))
+        + sorted(money_only, key=lambda code: (-money_score(code), code))
+    )
+    return ordered[:S02_CANDIDATE_LIMIT]
+
+# ★[ADAPTIVE-BOTTOM 2026-08-20 사용자 상시 승인]
+# FAST: 강세장 + 직접반등 + 시장대비 약세비율<=0.25 + 저점대비<=1.5%.
+# RETEST: 계단식 재확인 + 저점대비<=2.0%; 약장에서는 관찰>=300초.
+# 차단 신호는 emission_count/anchor 를 쓰지 않고 WAIT 로 남아 다음 저점을 계속 본다.
+ADAPTIVE_BOTTOM_ENABLED = (
+    # [UNVERIFIED 2026-08-20] 생산재생 4개 중 1개만 재현되어 기본 OFF 유지.
+    # 정확한 저장입력으로 PROD_REPLAY PASS 후 승인된 실전 런처에서만 YES로 켠다.
+    os.environ.get("S02_ADAPTIVE_BOTTOM_ENABLED", "NO").strip().upper()
+    in {"YES", "Y", "1", "TRUE", "ON"}
+)
+ADAPTIVE_FAST_MAX_WEAKNESS_RATIO = 0.25
+ADAPTIVE_FAST_MAX_ENTRY_GAP_PCT = 1.5
+ADAPTIVE_RETEST_MAX_ENTRY_GAP_PCT = 2.0
+ADAPTIVE_WEAK_MIN_OBSERVE_SEC = 300.0
+
+# ★[DAY-LOW-CAP 2026-08-25 친구님 승인 "고점매수만 차단"]
+#   당일 저점 대비 매수 상한(%). 저점매수 조건은 건드리지 않고 고점 추격만 막는다.
+#   롤백: setx S02_DAY_LOW_MAX_GAP_PCT 999 (사실상 해제) 후 신호기 재시작
+try:
+    DAY_LOW_MAX_GAP_PCT = float(
+        os.environ.get("S02_DAY_LOW_MAX_GAP_PCT", "2.0"))
+except (TypeError, ValueError):
+    DAY_LOW_MAX_GAP_PCT = 2.0
+
+
+def _adaptive_regime_group(band: str) -> str:
+    normalized = str(band or "").strip().upper()
+    if normalized in {"BULL", "LEAN_BULL", "LEAN_BULL_US"}:
+        return "STRONG"
+    if normalized in {"BEAR", "LEAN_BEAR", "LEAN_BEAR_US"}:
+        return "WEAK"
+    if normalized in {"FLAT", "GRAY"}:
+        return "NORMAL"
+    return "UNKNOWN"
+
+
+def adaptive_bottom_decision(
+    *,
+    algorithm: str,
+    entry_gap_pct: float,
+    anchor_low: float,
+    open_price: float,
+    avg_5d_range_pct: float,
+    regime_band: str,
+    u201_pct: float | None,
+    observe_sec: float,
+) -> Dict[str, Any]:
+    group = _adaptive_regime_group(regime_band)
+    low_from_open = (
+        (anchor_low / open_price - 1.0) * 100.0
+        if anchor_low > 0 and open_price > 0 else None
+    )
+    relative_low = (
+        low_from_open - u201_pct
+        if low_from_open is not None and u201_pct is not None else None
+    )
+    weakness = (
+        abs(min(0.0, relative_low)) / avg_5d_range_pct
+        if relative_low is not None and avg_5d_range_pct > 0 else None
+    )
+    direct = "DIRECT_REBOUND" in str(algorithm or "")
+    staircase = "STAIRCASE_RETEST" in str(algorithm or "")
+    fast = bool(
+        group == "STRONG" and direct and weakness is not None
+        and weakness <= ADAPTIVE_FAST_MAX_WEAKNESS_RATIO
+        and entry_gap_pct <= ADAPTIVE_FAST_MAX_ENTRY_GAP_PCT
+    )
+    retest = bool(
+        group != "UNKNOWN" and staircase
+        and entry_gap_pct <= ADAPTIVE_RETEST_MAX_ENTRY_GAP_PCT
+        and (group != "WEAK" or observe_sec >= ADAPTIVE_WEAK_MIN_OBSERVE_SEC)
+    )
+    lane = "FAST" if fast else ("RETEST" if retest else "BLOCK")
+    reason = (
+        f"ADAPTIVE_{lane}" if lane != "BLOCK"
+        else "ADAPTIVE_REGIME_MISSING" if group == "UNKNOWN"
+        else "ADAPTIVE_BOTTOM_BLOCK"
+    )
+    return {
+        "adaptive_pass": lane != "BLOCK",
+        "adaptive_lane": lane,
+        "adaptive_reason": reason,
+        "adaptive_regime": str(regime_band or "UNKNOWN"),
+        "adaptive_regime_group": group,
+        "adaptive_u201_pct": u201_pct,
+        "adaptive_low_from_open_pct": (
+            round(low_from_open, 4) if low_from_open is not None else None
+        ),
+        "adaptive_relative_weakness_ratio": (
+            round(weakness, 4) if weakness is not None else None
+        ),
+        "adaptive_avg_5d_range_pct": avg_5d_range_pct,
+        "adaptive_observe_sec": observe_sec,
+    }
 
 
 @dataclass(frozen=True)
@@ -162,6 +455,17 @@ class SignalConfig:
         "S02_OUTPUT", r"C:\stock_bot\data\strategy_02_low_buy_signal_v1.json"))
     event_dir: Path = Path(os.environ.get(
         "S02_EVENT_DIR", r"C:\stock_bot\data\strategy_02_signal_v1"))
+    regime_path: Path = Path(os.environ.get(
+        "S02_REGIME_PATH", r"C:\stock_bot\data\BACKTEST\regime_std_shadow.csv"))
+    adaptive_bottom_enabled: bool = ADAPTIVE_BOTTOM_ENABLED
+    exact_replay_dir: Path = Path(os.environ.get(
+        "S02_EXACT_REPLAY_DIR", r"C:\stock_bot\data\s02_exact_replay"))
+    exact_replay_journal_enabled: bool = (
+        os.environ.get("S02_EXACT_REPLAY_JOURNAL", "NO").strip().upper()
+        in {"YES", "Y", "1", "TRUE", "ON"}
+    )
+    exact_replay_max_bytes: int = int(os.environ.get(
+        "S02_EXACT_REPLAY_MAX_BYTES", str(200 * 1024 * 1024)))
     loop_sec: float = float(os.environ.get("S02_LOOP_SEC", "1"))
     max_snapshot_age_sec: float = float(os.environ.get("S02_SNAPSHOT_MAX_AGE", "4"))
     max_signals_per_code: int = int(os.environ.get("S02_MAX_CYCLES_PER_CODE", "2"))
@@ -213,8 +517,16 @@ class CodeState:
     six_pullback_low: float = 0.0
     six_micro_confirm_hits: int = 0
     six_micro_last_confirm_ts: datetime | None = None
+    # ★[DIRECT-REBOUND 2026-08-13] 공통 직접반등 레인의 연속 확인 상태.
+    direct_confirm_hits: int = 0
+    direct_last_confirm_ts: datetime | None = None
+    # ★[수정1] ready 전환 시 1회만 기록하기 위한 깃발(로그 폭증 방지).
+    direct_ready_logged: bool = False
     open_price: float = 0.0
     session_high: float = 0.0
+    # ★[DAY-LOW 2026-08-05] 정규장 진짜 저점(리셋 없음). 기록 전용 — 판정 미사용.
+    session_low: float = 0.0
+    session_low_ts: datetime | None = None
     six_reference_price: float = 0.0
     six_reference_mode: str = ""
     handoff_to_s03_s06: bool = False
@@ -227,6 +539,12 @@ class CodeState:
     surge_drop_steps: int = 0
     surge_confirm_hits: int = 0
     surge_last_confirm_ts: datetime | None = None
+    flow_book_shadow_emission_count: int = 0
+    flow_book_shadow_emitted_anchors: set[str] = field(default_factory=set)
+    flow_book_shadow_pending_anchor_id: str = ""
+    flow_book_shadow_pending_since: datetime | None = None
+    flow_book_shadow_pending_price: float = 0.0
+    flow_book_shadow_pending_hits: int = 0
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -239,6 +557,40 @@ def _read_json(path: Path) -> Dict[str, Any]:
         return json.loads(second.decode("utf-8-sig"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
+
+
+_REGIME_CACHE: Dict[str, Any] = {"mtime_ns": None, "rows": []}
+
+
+def _market_regime_at(path: Path, now: datetime) -> tuple[str, float | None]:
+    """장세 그림자의 당일 최신 확정행을 읽는다. 자료가 없으면 UNKNOWN으로 차단한다."""
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+        if _REGIME_CACHE["mtime_ns"] != mtime_ns:
+            rows = []
+            with path.open(encoding="utf-8-sig", newline="") as handle:
+                for raw in csv.DictReader(handle):
+                    try:
+                        ts = datetime.fromisoformat(str(raw.get("ts") or ""))
+                    except ValueError:
+                        continue
+                    rows.append((
+                        ts,
+                        str(raw.get("band_us") or raw.get("band") or "UNKNOWN"),
+                        _number(raw.get("u201_chg"), None),
+                    ))
+            _REGIME_CACHE["mtime_ns"] = mtime_ns
+            _REGIME_CACHE["rows"] = rows
+    except OSError:
+        return "UNKNOWN", None
+    prior = [
+        row for row in _REGIME_CACHE["rows"]
+        if row[0].date() == now.date() and row[0] <= now
+    ]
+    if not prior:
+        return "UNKNOWN", None
+    _, band, u201 = prior[-1]
+    return band, u201
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -254,6 +606,11 @@ def _required_drop_pct(ts: datetime) -> float:
         if ts.time() < MORNING_OPEN_REFERENCE_END
         else INTRADAY_DIP_DROP_PCT
     )
+
+
+def _effective_required_drop_pct(ts: datetime, adaptive_enabled: bool) -> float:
+    """Adaptive mode tracks every anchor low; legacy mode keeps fixed depth."""
+    return 0.0 if adaptive_enabled else _required_drop_pct(ts)
 
 
 def _parse_dt(value: Any, now: datetime) -> datetime | None:
@@ -295,26 +652,22 @@ def _afternoon_buy_speed_lead(points: list[MarketPoint]) -> bool:
     return buy10 > sell10
 
 
-def _s01_taken_codes(today: str) -> set:
-    """★[2026-07-31 친구님 지시 "1번 3번이 2번이 안 겹쳐야 돼"]
-    오늘 1번(S01)·3번(S03)이 이미 신호를 낸 종목 집합.
-
-    진입창을 09:00 로 당기면서 1번·3번과 시간이 겹치게
-    됐다. 같은 종목을 여러 전략이 동시에 노리면 공용 6슬롯을 나눠 먹고, 계좌 중복매수
-    차단에 걸려 뒤늦은 쪽이 헛수고를 한다.
-    파일이 없거나 날짜가 다르면 빈 집합 = 제외하지 않는다(fail-open).
-    """
-    taken = set()
-    for path in (r"C:\stock_bot\data\strategy_01_open_surge_signal_v2.json",
-                 r"C:\stock_bot\data\strategy_03_골짜기_급반등_signal_v1.json"):
-        payload = _read_json(Path(path))
-        if str(payload.get("date") or "").replace("-", "")[:8] != today:
-            continue
-        for row in (payload.get("signals") or []):
-            code = str(row.get("code") or "").zfill(6)
-            if len(code) == 6:
-                taken.add(code)
-    return taken
+def _s02_book_recovery_ready(points: list[MarketPoint]) -> bool:
+    """Delay only severe sell-book signals until two consecutive improvements."""
+    values = []
+    for point in points[-3:]:
+        total = point.bid_tot + point.ask_tot
+        if total <= 0:
+            return False
+        values.append((point.bid_tot - point.ask_tot) / total)
+    if not values:
+        return False
+    current = values[-1]
+    if current >= S02_BOOK_RECOVERY_LEVEL:
+        return True
+    if current > S02_SEVERE_BOOK_IMBALANCE:
+        return True
+    return len(values) == 3 and values[0] < values[1] < values[2]
 
 
 def _name_map(payload: Mapping[str, Any]) -> Dict[str, str]:
@@ -353,30 +706,40 @@ def load_live_points(
     if str(watch.get("for_date") or "").replace("-", "")[:8] != today:
         return [], "WATCH_DATE_MISMATCH", 0, {}
     codes = {str(code).zfill(6) for code in (watch.get("codes") or [])}
+    if not codes:
+        return [], "WATCH_EMPTY", 0, {}
     range_meta: Dict[str, Dict[str, Any]] = {}
     for meta_code, meta in (watch.get("all_meta") or {}).items():
         if not isinstance(meta, Mapping):
             continue
         picked = {
-            key: meta[key] for key in RANGE_KEYS if meta.get(key) is not None
+            key: meta[key]
+            for key in RANGE_KEYS + MONEY_FLOW_KEYS
+            if meta.get(key) is not None
         }
         if picked:
+            prev_close = _number(meta.get("prev_close"))
+            if prev_close > 0:
+                picked["hr_prev_close"] = prev_close
             range_meta[str(meta_code).zfill(6)] = picked
+    if HIGH_RANGE_ONLY:
+        selected_codes = _select_candidate_codes(watch, range_meta)
+        if not selected_codes:
+            return [], "CANDIDATE_META_MISSING", len(codes), {}
+        codes = set(selected_codes)
     snapshot = _read_json(config.snapshot_path)
     names = _name_map(_read_json(config.names_path))
-    s01_codes = _s01_taken_codes(today)          # ★1번이 오늘 잡은 종목(중복 방지)
     output: list[tuple[str, str, MarketPoint]] = []
     for code, raw in (snapshot.get("codes") or {}).items():
         code = str(code).zfill(6)
         if code not in codes or not isinstance(raw, Mapping):
             continue
-        # ★[2026-07-31] 고저폭 TOP30 제한 — range_meta 는 hr_* 가 실린 종목만 담고 있다.
-        #   range_meta 가 비면(고저폭 목록 실패) 제한하지 않는다(fail-open·위 주석 참조).
-        if HIGH_RANGE_ONLY and range_meta and code not in range_meta:
+        # ★[S02-DATA-FAIL-CLOSED 2026-08-27 사용자 승인]
+        # 고저폭·돈흐름 선별판 합집합에서 우선순위 상위 50개만 관찰한다.
+        if HIGH_RANGE_ONLY and code not in codes:
             continue
-        # ★[2026-07-31] 1번·3번이 오늘 이미 잡은 종목은 제외(_s01_taken_codes 주석 참조).
-        if code in s01_codes:
-            continue
+        # S01/S03의 신호만으로 S02 관찰을 중단하지 않는다. 실제 중복 주문은
+        # 엔진의 계좌 보유·미체결·공용 슬롯 검사에서 주문 직전에 차단한다.
         ts = _parse_dt(raw.get("ts"), now)
         ob_ts = _parse_dt(raw.get("ob_ts"), now)
         if ts is None or ob_ts is None:
@@ -421,6 +784,9 @@ def load_live_points(
             best_bid_px=best_bid,
             best_ask_qty=best_ask_qty,
             best_bid_qty=best_bid_qty,
+            # ★[DAY-LOW 2026-08-05] 거래소 당일 저가/고가. 없으면 0(=자체 추적으로 폴백).
+            broker_day_low=abs(_number(raw.get("lo"))),
+            broker_day_high=abs(_number(raw.get("hi"))),
         )))
     return output, ("LIVE" if output else "DATA_WAIT"), len(codes), range_meta
 
@@ -437,6 +803,7 @@ class LowBuySignalMonitor:
         min_best_bid_share: float = 0.50,
         max_confirm_chase_bps: float = 25.0,
         max_entry_gap_pct: float = 1.50,
+        adaptive_bottom_enabled: bool = False,
     ) -> None:
         if max_signals_per_code != 2:
             raise ValueError("Strategy 02 requires exactly two opportunities per code")
@@ -448,9 +815,13 @@ class LowBuySignalMonitor:
         self.min_best_bid_share = float(min_best_bid_share)
         self.max_confirm_chase_bps = float(max_confirm_chase_bps)
         self.max_entry_gap_pct = float(max_entry_gap_pct)
+        self.adaptive_bottom_enabled = bool(adaptive_bottom_enabled)
         self.states: Dict[str, CodeState] = {}
         self.latest: Dict[str, Dict[str, Any]] = {}
         self.signals: list[Dict[str, Any]] = []
+        self.flow_book_shadow_latest: Dict[str, Dict[str, Any]] = {}
+        self.flow_book_shadow_signals: list[Dict[str, Any]] = []
+        self._pending_flow_book_shadow_signals: list[Dict[str, Any]] = []
 
     @staticmethod
     def _clear_pending(state: CodeState) -> None:
@@ -504,6 +875,50 @@ class LowBuySignalMonitor:
             if high_val > 0:
                 state.last_signal_high = high_val
             self.signals.append(row)
+        for raw in payload.get("flow_book_shadow_signals") or []:
+            code = str(raw.get("code") or "").zfill(6)
+            if not code:
+                continue
+            row = dict(raw)
+            state = self.states.setdefault(code, CodeState())
+            state.flow_book_shadow_emission_count = max(
+                state.flow_book_shadow_emission_count,
+                int(row.get("shadow_signal_sequence") or 0),
+            )
+            anchor = str(row.get("anchor_id") or "")
+            if anchor:
+                state.flow_book_shadow_emitted_anchors.add(anchor)
+            self.flow_book_shadow_signals.append(row)
+
+    @staticmethod
+    def _six_flow_flip(state: CodeState, point: MarketPoint) -> str:
+        """저점 전후로 매수·매도 '대금 속도'가 역전됐는가.
+
+        ★[2026-08-06] 종전엔 이 계산이 판정 한복판에 인라인으로 있었다. 아침 급행이
+          같은 판정을 앞당겨 써야 해서 한 군데로 뽑았다 — 두 벌로 갈라지면 안 된다.
+        반환: "O"(역전) · "X"(역전 아님) · ""(잴 자료가 없음)
+        ⚠️절대 체결강도는 쓰지 않는다. 저점 전 매도 우위 -> 저점 후 매수 우위만 본다.
+        """
+        if state.six_low_ts is None:
+            return ""
+        flow_elapsed = max(1.0, (point.ts - state.six_low_ts).total_seconds())
+        post_buy = max(0.0, point.buy_money_cum - state.six_low_buy_money) / flow_elapsed
+        post_sell = max(0.0, point.sell_money_cum - state.six_low_sell_money) / flow_elapsed
+        if not (
+            state.six_pre_buy_rate >= 0
+            and state.six_pre_sell_rate >= 0
+            and (state.six_pre_buy_rate + state.six_pre_sell_rate) > 0
+            and (post_buy + post_sell) > 0
+        ):
+            return ""
+        return "O" if (
+            state.six_pre_sell_rate > state.six_pre_buy_rate
+            and post_buy > post_sell
+        ) else "X"
+
+    @classmethod
+    def _six_flow_flipped(cls, state: CodeState, point: MarketPoint) -> bool:
+        return cls._six_flow_flip(state, point) == "O"
 
     @staticmethod
     def _clear_six_retest(state: CodeState) -> None:
@@ -891,6 +1306,16 @@ class LowBuySignalMonitor:
         if not points:
             return None
         point = points[-1]
+        # 적응형 저점이 켜진 실전 경로에서는 종전의 아침 -3%/장중 -5%
+        # 낙폭을 선행 하드게이트로 쓰지 않는다. 모든 새 anchor 저점을 추적한 뒤
+        # FAST/RETEST 장세·수급·재확인 관문이 최종 진입을 결정한다.
+        # 적응형을 끄면 기존 고정 낙폭 동작으로 즉시 복귀한다.
+        # ★[DROP-GATE 복원 2026-08-25 친구님 "낙폭 문턴 복원 승인"]
+        #   위 설명과 달리, 적응형이 켜져도 낙폭 게이트를 유지한다.
+        #   8/25 356860: 장중고점 대비 -2.36% 뿐인데 FAST/RETEST 관문을 통과해
+        #   당일 저가 +9.37% 자리에서 매수됐다. 대체 관문이 제 역할을 못했다.
+        #   저점 추적(six_low 갱신)은 그대로 돌아간다 — 추격 시작만 막는다.
+        #   롤백: 이 두 줄을 _effective_required_drop_pct(point.ts, self.adaptive_bottom_enabled) 로 되돌림
         required_drop_pct = _required_drop_pct(point.ts)
         if point.price <= 0:
             return None
@@ -933,6 +1358,9 @@ class LowBuySignalMonitor:
 
         if point.price < state.six_low:
             state.six_reset_steps += 1
+            # ★[DIRECT-REBOUND 2026-08-13] 신저점 갱신 = 직접반등 확인 초기화.
+            state.direct_confirm_hits = 0
+            state.direct_last_confirm_ts = None
             state.six_low = point.price
             state.six_low_ts = point.ts
             state.six_low_buy_money = point.buy_money_cum
@@ -989,6 +1417,140 @@ class LowBuySignalMonitor:
             self._clear_six_retest(state)
             return None
 
+        # ★[DIRECT-REBOUND 2026-08-13 친구님 지시 "눌림은 선택 경로"] 공통 직접반등 레인.
+        #   판정 정책은 low_rebound_common_v1 한 곳(S06 동일). 수급 원시값은 S02 기존
+        #   함수(흐름역전·가속·상대전환·체결강도)를 그대로 입력으로 넘긴다 — 복사 금지.
+        #   기본 OFF(LOW_REBOUND_DIRECT 미설정): 판정만 하고 주문 신호는 내지 않는다.
+        relative_direct = self._relative_flow_turn(
+            points, SIX_FLOW_ACCEL_WINDOW_SEC, SIX_FLOW_ACCEL_WINDOW_SEC)
+        accel_direct = self._six_flow_acceleration(points)
+        direct_age_sec = (point.ts - state.six_low_ts).total_seconds()
+        direct_age_route = _direct_rebound_age_route(direct_age_sec)
+        direct = judge_direct_rebound(
+            confirm_hits=state.direct_confirm_hits,
+            last_confirm_ts=state.direct_last_confirm_ts,
+            cfg=DirectReboundConfig(
+                first_rebound_pct=SIX_FIRST_REBOUND_PCT,
+                chase_cap_pct=SIX_CHASE_CAP_PCT,
+                confirm_ticks=SURGE_CONFIRM_TICKS,
+                confirm_max_gap_sec=SURGE_CONFIRM_MAX_GAP_SEC,
+                min_no_new_low_sec=S02_DIRECT_MIN_NO_NEW_LOW_SEC,
+            ),
+            ts=point.ts,
+            price=point.price,
+            low_price=state.six_low,
+            no_new_low_sec=direct_age_sec,
+            drop_ok=True,  # OBSERVE 진입 자체가 전략별 낙폭 충족 이후다
+            flow_flip=(self._six_flow_flip(state, point) == "O"),
+            flow_accel=(
+                (accel_direct[2] > accel_direct[1])
+                if accel_direct and accel_direct[2] > 0 else None
+            ),
+            money_buy_turn=(
+                bool(relative_direct["money_buy_turn"])
+                if relative_direct is not None else None
+            ),
+            volume_buy_turn=(
+                bool(relative_direct["volume_buy_turn"])
+                if relative_direct is not None else None
+            ),
+            sell_restrength=(
+                (accel_direct[4] > accel_direct[3])
+                if accel_direct and accel_direct[2] > 0 else None
+            ),
+            che_rising=(
+                (point.che_str > state.six_low_che_str)
+                if state.six_low_che_str > 0 else None
+            ),
+        )
+        if direct_age_route == "RETEST":
+            direct["ready"] = False
+            direct["allow"] = False
+            direct["confirm_ticks"] = 0
+            direct["last_confirm_ts"] = None
+            direct["fail"] = list(direct["fail"]) + [
+                "LOW_TOO_STALE_FOR_DIRECT"
+            ]
+        state.direct_confirm_hits = direct["confirm_ticks"]
+        state.direct_last_confirm_ts = direct["last_confirm_ts"]
+        # ★[수정1 2026-08-13] ready 전건 감사 — 게이트 OFF 여도 기록(주문만 금지).
+        #   기존 통로 = 이 프로세스 stdout(예약 태스크가 sched 로그로 저장).
+        #   ready 전환 시 1회만 남겨 로그 폭증을 막는다.
+        if direct["ready"] and not state.direct_ready_logged:
+            _audit = {k: direct[k] for k in (
+                "lane", "ready", "armed", "allow", "fail", "low_price",
+                "rebound_pct", "no_new_low_sec", "flow_flip", "flow_accel",
+                "money_buy_turn", "volume_buy_turn", "che_rising",
+                "confirm_ticks", "chase_cap_pass")}
+            _audit["sell_restrength"] = (
+                (accel_direct[4] > accel_direct[3])
+                if accel_direct and accel_direct[2] > 0 else None)
+            print(
+                f"[{point.ts.strftime('%Y-%m-%d %H:%M:%S')}] S02_DIRECT_READY "
+                f"code={getattr(self, '_detect_code', '')} {_audit}",
+                flush=True,
+            )
+        state.direct_ready_logged = bool(direct["ready"])
+        if direct["allow"]:
+            drop_pct = (
+                (state.six_episode_high - state.six_low)
+                / state.six_episode_high * 100.0
+            )
+            self._last_dip_meta = {
+                "entry_lane": direct["lane"],
+                "dip_low_reset_steps": state.six_reset_steps,
+                "dip_drop_pct": round(drop_pct, 3),
+                "required_drop_pct": required_drop_pct,
+                "dip_episode_high": round(state.six_episode_high, 4),
+                "low_price": direct["low_price"],
+                "rebound_pct": direct["rebound_pct"],
+                "no_new_low_sec": direct["no_new_low_sec"],
+                "dip_flow_flip": "O" if direct["flow_flip"] else "X",
+                "flow_accel": "O" if direct["flow_accel"] else "X",
+                "money_buy_turn": direct["money_buy_turn"],
+                "volume_buy_turn": direct["volume_buy_turn"],
+                "che_rising": direct["che_rising"],
+                "low_confirm_ticks": direct["confirm_ticks"],
+                "chase_cap_pass": direct["chase_cap_pass"],
+            }
+            return BottomSignal(
+                algorithm="S02_S06_DIRECT_REBOUND_V1",
+                signal_ts=point.ts,
+                signal_price=point.price,
+                anchor_low_ts=state.six_low_ts,
+                anchor_low_price=state.six_low,
+                wave_count=state.six_reset_steps + 1,
+                reason=(
+                    f"DIRECT_REBOUND drop={((state.six_episode_high - state.six_low) / state.six_episode_high * 100.0):.2f}% "
+                    f"rebound={direct['rebound_pct']:.2f}%"
+                ),
+            )
+
+        # ★[MORNING-FASTPATH 2026-08-06] 아침 창에서 '역전 + 1.0~1.5%' 면 더 안 기다린다.
+        #   여기서 켜는 것은 '시간을 버는 조건'(60초·눌림·2차반등)뿐이다.
+        #   아래 흐름 검증(flow_flip·가속·상대전환)은 그대로 다 통과해야 신호가 나간다.
+        fastpath = False
+        if (
+            MORNING_FASTPATH
+            and point.ts.time() < MORNING_FASTPATH_END
+            and state.six_low > 0
+        ):
+            fast_rebound = (point.price / state.six_low - 1.0) * 100.0
+            if (
+                SIX_FIRST_REBOUND_PCT
+                <= fast_rebound
+                <= MORNING_FASTPATH_MAX_REBOUND_PCT
+                and self._six_flow_flipped(state, point)
+                # ★[수정2 2026-08-13] 급행도 공통 판정(allow)이 최종 권위 —
+                #   공통이 WAIT/BLOCK 이면 급행 경로도 주문으로 가지 않는다.
+                and direct["allow"]
+            ):
+                fastpath = True
+                # 뒤의 눌림·2차반등 검사가 통과하도록 저점 자체를 눌림바닥으로 삼는다.
+                # (값을 지어내는 것이 아니라 '눌림을 안 기다린다'를 이렇게 표현한다)
+                state.six_pullback_seen = True
+                state.six_pullback_low = state.six_low
+
         if not state.six_pullback_seen:
             state.six_first_rebound_peak = max(
                 state.six_first_rebound_peak, point.price)
@@ -1008,7 +1570,7 @@ class LowBuySignalMonitor:
                 return None
             state.six_pullback_low = min(state.six_pullback_low, point.price)
 
-        if elapsed < SIX_OBSERVE_SEC:
+        if elapsed < SIX_OBSERVE_SEC and not fastpath:
             return None
         if not state.six_pullback_seen or state.six_pullback_low <= 0:
             return None
@@ -1026,21 +1588,16 @@ class LowBuySignalMonitor:
         flow_elapsed = max(1.0, (point.ts - state.six_low_ts).total_seconds())
         delta_buy = point.buy_money_cum - state.six_low_buy_money
         delta_sell = point.sell_money_cum - state.six_low_sell_money
-        post_buy = max(0.0, delta_buy) / flow_elapsed
-        post_sell = max(0.0, delta_sell) / flow_elapsed
-        flow_flip = ""
-        if (
-            state.six_pre_buy_rate >= 0
-            and state.six_pre_sell_rate >= 0
-            and (state.six_pre_buy_rate + state.six_pre_sell_rate) > 0
-            and (post_buy + post_sell) > 0
-        ):
-            flow_flip = "O" if (
-                state.six_pre_sell_rate > state.six_pre_buy_rate
-                and post_buy > post_sell
-            ) else "X"
+        # ★[2026-08-06] 역전 판정은 _six_flow_flip 한 곳에서만 한다(아침 급행과 공유).
+        flow_flip = self._six_flow_flip(state, point)
         acceleration = self._six_flow_acceleration(points)
-        if False:  # [SHADOW-B 2026-08-05] 가격만 판정 - 수급역전/가속 관문 통과
+        if False:  # [SHADOW-B] 가격만 판정 - 수급역전/가속 관문 통과
+            state.six_micro_confirm_hits = 0
+            state.six_micro_last_confirm_ts = None
+            return None
+        # ★[저점리셋 관문 2026-08-07] 저점이 몇 번 깨졌는지를 본다.
+        #   한두 번 깨진 저점은 아직 바닥이 아니다(8/7 재생: 리셋 3회 이하 4건 전원 이익 0).
+        if state.six_reset_steps < MIN_LOW_RESET_STEPS:
             state.six_micro_confirm_hits = 0
             state.six_micro_last_confirm_ts = None
             return None
@@ -1050,8 +1607,8 @@ class LowBuySignalMonitor:
         relative = self._relative_flow_turn(
             points, SIX_FLOW_ACCEL_WINDOW_SEC, SIX_FLOW_ACCEL_WINDOW_SEC)
         if relative is None:
-            # [SHADOW-B] 가격만 판정 — 상대속도 자료가 없어도 막지 않는다.
-            #   단, 아래에서 relative[...] 를 읽으므로 통과값으로 채워야 터지지 않는다.
+            # [SHADOW-B] 가격만 판정 - 상대속도 자료가 없어도 막지 않는다.
+            #   단, 아래에서 relative[...] 를 읽으므로 통과값으로 채운다.
             relative = {"money_buy_turn": True, "volume_buy_turn": True,
                         "che_rising": True}
         if False:  # [SHADOW-B] 원래 관문 자리
@@ -1230,8 +1787,162 @@ class LowBuySignalMonitor:
             anchor_low_price=low,
             wave_count=1,
             reason=(f"DIP_REBOUND drop={(high - low) / high * 100.0:.2f}% "
-                    f"rebound={rebound:.2f}%"),
+                f"rebound={rebound:.2f}%"),
         )
+
+    @staticmethod
+    def _clear_flow_book_shadow_pending(state: CodeState) -> None:
+        state.flow_book_shadow_pending_anchor_id = ""
+        state.flow_book_shadow_pending_since = None
+        state.flow_book_shadow_pending_price = 0.0
+        state.flow_book_shadow_pending_hits = 0
+
+    def drain_flow_book_shadow_signals(self) -> list[Dict[str, Any]]:
+        rows = self._pending_flow_book_shadow_signals
+        self._pending_flow_book_shadow_signals = []
+        return rows
+
+    def _track_flow_book_shadow(
+        self,
+        code: str,
+        name: str,
+        point: MarketPoint,
+        state: CodeState,
+        *,
+        allow_signal: bool,
+    ) -> None:
+        if not FLOW_BOOK_SHADOW_ENABLED or not DIP_MODE:
+            return
+        row: Dict[str, Any] = {
+            "ts": point.ts.isoformat(timespec="seconds"),
+            "code": code,
+            "name": name,
+            "action": "SHADOW_WAIT",
+            "reason": "FLOW_BOOK_RECOVERY_WAIT",
+            "price": point.price,
+            "algorithm": "PRO_FLOW_BOOK_EXHAUSTION",
+            "mode": "SHADOW_ORDER_ZERO",
+            "provenance": "[HYPOTHETICAL]",
+        }
+        signal = detect_flow_book_exhaustion(list(state.points))
+        if signal is None:
+            self._clear_flow_book_shadow_pending(state)
+            self.flow_book_shadow_latest[code] = row
+            return
+        if abs((point.ts - signal.signal_ts).total_seconds()) > 1:
+            self._clear_flow_book_shadow_pending(state)
+            row["reason"] = "STALE_DETECTOR_RESULT"
+            self.flow_book_shadow_latest[code] = row
+            return
+        if point.ts.time() >= AFTERNOON_START:
+            drop_pct = (
+                (state.session_high - point.price) / state.session_high * 100.0
+                if state.session_high > 0 else 0.0
+            )
+            if drop_pct < AFTERNOON_MIN_SIGNAL_DROP_PCT:
+                self._clear_flow_book_shadow_pending(state)
+                row["reason"] = "AFTERNOON_DROP_LT_5PCT"
+                self.flow_book_shadow_latest[code] = row
+                return
+            if not _afternoon_buy_speed_lead(list(state.points)):
+                self._clear_flow_book_shadow_pending(state)
+                row["reason"] = "AFTERNOON_BUY_SPEED_NOT_LEADING"
+                self.flow_book_shadow_latest[code] = row
+                return
+        book_ok, book_reason, spread_bps, edge_bps, best_bid_share = (
+            self._book_telemetry(point)
+        )
+        row.update({
+            "spread_bps": round(spread_bps, 4),
+            "microprice_edge_bps": round(edge_bps, 4),
+            "best_bid_share": round(best_bid_share, 4),
+        })
+        if not book_ok:
+            self._clear_flow_book_shadow_pending(state)
+            row["reason"] = book_reason
+            self.flow_book_shadow_latest[code] = row
+            return
+        if not allow_signal:
+            self._clear_flow_book_shadow_pending(state)
+            row["reason"] = "ENTRY_TIME_CLOSED"
+            self.flow_book_shadow_latest[code] = row
+            return
+        anchor_id = (
+            f"{signal.anchor_low_ts.isoformat(timespec='seconds')}:"
+            f"{signal.anchor_low_price:.4f}"
+        )
+        if anchor_id in state.flow_book_shadow_emitted_anchors:
+            self._clear_flow_book_shadow_pending(state)
+            row["reason"] = "SHADOW_ANCHOR_ALREADY_USED"
+            self.flow_book_shadow_latest[code] = row
+            return
+        if state.flow_book_shadow_emission_count >= self.max_signals_per_code:
+            self._clear_flow_book_shadow_pending(state)
+            row["reason"] = "SHADOW_CYCLE_LIMIT"
+            self.flow_book_shadow_latest[code] = row
+            return
+        if (
+            state.flow_book_shadow_pending_anchor_id != anchor_id
+            or state.flow_book_shadow_pending_since is None
+        ):
+            state.flow_book_shadow_pending_anchor_id = anchor_id
+            state.flow_book_shadow_pending_since = point.ts
+            state.flow_book_shadow_pending_price = point.price
+            state.flow_book_shadow_pending_hits = 1
+            row["reason"] = "SHADOW_ENTRY_CONFIRM_WAIT"
+            self.flow_book_shadow_latest[code] = row
+            return
+        chase_bps = (
+            (point.price / state.flow_book_shadow_pending_price - 1.0) * 10_000.0
+            if state.flow_book_shadow_pending_price > 0 else 0.0
+        )
+        if chase_bps < 0 or chase_bps > self.max_confirm_chase_bps:
+            state.flow_book_shadow_pending_since = point.ts
+            state.flow_book_shadow_pending_price = point.price
+            state.flow_book_shadow_pending_hits = 1
+            row["reason"] = "SHADOW_ENTRY_CONFIRM_PRICE_RESET"
+            self.flow_book_shadow_latest[code] = row
+            return
+        state.flow_book_shadow_pending_hits += 1
+        confirm_age_sec = max(
+            0.0,
+            (point.ts - state.flow_book_shadow_pending_since).total_seconds(),
+        )
+        if (
+            confirm_age_sec < self.confirm_sec
+            or state.flow_book_shadow_pending_hits < self.confirm_points
+        ):
+            row["reason"] = "SHADOW_ENTRY_CONFIRM_WAIT"
+            self.flow_book_shadow_latest[code] = row
+            return
+        entry_gap = (
+            (point.price / signal.anchor_low_price - 1.0) * 100.0
+            if signal.anchor_low_price > 0 else 999.0
+        )
+        if entry_gap > self.max_entry_gap_pct:
+            self._clear_flow_book_shadow_pending(state)
+            row["reason"] = "ENTRY_GAP_TOO_WIDE"
+            self.flow_book_shadow_latest[code] = row
+            return
+        state.flow_book_shadow_emission_count += 1
+        state.flow_book_shadow_emitted_anchors.add(anchor_id)
+        row.update({
+            "action": "SHADOW_READY",
+            "reason": signal.reason,
+            "anchor_low": signal.anchor_low_price,
+            "anchor_low_ts": signal.anchor_low_ts.isoformat(timespec="seconds"),
+            "anchor_id": anchor_id,
+            "entry_gap_pct": round(entry_gap, 4),
+            "confirm_age_sec": round(confirm_age_sec, 3),
+            "confirm_points": state.flow_book_shadow_pending_hits,
+            "wave_count": signal.wave_count,
+            "shadow_signal_sequence": state.flow_book_shadow_emission_count,
+        })
+        emitted = dict(row)
+        self.flow_book_shadow_signals.append(emitted)
+        self._pending_flow_book_shadow_signals.append(emitted)
+        self._clear_flow_book_shadow_pending(state)
+        self.flow_book_shadow_latest[code] = row
 
     def process_point(
         self,
@@ -1242,6 +1953,9 @@ class LowBuySignalMonitor:
         allow_signal: bool = True,
         open_price: float = 0.0,
         session_high: float = 0.0,
+        regime_band: str = "UNKNOWN",
+        u201_pct: float | None = None,
+        avg_5d_range_pct: float = 0.0,
     ) -> tuple[Dict[str, Any], bool]:
         state = self.states.setdefault(code, CodeState())
         if open_price > 0:
@@ -1250,6 +1964,20 @@ class LowBuySignalMonitor:
         if open_price > 0:
             state.open_price = open_price
         state.session_high = max(state.session_high, session_high, point.price)
+        # ★[DAY-LOW 2026-08-05] 정규장 진짜 저점. 절대 리셋하지 않는다(anchor_low 와 다름).
+        #   ①거래소가 주는 당일 저가(브로커 FID 18)를 최우선으로 쓴다 — 장중에
+        #     신호기가 재기동해도 정확하다(자체 추적은 그 시점부터 다시 시작해 버린다).
+        #   ②안 실려 오면 내가 본 틱으로 만든다(폴백).
+        #   기록 전용이라 어떤 판정 분기에도 들어가지 않는다.
+        if point.ts.time() >= REGULAR_SESSION_START and point.price > 0:
+            broker_low = abs(getattr(point, "broker_day_low", 0.0) or 0.0)
+            if broker_low > 0:
+                if state.session_low <= 0 or broker_low < state.session_low:
+                    state.session_low = broker_low
+                    state.session_low_ts = point.ts
+            elif state.session_low <= 0 or point.price < state.session_low:
+                state.session_low = point.price
+                state.session_low_ts = point.ts
         if state.points:
             last = state.points[-1]
             if point.ts <= last.ts:
@@ -1299,6 +2027,14 @@ class LowBuySignalMonitor:
         while state.points and state.points[0].ts.timestamp() < cutoff:
             state.points.popleft()
 
+        self._track_flow_book_shadow(
+            code,
+            name,
+            point,
+            state,
+            allow_signal=allow_signal,
+        )
+
         morning = point.ts.time() < MORNING_OPEN_REFERENCE_END
         reference_price = state.open_price if morning else state.session_high
         if reference_price <= 0:
@@ -1312,6 +2048,8 @@ class LowBuySignalMonitor:
         #   S02_DIP_MODE=NO 로 두면 종전 매도소진 판정으로 즉시 복귀한다.
         if DIP_MODE:
             self._detect_state = state
+            # ★[수정1 2026-08-13] 직접반등 감사 기록용 종목코드 전달.
+            self._detect_code = code
             signal = self._detect_dip_rebound(list(state.points))
             wait_reason = (
                 "S02_MONEY_SURGE_OR_STAIRCASE_WAIT" if SIX_STYLE
@@ -1323,6 +2061,19 @@ class LowBuySignalMonitor:
         if signal is None:
             self._clear_pending(state)
             return self._wait_row(code, name, point, wait_reason), False
+
+        s06_style_drop_pct = (
+            (state.open_price - state.session_low) / state.open_price * 100.0
+            if state.open_price > 0 and state.session_low > 0 else None
+        )
+        if (
+            s06_style_drop_pct is not None
+            and s06_style_drop_pct >= S02_S06_SPLIT_DROP_PCT
+        ):
+            self._clear_pending(state)
+            return self._wait_row(
+                code, name, point, "S02_DROP_GTE_8PCT_HANDOFF_S06"
+            ), False
 
         # ★[AFT5F 2026-08-03] 그림자 확정 후보를 12시 이후 실전 관문에 동일 적용.
         if point.ts.time() >= AFTERNOON_START:
@@ -1347,6 +2098,11 @@ class LowBuySignalMonitor:
         book_ok, book_reason, spread_bps, edge_bps, best_bid_share = (
             self._book_telemetry(point)
         )
+        if SIX_STYLE and not _s02_book_recovery_ready(list(state.points)):
+            self._clear_pending(state)
+            return self._wait_row(
+                code, name, point, "S02_BOOK_RECOVERY_WAIT"
+            ), False
         if not book_ok and not SIX_STYLE:
             # ★[2026-08-01 친구님 "6번에 없는 건 넣지 마·똑같이"] 6번에는 호가 관문이
             #   없다 — SIX_STYLE 에서는 스프레드/호가 값은 기록만 하고 막지 않는다.
@@ -1432,6 +2188,58 @@ class LowBuySignalMonitor:
             self._clear_pending(state)
             return self._wait_row(code, name, point, "ENTRY_GAP_TOO_WIDE"), False
 
+        adaptive_meta: Dict[str, Any] = {}
+        if self.adaptive_bottom_enabled:
+            dip_meta = getattr(self, "_last_dip_meta", None) or {}
+            adaptive_meta = adaptive_bottom_decision(
+                algorithm=signal.algorithm,
+                entry_gap_pct=entry_gap,
+                anchor_low=signal.anchor_low_price,
+                open_price=state.open_price,
+                avg_5d_range_pct=avg_5d_range_pct,
+                regime_band=regime_band,
+                u201_pct=u201_pct,
+                observe_sec=_number(dip_meta.get("observe_sec")),
+            )
+            if not adaptive_meta["adaptive_pass"]:
+                blocked = self._wait_row(
+                    code, name, point, adaptive_meta["adaptive_reason"])
+                blocked.update(adaptive_meta)
+                blocked.update({
+                    "anchor_low": signal.anchor_low_price,
+                    "anchor_low_ts": signal.anchor_low_ts.isoformat(timespec="seconds"),
+                    "entry_gap_pct": round(entry_gap, 4),
+                    "algorithm": signal.algorithm,
+                })
+                return blocked, False
+
+        # ★[DAY-LOW-CAP 2026-08-25] 8/5 주석의 예고가 8/25 356860 에서 현실화 —
+        #   anchor 기준 1.28% 인데 당일 저점 기준으로는 9.37% 였다
+        #   (당일 저가 32,550 → 매수 35,600). 저점매수 조건은 그대로 두고
+        #   고점 추격만 막는다. NaN 무력화 방지를 위해 not (x <= MAX) 형태.
+        #   저점 자료가 없으면 차단(fail-closed).
+        _day_low_gap = (
+            (point.price / state.session_low - 1) * 100
+            if state.session_low > 0 else None
+        )
+        if _day_low_gap is None or not (_day_low_gap <= DAY_LOW_MAX_GAP_PCT):
+            blocked = self._wait_row(
+                code, name, point,
+                "S02_DAY_LOW_MISSING" if _day_low_gap is None
+                else "S02_DAY_LOW_GAP_TOO_FAR")
+            blocked.update({
+                "anchor_low": signal.anchor_low_price,
+                "anchor_low_ts": signal.anchor_low_ts.isoformat(timespec="seconds"),
+                "entry_gap_pct": round(entry_gap, 4),
+                "algorithm": signal.algorithm,
+                "day_low": round(state.session_low, 4),
+                "day_low_gap_pct": (
+                    round(_day_low_gap, 4)
+                    if _day_low_gap is not None else None),
+                "day_low_cap_pct": DAY_LOW_MAX_GAP_PCT,
+            })
+            return blocked, False
+
         state.emission_count += 1
         state.emitted_anchors.add(anchor_id)
         state.last_signal_low = float(signal.anchor_low_price)
@@ -1450,6 +2258,21 @@ class LowBuySignalMonitor:
             "anchor_low_ts": signal.anchor_low_ts.isoformat(timespec="seconds"),
             "anchor_id": anchor_id,
             "entry_gap_pct": round(entry_gap, 4),
+            # ★[DAY-LOW 2026-08-05] 진짜 당일 저점과 그 대비 매수가.
+            #   왜 — 위 anchor_low 는 새 고점이 찍힐 때마다 _reset_six_cycle 이
+            #   현재가로 통째로 갈아치운다(=그 시점 이후의 저점일 뿐 당일 저점이 아님).
+            #   그래서 entry_gap_pct 는 문턱을 조일수록 좋아 보이는데 실제 매수가는
+            #   올라갈 수 있다. 8/5 원익IPS 실증: anchor 기준 1.439%(최우수)인 설정이
+            #   진짜 저점 기준으로는 3.785%(최악)였고 종가대비 -1.013% 였다.
+            #   ⚠️판정에는 쓰지 않는다 — 기록 전용. 문턱은 며칠 쌓아서 고른다.
+            "day_low": round(state.session_low, 4),
+            "day_low_ts": (
+                state.session_low_ts.isoformat(timespec="seconds")
+                if state.session_low_ts else ""
+            ),
+            "day_low_gap_pct": round(
+                (point.price / state.session_low - 1) * 100, 4
+            ) if state.session_low > 0 else 0.0,
             "book_imbalance": round(imbalance, 4),
             "best_ask_price": point.best_ask_px,
             "spread_bps": round(spread_bps, 4),
@@ -1464,6 +2287,7 @@ class LowBuySignalMonitor:
         }
         # ★[2026-07-31] 저점 리셋 기준 매수/매도 배수·계단 수 기록(판정에는 미사용)
         row.update(getattr(self, "_last_dip_meta", None) or {})
+        row.update(adaptive_meta)
         self._clear_pending(state)
         state.points.clear()
         state.points.append(point)
@@ -1550,6 +2374,39 @@ def _append_events(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+EXACT_REPLAY_FIELDS = (
+    "ts", "code", "name", "allow_signal", "open_price", "session_high",
+    "regime_band", "u201_pct", "avg_5d_range_pct", "price", "cum_vol",
+    "che_str", "ask_tot", "bid_tot", "buy_money_cum", "sell_money_cum",
+    "buy_vol_cum", "sell_vol_cum", "best_ask_px", "best_bid_px",
+    "best_ask_qty", "best_bid_qty", "broker_day_low", "broker_day_high",
+)
+
+
+def _append_exact_replay_points(
+    path: Path,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    max_bytes: int,
+) -> None:
+    """생산 process_point 입력만 고정 열로 이어쓴다. 주문·상태에는 관여하지 않는다."""
+    rows = list(rows)
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.stat().st_size >= max_bytes:
+        return
+    needs_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=EXACT_REPLAY_FIELDS,
+            restval="", extrasaction="ignore",
+        )
+        if needs_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
 def run(config: SignalConfig, *, once: bool = False) -> int:
     now = datetime.now(KST).replace(tzinfo=None)
     monitor = LowBuySignalMonitor(
@@ -1561,27 +2418,97 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
         min_best_bid_share=config.min_best_bid_share,
         max_confirm_chase_bps=config.max_confirm_chase_bps,
         max_entry_gap_pct=config.max_entry_gap_pct,
+        adaptive_bottom_enabled=config.adaptive_bottom_enabled,
     )
     monitor.restore(_read_json(config.output_path), now.strftime("%Y%m%d"))
+    relative_strength_shadow = RelativeStrengthReboundShadow()
     while True:
         now = datetime.now(KST).replace(tzinfo=None)
         points, status, watch_count, range_meta = load_live_points(config, now)
+        regime_band, u201_pct = _market_regime_at(config.regime_path, now)
         minute_refs = _minute_references(
             _read_json(config.minute_path), now.strftime("%Y%m%d"))
         new_signals = []
+        new_flow_book_shadow_signals = []
+        exact_replay_rows = []
         for code, name, point in points:
             allow = ENTRY_START <= point.ts.time() < ENTRY_END
             reference = minute_refs.get(code) or {}
+            # ★[공통배관 2026-08-07 친구님 "전 전략이 다 같이 써야 돼"]
+            #   분봉 기준값이 없는 종목만 공통 모듈(실황판→거래소 op/hi)로 메운다.
+            #   분봉 값이 있으면 종전 그대로 — 비교 기준선 보존.
+            anchor = day_anchor(code, today=now.strftime("%Y%m%d"),
+                                snapshot_path=config.snapshot_path)
+            open_price = _number(reference.get("open")) or anchor.open
+            session_high = _number(reference.get("high")) or anchor.high
+            avg_5d_range_pct = _number(
+                (range_meta.get(code) or {}).get("hr_avg5_range")
+            )
+            if config.exact_replay_journal_enabled:
+                exact_replay_rows.append({
+                    "ts": point.ts.isoformat(timespec="microseconds"),
+                    "code": code,
+                    "name": name,
+                    "allow_signal": int(allow),
+                    "open_price": open_price,
+                    "session_high": session_high,
+                    "regime_band": regime_band,
+                    "u201_pct": u201_pct,
+                    "avg_5d_range_pct": avg_5d_range_pct,
+                    "price": point.price,
+                    "cum_vol": point.cum_vol,
+                    "che_str": point.che_str,
+                    "ask_tot": point.ask_tot,
+                    "bid_tot": point.bid_tot,
+                    "buy_money_cum": point.buy_money_cum,
+                    "sell_money_cum": point.sell_money_cum,
+                    "buy_vol_cum": point.buy_vol_cum,
+                    "sell_vol_cum": point.sell_vol_cum,
+                    "best_ask_px": point.best_ask_px,
+                    "best_bid_px": point.best_bid_px,
+                    "best_ask_qty": point.best_ask_qty,
+                    "best_bid_qty": point.best_bid_qty,
+                    "broker_day_low": getattr(point, "broker_day_low", 0.0),
+                    "broker_day_high": getattr(point, "broker_day_high", 0.0),
+                })
             row, fired = monitor.process_point(
                 code, name, point, allow_signal=allow,
-                open_price=_number(reference.get("open")),
-                session_high=_number(reference.get("high")),
+                open_price=open_price,
+                session_high=session_high,
+                regime_band=regime_band,
+                u201_pct=u201_pct,
+                avg_5d_range_pct=avg_5d_range_pct,
             )
             row.update(range_meta.get(code) or {})
+            row.update(relative_strength_shadow.evaluate(
+                code=code,
+                ts=point.ts,
+                price=point.price,
+                previous_close=_number(
+                    (range_meta.get(code) or {}).get("hr_prev_close")
+                ),
+                market_pct=u201_pct,
+                buy_money_cum=point.buy_money_cum,
+                sell_money_cum=point.sell_money_cum,
+                best_ask_px=point.best_ask_px,
+                best_bid_px=point.best_bid_px,
+                best_ask_qty=point.best_ask_qty,
+                best_bid_qty=point.best_bid_qty,
+                high_range_meta=range_meta.get(code),
+            ))
             monitor.latest[code] = row
+            new_flow_book_shadow_signals.extend(
+                monitor.drain_flow_book_shadow_signals()
+            )
             if fired:
                 monitor.signals.append(dict(row))
                 new_signals.append(dict(row))
+        if config.exact_replay_journal_enabled:
+            _append_exact_replay_points(
+                config.exact_replay_dir / f"s02_exact_inputs_{now:%Y%m%d}.csv",
+                exact_replay_rows,
+                max_bytes=config.exact_replay_max_bytes,
+            )
         payload = {
             "schema": SIGNAL_SCHEMA,
             "date": now.strftime("%Y%m%d"),
@@ -1591,12 +2518,21 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
             "watch_count": watch_count,
             "signals": monitor.signals[-1000:],
             "candidates": list(monitor.latest.values()),
+            "flow_book_shadow_signals": monitor.flow_book_shadow_signals[-1000:],
+            "flow_book_shadow_candidates": list(
+                monitor.flow_book_shadow_latest.values()
+            ),
         }
         if not _write_json_atomic(config.output_path, payload):
             print(f"SIGNAL_OUTPUT_STALE_CONTINUING path={config.output_path}", file=sys.stderr, flush=True)
         _append_events(
             config.event_dir / f"strategy_02_signals_{now:%Y%m%d}.csv",
             new_signals,
+        )
+        _append_events(
+            config.event_dir
+            / f"strategy_02_flow_book_shadow_{now:%Y%m%d}.csv",
+            new_flow_book_shadow_signals,
         )
         if once or now.weekday() >= 5 or now.time() >= time(14, 21):
             return 0
@@ -1607,7 +2543,34 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
-    return run(SignalConfig(), once=args.once)
+    lock_path = Path(os.environ.get(
+        "S02_LOCK_PATH", r"C:\stock_bot\data\strategy_02_signal_v1.lock"))
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = lock_path.open("a+")
+    try:
+        if lock_handle.tell() == 0:
+            lock_handle.write("0")
+            lock_handle.flush()
+        lock_handle.seek(0)
+        msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        lock_handle.close()
+        # 2026-08-27: 종전에는 잠금을 못 잡으면 아무 말 없이 종료해, 프로세스는 살아 있는데
+        # 산출물만 0 인 '조용사'로 보였다(8/27 09:41 실전 41분 정지의 진단을 어렵게 만든 원인).
+        # 종료코드 0 은 그대로 두고(태스크 판정 불변) 사유만 남긴다.
+        print(
+            f"S02_SIGNAL_SINGLETON_LOCK_BUSY lock={lock_path} "
+            "- another S02 signal process holds it; this one exits without running.",
+            file=sys.stderr, flush=True)
+        return 0
+    try:
+        return run(SignalConfig(), once=args.once)
+    finally:
+        try:
+            lock_handle.seek(0)
+            msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            lock_handle.close()
 
 
 if __name__ == "__main__":

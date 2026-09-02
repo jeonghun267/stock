@@ -13,5 +13,8 @@ set S02_SIX_FIRST_REBOUND_PCT=1.0
 set S02_OBSERVE_SEC=0
 set S02_OUTPUT=C:\stock_bot\data\shadow_s02_B\signal_B.json
 set S02_EVENT_DIR=C:\stock_bot\data\shadow_s02_B
+REM 2026-08-27: the rebased copy carries the live singleton lock, so give this
+REM shadow its own lock path - otherwise it would race the live 09:00 S02 signal.
+set S02_LOCK_PATH=C:\stock_bot\data\shadow_s02_B\signal_B.lock
 cd /d C:\stock_bot\RUN
 C:\python310\python.exe -B -X utf8 C:\stock_bot\RUN\strategy_02_low_buy_signal_SHADOWB_v1.py >> C:\stock_bot\data\shadow_s02_B\_sched.log 2>&1

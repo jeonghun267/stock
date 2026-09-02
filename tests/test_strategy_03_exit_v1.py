@@ -18,6 +18,7 @@ if str(RUN) not in sys.path:
 
 from strategy_01_rotation_engine_v2 import kst_now
 from strategy_03_rotation_engine_v1 import (
+    S03CrashClaimNotHeld,
     Strategy03Engine,
     Strategy03HoldSellEngine,
     build_config,
@@ -47,6 +48,27 @@ class Strategy03ExitTests(unittest.TestCase):
             entry_lane="OPEN_CRASH",
         )
 
+    def _early_peak_observation(
+        self,
+        seconds: float,
+        *,
+        price: str = "10039",
+        **changes,
+    ) -> HoldSellObservation:
+        observation = HoldSellObservation(
+            observed_at=self.now + timedelta(seconds=seconds),
+            price=Decimal(price),
+            buy_money_per_sec_10s=Decimal("100"),
+            sell_money_per_sec_10s=Decimal("1000"),
+            buy_money_per_sec_30s=Decimal("1000"),
+            sell_money_per_sec_30s=Decimal("500"),
+            buy_volume_per_sec_5s=Decimal("100"),
+            sell_volume_per_sec_5s=Decimal("1000"),
+            sell_volume_per_sec_previous_10s=Decimal("100"),
+            che_str_change_5s=Decimal("-100"),
+        )
+        return replace(observation, **changes)
+
     def test_open_exit_uses_minus_two_stop_not_legacy_minus_one(self) -> None:
         engine = Strategy03HoldSellEngine()
         minus_one = HoldSellObservation(
@@ -62,6 +84,215 @@ class Strategy03ExitTests(unittest.TestCase):
         )
         self.assertTrue(decision.should_sell)
         self.assertIn("-2.00%", decision.reason)
+
+    def test_open_low_break_v2_is_full_sell_and_fail_closed(self) -> None:
+        qualified = HoldSellObservation(
+            observed_at=self.now + timedelta(minutes=5),
+            price=Decimal("9870"),
+            buy_money_per_sec_10s=Decimal("100"),
+            sell_money_per_sec_10s=Decimal("300"),
+            sell_money_per_sec_30s=Decimal("200"),
+        )
+        engine = Strategy03HoldSellEngine()
+        engine.set_s03_entry_reference_low("9900")
+        decision = engine.evaluate(self._state("low-break-v2"), qualified)
+        self.assertEqual(decision.action, HoldSellAction.SELL)
+        self.assertEqual(
+            decision.reason,
+            "S03_REFERENCE_LOW_BREAK_SELL_REACCEL",
+        )
+
+        missing_flow = Strategy03HoldSellEngine()
+        missing_flow.set_s03_entry_reference_low("9900")
+        decision = missing_flow.evaluate(
+            self._state("low-break-missing-flow", code="654321"),
+            replace(qualified, sell_money_per_sec_30s=Decimal("0")),
+        )
+        self.assertFalse(decision.should_sell)
+
+    def test_open_low_break_v2_cannot_bypass_time_stop_or_lane(self) -> None:
+        at_time = Strategy03HoldSellEngine()
+        at_time.set_s03_entry_reference_low("9900")
+        time_decision = at_time.evaluate(
+            self._state("low-break-time"),
+            HoldSellObservation(
+                observed_at=self.now.replace(hour=10, minute=30),
+                price=Decimal("9870"),
+                buy_money_per_sec_10s=Decimal("100"),
+                sell_money_per_sec_10s=Decimal("300"),
+                sell_money_per_sec_30s=Decimal("200"),
+            ),
+        )
+        self.assertEqual(time_decision.reason, "TIME_EXIT_1030")
+
+        hard_stop = Strategy03HoldSellEngine()
+        hard_stop.set_s03_entry_reference_low("9900")
+        stop_decision = hard_stop.evaluate(
+            self._state("low-break-hard-stop", code="654321"),
+            replace(
+                time_decision and HoldSellObservation(
+                    observed_at=self.now + timedelta(minutes=5),
+                    price=Decimal("9700"),
+                    buy_money_per_sec_10s=Decimal("100"),
+                    sell_money_per_sec_10s=Decimal("300"),
+                    sell_money_per_sec_30s=Decimal("200"),
+                )
+            ),
+        )
+        self.assertIn("HARD_STOP", stop_decision.reason)
+
+        intraday = Strategy03HoldSellEngine()
+        intraday.set_s03_entry_reference_low("9900")
+        intraday_state = self._state("low-break-intraday", code="112233")
+        intraday_state.entry_lane = "INTRADAY_CRASH"
+        lane_decision = intraday.evaluate(
+            intraday_state,
+            HoldSellObservation(
+                observed_at=self.now + timedelta(minutes=5),
+                price=Decimal("9870"),
+                buy_money_per_sec_10s=Decimal("100"),
+                sell_money_per_sec_10s=Decimal("300"),
+                sell_money_per_sec_30s=Decimal("200"),
+            ),
+        )
+        self.assertIn("HARD_STOP", lane_decision.reason)
+        self.assertNotIn("S03_REFERENCE_LOW_BREAK", lane_decision.reason)
+
+    def test_s03_early_peak_blocks_low_flow_score(self) -> None:
+        audit = unittest.mock.Mock()
+        engine = Strategy03HoldSellEngine(
+            audit_recorder=audit, early_peak_live_enabled=True)
+        state = self._state("early-peak-flow")
+        state.peak_price = Decimal("10100")
+        decision = engine.evaluate(
+            state,
+            self._early_peak_observation(
+                1,
+                buy_money_per_sec_10s=Decimal("0"),
+                sell_money_per_sec_10s=Decimal("0"),
+                buy_money_per_sec_30s=Decimal("0"),
+                buy_volume_per_sec_5s=Decimal("0"),
+                sell_volume_per_sec_5s=Decimal("0"),
+                sell_volume_per_sec_previous_10s=Decimal("0"),
+                che_str_change_5s=Decimal("0"),
+            ),
+        )
+        self.assertFalse(decision.should_sell)
+        evidence = audit.record.call_args.kwargs["state_after"]
+        self.assertEqual(evidence["s03_early_peak_flow_break_score"], 0)
+        self.assertEqual(
+            evidence["s03_early_peak_block_reason"], "FLOW_SCORE_LOW")
+
+    def test_s03_early_peak_blocks_and_resets_all_rising_holds(self) -> None:
+        audit = unittest.mock.Mock()
+        engine = Strategy03HoldSellEngine(
+            audit_recorder=audit, early_peak_live_enabled=True)
+        state = self._state("early-peak-rising")
+        state.peak_price = Decimal("10100")
+        engine.evaluate(state, self._early_peak_observation(1))
+        self.assertIsNotNone(engine.get_s03_early_peak_watch_since())
+        decision = engine.evaluate(
+            state,
+            self._early_peak_observation(2, daily_ma_permit=True),
+        )
+        self.assertFalse(decision.should_sell)
+        self.assertIsNone(engine.get_s03_early_peak_watch_since())
+        self.assertEqual(
+            audit.record.call_args.kwargs["state_after"][
+                "s03_early_peak_block_reason"
+            ],
+            "RISING_HOLD",
+        )
+
+        buy_dominant = Strategy03HoldSellEngine(
+            early_peak_live_enabled=True)
+        buy_state = self._state("early-peak-buy-dominant", code="654321")
+        buy_state.peak_price = Decimal("10100")
+        buy_decision = buy_dominant.evaluate(
+            buy_state,
+            self._early_peak_observation(
+                1,
+                buy_money_per_sec_10s=Decimal("1000"),
+                sell_money_per_sec_10s=Decimal("100"),
+                buy_money_per_sec_30s=Decimal("2000"),
+            ),
+        )
+        self.assertFalse(buy_decision.should_sell)
+        self.assertIsNone(buy_dominant.get_s03_early_peak_watch_since())
+
+        common_hold = Strategy03HoldSellEngine(
+            early_peak_live_enabled=True)
+        common_state = self._state("early-peak-common-hold", code="112233")
+        common_state.peak_price = Decimal("10100")
+        common_observation = self._early_peak_observation(1)
+        with patch.object(
+            common_hold,
+            "_evaluate_strategy03_once",
+            return_value=common_hold._decision(
+                common_state,
+                common_observation,
+                HoldSellAction.HOLD,
+                "COMMON_RISING_HOLD",
+            ),
+        ):
+            common_decision = common_hold.evaluate(
+                common_state, common_observation)
+        self.assertFalse(common_decision.should_sell)
+        self.assertIsNone(common_hold.get_s03_early_peak_watch_since())
+
+    def test_s03_early_peak_requires_three_continuous_seconds(self) -> None:
+        engine = Strategy03HoldSellEngine(early_peak_live_enabled=True)
+        state = self._state("early-peak-watch")
+        state.peak_price = Decimal("10100")
+        pending = engine.evaluate(
+            state, self._early_peak_observation(1))
+        self.assertFalse(pending.should_sell)
+        saved_watch = engine.get_s03_early_peak_watch_since()
+        self.assertIsNotNone(saved_watch)
+
+        restored = Strategy03HoldSellEngine(early_peak_live_enabled=True)
+        restored.set_s03_early_peak_watch_since(saved_watch.isoformat())
+        still_pending = restored.evaluate(
+            state, self._early_peak_observation(3.9))
+        self.assertFalse(still_pending.should_sell)
+        decision = restored.evaluate(
+            state, self._early_peak_observation(4))
+        self.assertEqual(decision.action, HoldSellAction.SELL)
+        self.assertEqual(decision.reason, "S03_EARLY_PEAK")
+
+    def test_s03_early_peak_blocks_below_cost_floor(self) -> None:
+        audit = unittest.mock.Mock()
+        engine = Strategy03HoldSellEngine(
+            audit_recorder=audit, early_peak_live_enabled=True)
+        state = self._state("early-peak-cost")
+        state.peak_price = Decimal("10100")
+        decision = engine.evaluate(
+            state, self._early_peak_observation(1, price="10020"))
+        self.assertFalse(decision.should_sell)
+        evidence = audit.record.call_args.kwargs["state_after"]
+        self.assertFalse(evidence["s03_early_peak_cost_floor_ok"])
+        self.assertEqual(
+            evidence["s03_early_peak_block_reason"], "COST_FLOOR_BLOCK")
+
+    def test_s03_early_peak_cannot_bypass_hard_stop(self) -> None:
+        engine = Strategy03HoldSellEngine(early_peak_live_enabled=True)
+        state = self._state("early-peak-hard-stop")
+        state.peak_price = Decimal("10100")
+        decision = engine.evaluate(
+            state, self._early_peak_observation(1, price="9700"))
+        self.assertTrue(decision.should_sell)
+        self.assertIn("HARD_STOP", decision.reason)
+
+    def test_s03_early_peak_cannot_bypass_force_exit(self) -> None:
+        engine = Strategy03HoldSellEngine(early_peak_live_enabled=True)
+        state = self._state("early-peak-time")
+        state.peak_price = Decimal("10100")
+        observation = replace(
+            self._early_peak_observation(1),
+            observed_at=self.now.replace(hour=10, minute=30),
+        )
+        decision = engine.evaluate(state, observation)
+        self.assertEqual(decision.reason, "TIME_EXIT_1030")
 
     def test_explicit_entry_lane_wins_over_fill_time(self) -> None:
         engine = Strategy03HoldSellEngine()
@@ -89,6 +320,62 @@ class Strategy03ExitTests(unittest.TestCase):
         )
         self.assertTrue(intraday_decision.should_sell)
         self.assertIn("-1.00%", intraday_decision.reason)
+
+    def test_restart_reconciles_ordering_claim_to_bought(self) -> None:
+        engine = Strategy03Engine.__new__(Strategy03Engine)
+        engine._active_positions = lambda: {
+            "123456:1": {
+                "code": "123456", "phase": "HOLD",
+                "entry_lane": "OPEN_CRASH",
+            }
+        }
+        with (
+            patch("strategy_03_rotation_engine_v1.crash_claim.enabled", return_value=True),
+            patch("strategy_03_rotation_engine_v1.kst_now", return_value=self.now),
+            patch(
+                "strategy_03_rotation_engine_v1.crash_claim.active_s03_claims",
+                return_value={
+                    "123456": {"state": "ORDERING", "order_id": "o-1"}
+                },
+            ),
+            patch("strategy_03_rotation_engine_v1.crash_claim.mark_bought") as mark,
+        ):
+            engine._reconcile_crash_claims()
+        mark.assert_called_once_with(
+            "123456", self.now, order_id="o-1")
+
+    def test_preorder_fails_closed_when_claim_transition_fails(self) -> None:
+        engine = Strategy03Engine.__new__(Strategy03Engine)
+        engine._release_slot = unittest.mock.Mock()
+        engine._event = unittest.mock.Mock()
+        engine._save = unittest.mock.Mock()
+        position = {
+            "code": "123456", "name": "TEST", "phase": "BUY_PENDING",
+            "entry_lane": "OPEN_CRASH", "last_price": 10000,
+            "slot_reserved": True,
+            "pending": {"idempotency_key": "order-1"},
+        }
+        with (
+            patch(
+                "strategy_03_rotation_engine_v1.crash_claim.enabled",
+                return_value=True,
+            ),
+            patch(
+                "strategy_03_rotation_engine_v1.crash_claim.mark_ordering",
+                return_value=False,
+            ),
+        ):
+            with self.assertRaises(S03CrashClaimNotHeld):
+                engine._order_lifecycle(
+                    "BUY_PREPARED", position, observed_at=self.now)
+        self.assertEqual(position["phase"], "FAILED")
+        self.assertFalse(position["slot_reserved"])
+        engine._release_slot.assert_called_once_with(position)
+        self.assertEqual(
+            engine._event.call_args.kwargs["reason"],
+            "S03_CRASH_CLAIM_NOT_HELD_PREORDER",
+        )
+
     def test_open_daily_ma_trend_holds_but_weak_trend_exits(self) -> None:
         engine = Strategy03HoldSellEngine()
         weak_observation = HoldSellObservation(

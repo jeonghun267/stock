@@ -10,7 +10,7 @@ import json
 import os
 import sys
 import time as time_module
-from collections import deque
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, time, timedelta
 from decimal import Decimal
@@ -58,6 +58,8 @@ from approval_manifest_writer_v1 import live_feature_enabled
 
 ROCKET_LIVE_STAGE = "ROCKET"
 ROCKET_LIVE_FEATURE = "S01_ROCKET"
+PULLBACK_LIVE_STAGE = "PULLBACK"
+PULLBACK_LIVE_FEATURE = "S01_PULLBACK"
 # [S01 ABOVE-OPEN LIVE OBSERVATION 2026-08-14 owner approval]
 # Five trading sessions after the 2026-08-17 substitute holiday.  The
 # detector stays unchanged; only an already-confirmed shadow row can be
@@ -141,8 +143,12 @@ class ShadowConfig:
     html_path: Path = Path(os.environ.get(
         "S01_HTML", r"C:\stock_bot\보고서\새전략01_급상승_신호감시.html"))
     loop_sec: float = float(os.environ.get("S01_LOOP_SEC", "1.0"))
-    max_snapshot_age_sec: float = float(os.environ.get("S01_SNAPSHOT_MAX_AGE", "5"))
-    max_board_age_sec: float = float(os.environ.get("S01_BOARD_MAX_AGE", "10"))
+    max_snapshot_age_sec: float = float(os.environ.get(
+        "S01_SNAPSHOT_MAX_AGE_SEC", os.environ.get("S01_SNAPSHOT_MAX_AGE", "4")
+    ))
+    max_board_age_sec: float = float(os.environ.get(
+        "S01_BOARD_MAX_AGE_SEC", os.environ.get("S01_BOARD_MAX_AGE", "8")
+    ))
     max_signals_per_code: int = int(os.environ.get("S01_MAX_CYCLES_PER_CODE", "2"))
     rotation_state_path: Path = Path(os.environ.get(
         "S01_ROTATION_STATE",
@@ -179,6 +185,7 @@ class ShadowPoint:
     exact_flow: bool
     high_range_rank: int = 0
     high_range_ready: bool = False
+    high_range_money_speed_ratio: float = 0.0
     che_str: float = 0.0
     cum_vol: float = 0.0
     theme_leader: bool = False
@@ -432,6 +439,9 @@ def load_live_points(
                 (range_meta.get(point.code) or {}).get("hr_rank")
             )),
             high_range_ready=_is_top40_range_row(range_meta.get(point.code)),
+            high_range_money_speed_ratio=_safe_float(
+                (range_meta.get(point.code) or {}).get("hr_money_speed_ratio")
+            ),
         )
         for point in points
     ]
@@ -1288,25 +1298,94 @@ def rocket_live_enabled() -> bool:
     return env_enabled and live_feature_enabled(ROCKET_LIVE_FEATURE)
 
 
+def pullback_live_enabled() -> bool:
+    """Require both the hashed launcher switch and the sealed owner grant."""
+    env_enabled = (
+        os.environ.get("S01_PULLBACK_LIVE", "NO").strip().upper()
+        in {"YES", "Y", "1", "TRUE", "ON"}
+    )
+    return env_enabled and live_feature_enabled(PULLBACK_LIVE_FEATURE)
+
+
 def promote_rocket_live(
     entry_v3_rows: Iterable[Mapping[str, Any]],
     existing_signals: Iterable[Mapping[str, Any]],
     *,
     enabled: bool | None = None,
+    diagnostics: list[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any] | None:
-    """Promote only the already-selected ROCKET lane; other v3 lanes stay shadow."""
+    """Promote distinct ROCKET codes up to the owner-approved three slots."""
     if enabled is None:
         enabled = rocket_live_enabled()
-    if not enabled or any(
-        str(row.get("entry_stage") or "") == ROCKET_LIVE_STAGE
+    rows = [dict(row) for row in entry_v3_rows]
+    existing_codes = {
+        str(row.get("code") or "").zfill(6)
         for row in existing_signals
-    ):
+        if str(row.get("entry_stage") or "") == ROCKET_LIVE_STAGE
+    }
+    if not enabled or len(existing_codes) >= 3:
         return None
     eligible = [
-        dict(row) for row in entry_v3_rows
+        row for row in rows
         if str(row.get("stage") or "") == ROCKET_LIVE_STAGE
         and str(row.get("action") or "") == BuyAction.BUY_READY.value
         and str(row.get("mode") or "") == "SIGNAL_ONLY_ORDER_ZERO"
+        and str(row.get("code") or "").zfill(6) not in existing_codes
+    ]
+    if not eligible:
+        if rows and diagnostics is not None:
+            stage_counts = Counter(str(row.get("stage") or "None") for row in rows)
+            diagnostics.append({
+                "ts": max(str(row.get("ts") or "") for row in rows),
+                "event": "ROCKET_NOT_ELIGIBLE",
+                "entry_v3_rows": len(rows),
+                "stage_distribution": json.dumps(
+                    dict(stage_counts), ensure_ascii=False, sort_keys=True),
+                "rocket_live": bool(enabled),
+                "s01_entry_v3_mode": os.environ.get(
+                    "S01_ENTRY_V3_MODE", "UNSET"),
+            })
+        return None
+    selected = max(
+        eligible,
+        key=lambda row: (
+            _safe_float(row.get("score")),
+            str(row.get("code") or ""),
+        ),
+    )
+    selected.update({
+        "entry_stage": ROCKET_LIVE_STAGE,
+        "requested_quantity": 1,
+        "signal_sequence": len(existing_codes) + 1,
+        "mode": "SIGNAL_ONLY_ORDER_ZERO",
+    })
+    return selected
+
+
+def promote_pullback_live(
+    entry_v3_rows: Iterable[Mapping[str, Any]],
+    existing_signals: Iterable[Mapping[str, Any]],
+    *,
+    enabled: bool | None = None,
+) -> Dict[str, Any] | None:
+    """Promote one confirmed PULLBACK per batch, capped at three codes daily."""
+    if enabled is None:
+        enabled = pullback_live_enabled()
+    if not enabled:
+        return None
+    existing_codes = {
+        str(row.get("code") or "").zfill(6)
+        for row in existing_signals
+        if str(row.get("entry_stage") or "") == PULLBACK_LIVE_STAGE
+    }
+    if len(existing_codes) >= 3:
+        return None
+    eligible = [
+        dict(row) for row in entry_v3_rows
+        if str(row.get("stage") or "") == PULLBACK_LIVE_STAGE
+        and str(row.get("action") or "") == BuyAction.BUY_READY.value
+        and str(row.get("mode") or "") == "SIGNAL_ONLY_ORDER_ZERO"
+        and str(row.get("code") or "").zfill(6) not in existing_codes
     ]
     if not eligible:
         return None
@@ -1318,7 +1397,7 @@ def promote_rocket_live(
         ),
     )
     selected.update({
-        "entry_stage": ROCKET_LIVE_STAGE,
+        "entry_stage": PULLBACK_LIVE_STAGE,
         "requested_quantity": 1,
         "signal_sequence": 1,
         "mode": "SIGNAL_ONLY_ORDER_ZERO",
@@ -1331,7 +1410,7 @@ def restore_entry_v3_emitted(
     payload: Mapping[str, Any],
     today: str,
 ) -> list[Dict[str, Any]]:
-    """Restore same-day v3 lane caps so a signal-process restart cannot refire."""
+    """Restore same-day code/lane dedup without spending broker-order capacity."""
     if str(payload.get("date") or "") != today:
         return []
     restored: list[Dict[str, Any]] = []
@@ -1342,13 +1421,18 @@ def restore_entry_v3_emitted(
         stage = str(raw.get("stage") or "")
         if len(code) != 6 or not code.isdigit():
             continue
-        if stage not in {"ROCKET", "PULLBACK", "ORB"}:
+        if stage not in {"ROCKET", "PULLBACK"}:
             continue
         key = (code, stage)
         if key in runtime.emitted:
             continue
         runtime.emitted.add(key)
-        runtime.lane_counts[stage] += 1
+        try:
+            emitted_at = datetime.fromisoformat(str(raw.get("ts") or ""))
+        except ValueError:
+            emitted_at = datetime.min
+        if hasattr(runtime, "emitted_at"):
+            runtime.emitted_at[key] = emitted_at
         restored.append(dict(raw))
     return restored
 
@@ -1438,12 +1522,21 @@ class ShadowRuntime:
         self.entry_v3_signals.extend(entry_v3_new)
         signals = self.monitor.process_points(points)
         rocket_live = rocket_live_enabled()
+        rocket_diagnostics: list[Dict[str, Any]] = []
         rocket_promoted = promote_rocket_live(
             entry_v3_new, self.monitor.signals, enabled=rocket_live,
+            diagnostics=rocket_diagnostics,
         )
         if rocket_promoted is not None:
             self.monitor.signals.append(rocket_promoted)
             signals.append(rocket_promoted)
+        pullback_promoted = promote_pullback_live(
+            entry_v3_new, self.monitor.signals,
+            enabled=pullback_live_enabled(),
+        )
+        if pullback_promoted is not None:
+            self.monitor.signals.append(pullback_promoted)
+            signals.append(pullback_promoted)
         shadow_signals = self.monitor.drain_shadow_signals()
         promoted = promote_above_open_rebreak_live(
             shadow_signals, self.monitor.signals, now)
@@ -1472,6 +1565,7 @@ class ShadowRuntime:
             "shadow_signals": self.monitor.shadow_signals,
             "entry_v3_mode": "SHADOW",
             "rocket_live_mode": "LIVE" if rocket_live else "SHADOW",
+            "rocket_diagnostics": rocket_diagnostics,
             "entry_v3_loss_pause_until": (
                 loss_pause_until.isoformat(timespec="seconds") if loss_pause_until else ""
             ),
@@ -1499,6 +1593,11 @@ class ShadowRuntime:
             / f"strategy_01_entry_v3_shadow_{now:%Y%m%d}.csv"
         )
         _append_events(entry_v3_path, entry_v3_audit)
+        rocket_diagnostic_path = (
+            self.config.event_dir
+            / f"strategy_01_rocket_diagnostic_{now:%Y%m%d}.csv"
+        )
+        _append_events(rocket_diagnostic_path, rocket_diagnostics)
         return payload
 
 

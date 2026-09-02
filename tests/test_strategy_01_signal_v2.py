@@ -19,9 +19,11 @@ from strategy_01_open_surge_signal_v2 import (
     _book_telemetry,
     _is_top40_range_row,
     build_delay_0903_shadow,
+    promote_pullback_live,
     promote_rocket_live,
     restore_entry_v3_emitted,
 )
+import strategy_01_signal_contract_v2 as signal_contract
 
 
 class SequenceStrategy:
@@ -39,7 +41,22 @@ class SequenceStrategy:
 
 
 class Strategy01SignalV2Tests(unittest.TestCase):
-    def test_only_rocket_is_promoted_live_once_at_one_share(self) -> None:
+    def test_pullback_promotes_one_share_and_caps_three_codes(self) -> None:
+        rows = [
+            {"ts": "2026-08-26T09:03:05", "code": "111111",
+             "action": "BUY_READY", "stage": "PULLBACK", "score": 99,
+             "mode": "SIGNAL_ONLY_ORDER_ZERO"},
+        ]
+        promoted = promote_pullback_live(rows, [], enabled=True)
+        self.assertEqual(promoted["entry_stage"], "PULLBACK")
+        self.assertEqual(promoted["requested_quantity"], 1)
+        existing = [
+            {"code": code, "entry_stage": "PULLBACK"}
+            for code in ("111111", "222222", "333333")
+        ]
+        self.assertIsNone(promote_pullback_live(rows, existing, enabled=True))
+
+    def test_rocket_promotes_one_share_and_caps_three_distinct_codes(self) -> None:
         rows = [
             {"ts": "2026-08-26T09:00:05", "code": "111111", "action": "BUY_READY", "stage": "PULLBACK", "score": 99, "mode": "SIGNAL_ONLY_ORDER_ZERO"},
             {"ts": "2026-08-26T09:00:05", "code": "222222", "action": "BUY_READY", "stage": "ROCKET", "score": 80, "mode": "SIGNAL_ONLY_ORDER_ZERO"},
@@ -49,23 +66,88 @@ class Strategy01SignalV2Tests(unittest.TestCase):
         self.assertEqual(promoted["entry_stage"], "ROCKET")
         self.assertEqual(promoted["requested_quantity"], 1)
         self.assertIsNone(promote_rocket_live(rows, [promoted], enabled=True))
+        existing = [promoted]
+        for sequence, code in enumerate(("333333", "444444"), start=2):
+            next_rows = [
+                {"ts": "2026-08-26T09:01:05", "code": code,
+                 "action": "BUY_READY", "stage": "ROCKET", "score": 80,
+                 "mode": "SIGNAL_ONLY_ORDER_ZERO"},
+            ]
+            next_promoted = promote_rocket_live(next_rows, existing, enabled=True)
+            self.assertEqual(next_promoted["requested_quantity"], 1)
+            self.assertEqual(next_promoted["signal_sequence"], sequence)
+            existing.append(next_promoted)
+        self.assertIsNone(promote_rocket_live(rows, existing, enabled=True))
         self.assertIsNone(promote_rocket_live(rows, [], enabled=False))
 
-    def test_entry_v3_restart_restores_daily_lane_cap(self) -> None:
-        runtime = SimpleNamespace(emitted=set(), lane_counts=defaultdict(int))
+    def test_rocket_ineligible_reason_is_recorded_once_per_batch(self) -> None:
+        diagnostics = []
+        rows = [
+            {"ts": "2026-08-26T09:00:05", "code": "111111",
+             "action": "BUY_READY", "stage": None,
+             "mode": "SIGNAL_ONLY_ORDER_ZERO"},
+            {"ts": "2026-08-26T09:00:05", "code": "222222",
+             "action": "BUY_READY", "stage": "PULLBACK",
+             "mode": "SIGNAL_ONLY_ORDER_ZERO"},
+        ]
+
+        self.assertIsNone(promote_rocket_live(
+            rows, [], enabled=True, diagnostics=diagnostics,
+        ))
+        self.assertEqual(1, len(diagnostics))
+        self.assertEqual(2, diagnostics[0]["entry_v3_rows"])
+        self.assertEqual('{"None": 1, "PULLBACK": 1}',
+                         diagnostics[0]["stage_distribution"])
+        self.assertTrue(diagnostics[0]["rocket_live"])
+        self.assertIn("s01_entry_v3_mode", diagnostics[0])
+
+    def test_entry_v3_restart_restores_code_dedup_without_lane_spend(self) -> None:
+        runtime = SimpleNamespace(
+            emitted=set(), emitted_at={}, lane_counts=defaultdict(int),
+        )
         payload = {
             "date": "20260826",
             "entry_v3_signals": [
-                {"code": "222222", "stage": "ROCKET"},
-                {"code": "222222", "stage": "ROCKET"},
-                {"code": "333333", "stage": "PULLBACK"},
+                {"ts": "2026-08-26T09:00:00", "code": "222222", "stage": "ROCKET"},
+                {"ts": "2026-08-26T09:00:00", "code": "222222", "stage": "ROCKET"},
+                {"ts": "2026-08-26T09:01:00", "code": "333333", "stage": "PULLBACK"},
             ],
         }
         restored = restore_entry_v3_emitted(runtime, payload, "20260826")
         self.assertEqual(len(restored), 2)
-        self.assertEqual(runtime.lane_counts["ROCKET"], 1)
-        self.assertEqual(runtime.lane_counts["PULLBACK"], 1)
+        self.assertEqual(runtime.lane_counts["ROCKET"], 0)
+        self.assertEqual(runtime.lane_counts["PULLBACK"], 0)
         self.assertIn(("222222", "ROCKET"), runtime.emitted)
+        self.assertEqual(
+            runtime.emitted_at[("222222", "ROCKET")],
+            datetime.fromisoformat("2026-08-26T09:00:00"),
+        )
+
+    def test_v3_stage_is_forwarded_as_order_entry_stage(self) -> None:
+        old_mode = signal_contract.ENTRY_V3_MODE
+        old_capture = signal_contract.OPEN_PRIORITY_CAPTURE
+        try:
+            signal_contract.ENTRY_V3_MODE = "LIVE"
+            signal_contract.OPEN_PRIORITY_CAPTURE = False
+            now = datetime(2026, 8, 27, 9, 3, 10)
+            payload = {
+                "schema": signal_contract.SIGNAL_SCHEMA,
+                "mode": signal_contract.SIGNAL_MODE,
+                "date": "20260827",
+                "updated_at": now.isoformat(),
+                "entry_v3_signals": [{
+                    "ts": now.isoformat(), "code": "123456",
+                    "action": "BUY_READY", "stage": "PULLBACK",
+                    "mode": signal_contract.SIGNAL_MODE,
+                }],
+            }
+            rows = signal_contract.select_fresh_signals(
+                payload, now=now, max_age_sec=5,
+            )
+            self.assertEqual(rows[0]["entry_stage"], "PULLBACK")
+        finally:
+            signal_contract.ENTRY_V3_MODE = old_mode
+            signal_contract.OPEN_PRIORITY_CAPTURE = old_capture
 
     @staticmethod
     def rising_ma3(_code: str):

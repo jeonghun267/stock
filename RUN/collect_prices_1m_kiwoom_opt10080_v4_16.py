@@ -1778,27 +1778,28 @@ class KiwoomCollector:
                 import glob as _si_glob, json as _si_json
                 # [INJECTFIX 2026-06-25 ★급등주 커버리지] ①movers·scanner 우선순위 ②all_codes필터 제거
                 #   (8:45 스냅 1642종목에 없는 당일급등주=파루·금양도 수집) ③cap 20→30. 백업.bak_pre_injectfix
-                _si_pri = []; _si_rest = []   # 순서보존(우선=movers/scanner, 나중=breakout 등)
+                _si_must = []; _si_pri = []; _si_rest = []   # S07M 당일후보 > movers/scanner > 나머지
                 for _si_f in sorted(_si_glob.glob(r"C:\stock_bot\IPC\micro_watch_*.json")):
                     try:
                         with open(_si_f, encoding="utf-8-sig") as _si_fh:
                             _cs = [str(_c).zfill(6) for _c in (_si_json.load(_si_fh).get("codes") or [])]
                     except Exception:
                         _cs = []
-                    if ("movers" in _si_f) or ("scanner" in _si_f): _si_pri += _cs
+                    if "s07_morning" in _si_f: _si_must += _cs
+                    elif ("movers" in _si_f) or ("scanner" in _si_f): _si_pri += _cs
                     else: _si_rest += _cs
                 _si_cap = int(os.environ.get("COLLECT_STRATEGY_INJECT_MAX", "30"))
                 # [INJECT-OUTPOOL 2026-06-27 ★풀밖 우선] all_codes(=수집 universe)에 없는 전략후보는
                 #   bucket_c 회전·정상경로가 전혀 못 잡음(유일경로=inject) → movers/scanner보다 먼저 넣어야
                 #   cap에 안 밀림. 풀안 후보는 C 백필이 커버하므로 차순위. 6/26 미수집(208640/299660/361670
                 #   =돌파꼬리·풀밖)이 cap12에 잘린 근본수정. cap 불변=TR부하 0. 롤백 env COLLECT_INJECT_OUTPOOL=NO.
-                _si_ordered = _si_pri + _si_rest          # 기존 우선순위(movers/scanner→breakout) 보존
+                _si_ordered = _si_must + _si_pri + _si_rest  # S07M은 기존 cap 안에서 보장
                 if os.environ.get("COLLECT_INJECT_OUTPOOL", "YES").strip().upper() == "YES":
                     _si_allset = set(self.all_codes)
                     if _si_allset:                         # all_codes 비면 재정렬 안함(fail-safe·기존동작)
                         _si_out = [c for c in _si_ordered if c not in _si_allset]   # 풀밖=유일경로 inject
                         _si_in  = [c for c in _si_ordered if c in _si_allset]       # 풀안=C백필 커버
-                        _si_ordered = _si_out + _si_in
+                        _si_ordered = list(dict.fromkeys(_si_must + _si_out + _si_in))
                 _si_aset = set(bucket_a); _si_seen = set(); _si_add = []
                 for _c in _si_ordered:   # 풀밖 우선 → 그다음 movers/scanner→breakout 순서대로
                     if len(_c) == 6 and _c.isdigit() and _c not in _si_aset and _c not in _si_seen:
@@ -4369,7 +4370,10 @@ class KiwoomCollector:
             #   (1,100/h)이라 총량을 줄이는 유일 레버 = 사이클 사이 휴지. 기본 180s(코어 재수집 ~6.4분 간격
             #   = 현행 4.8~8.4분 사이클과 동급 신선도·TR은 반토막). 개장 직후(~09:05)와 장후 백필(15:19~)은
             #   기존 그대로. 하트비트는 60s 조각으로 유지(감시 오탐 방지). 롤백: setx COLLECT_CYCLE_GAP_SEC 0
-            _cyc_gap = float(os.environ.get("COLLECT_CYCLE_GAP_SEC", "180"))
+            # ★[2026-08-28 친구님 승인 "1 추천"] 180 → 90초 절충 — 8/28 실측 공백률 11% 개선 목적.
+            #   0초(TR 2배)는 8/13 계정 조회제한 사고 위험으로 기각. 월요일 TIMEOUT 비율 관찰 후 재조정.
+            #   롤백: setx COLLECT_CYCLE_GAP_SEC 180
+            _cyc_gap = float(os.environ.get("COLLECT_CYCLE_GAP_SEC", "90"))
             _gap_nt = datetime.now().time()
             if _cyc_gap > 0 and dtime(9, 5) <= _gap_nt <= dtime(15, 19):
                 _gap_left = max(_cyc_gap, float(self.evolver.loop_sec))

@@ -484,6 +484,7 @@ SLOTS_REB = int(os.environ.get("MF_SLOTS_REB", "2"))   # 바닥+눌림(저점반
 SLOTS_MA  = int(os.environ.get("MF_SLOTS_MA",  "1"))   # MA전환 바닥 슬롯
 INCLUDE_RISK = os.environ.get("MF_INCLUDE_RISK", "NO").strip().upper() == "YES"  # 🟡(레짐위험)도 후보에(기본 NO=급락장 전면방어)
 ENTRY_END = os.environ.get("MF_EXEC_ENTRY_END", "1300")   # [7/9 친구님 "13시까지만 하자"] 1개월 조사: 13시 저점부터 반등성공 52%로 꺾임(9~12시 78~100%) → 신규진입 13:00 마감
+DEEP_ENTRY_END = os.environ.get("MF_DEEP_ENTRY_END", "1400")
 EOD_HM    = os.environ.get("MF_EXEC_EOD", "1518")
 # [2026-07-09 친구님 "1차 매매는 10시20분까지 다 매도한다·프로그램에 고정"] 아침 1차 회전 —
 #   신규진입은 R1_ENTRY_END(10:00)까지·R1_CLOSE(10:20)에 남은 보유 전량 시장가 청산(매도사다리 최우선·큰손유예도 무시).
@@ -501,6 +502,8 @@ BOARD     = Path(r"C:\stock_bot\data\돈흐름_선별판.json")
 POS       = Path(r"C:\stock_bot\data\돈흐름_포지션.json")
 LOG       = Path(r"C:\stock_bot\data\LOG\돈흐름매매.log")
 RT_OPEN   = Path(r"C:\stock_bot\data\rt_open_positions.json")
+AUDIT_DIR = Path(r"C:\stock_bot\data\audit")
+_AUDIT_SEEN = set()
 
 
 def _log(m):
@@ -579,6 +582,84 @@ def _imb(bc, code):
         return float(v) if isinstance(v, (int, float)) else None
     except Exception:
         return None
+
+
+def _audit_decision(code, event, gate=None, gate_pass=None, values=None):
+    """Persist decision inputs only; never changes a buy/sell decision."""
+    try:
+        now = datetime.now()
+        key = (now.strftime("%Y%m%d%H%M"), str(code).zfill(6), event, gate)
+        if key in _AUDIT_SEEN:
+            return
+        _AUDIT_SEEN.add(key)
+        passed = dict(gate_pass or {})
+        would_pass = None
+        if gate and gate in passed:
+            others = [v for k, v in passed.items() if k != gate]
+            would_pass = bool(others) and all(v is True for v in others)
+        row = {
+            "ts": now.isoformat(timespec="seconds"),
+            "hm": now.strftime("%H%M"),
+            "code": str(code).zfill(6),
+            "event": event,
+            "gate": gate,
+            "gate_pass": passed,
+            "would_pass_without_gate": would_pass,
+            "values": values or {},
+        }
+        AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        path = AUDIT_DIR / f"mflow_decision_inputs_{now:%Y%m%d}.jsonl"
+        with path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _entry_gate_snapshot(bc, code, role, inflow_ok, dump_pass=None):
+    """Read the five approved audit gates without changing their thresholds."""
+    eimb_thr = float(os.environ.get("MF_DEEP_ENTRY_IMB", "1.0") or 0)
+    eiv = _imb(bc, code)
+    failopen = os.environ.get("MF_ENTRY_IMB_FAILOPEN", "YES").strip().upper() == "YES"
+    imb_ok = eimb_thr <= 0 or (eiv is None and failopen) or (eiv is not None and eiv >= eimb_thr)
+    epos_thr = float(os.environ.get("MF_DEEP_ENTRY_POS", "0.6") or 0)
+    bull_n = int(os.environ.get("MF_DEEP_BULL_N", "0") or 0)
+    bar = _bar1m(code)
+    bpos = bar.get("pos") if isinstance(bar, dict) else None
+    pos_ok = epos_thr <= 0 or (bar is not None and bpos is not None and float(bpos) >= epos_thr)
+    seq = []
+    if isinstance(bar, dict):
+        seq.append(1 if bar.get("bull") else 0)
+        for pb in reversed(bar.get("prev") or []):
+            try:
+                seq.append(1 if float(pb[3]) > float(pb[0]) else 0)
+            except Exception:
+                break
+    bull_ok = bull_n <= 0 or (len(seq) >= bull_n and all(seq[:bull_n]))
+    if dump_pass is None:
+        dump_pass = bool(
+            role == "깊은바닥"
+            and os.environ.get("MF_DEEP_DUMP_FREE", "YES").strip().upper() == "YES")
+    passed = {
+        "inflow": bool(inflow_ok),
+        "imbalance": bool(imb_ok),
+        "candle_pos": bool(pos_ok),
+        "bull_n": bool(bull_ok),
+        "dumping": bool(dump_pass),
+    }
+    values = {
+        "inflow_ok": bool(inflow_ok),
+        "imb": eiv,
+        "imb_threshold": eimb_thr,
+        "imb_failopen": failopen,
+        "bar": bar,
+        "candle_pos": bpos,
+        "candle_pos_threshold": epos_thr,
+        "bull_n": bull_n,
+        "bull_sequence": seq[:max(1, bull_n)],
+        "dump_pass": bool(dump_pass),
+        "role": role,
+    }
+    return passed, values
 
 
 def _cumvol(bc, code):
@@ -1125,7 +1206,9 @@ def _mabase_map():
 def _entries(bc, pos, hm, today, mode):
     """진입 (🟢 이기는중 상위 → 시장가). 매번 캐시된 보드 재로드 → 백그라운드가 갱신하면 즉시 반영.
     pos in-place 갱신. 변경 있으면 True."""
-    if hm > ENTRY_END:
+    # General lanes still close at ENTRY_END; only the approved deep-bottom R2
+    # lane remains evaluable until its existing DEEP_ENTRY_END.
+    if hm > DEEP_ENTRY_END:
         return False
     _r2 = bool(R1_CLOSE_HM) and hm > R1_ENTRY_END   # [7/9 친구님 "2차 창도 열어"] 2차 창(10:00~ENTRY_END) — 깊은바닥만 허용
     if _r2 and not (R2_DEEP and DEEP_ON):
@@ -1245,12 +1328,19 @@ def _entries(bc, pos, hm, today, mode):
                     # [7/10 장중 친구님 "돈유입 확인 중요 — 지금 배선해"] 등재 순간 즉시 수급 1발(하루 종목당 1회) —
                     #   저점 시점 수급 기준점 확보 + smart_money 60s캐시 웜업 → 턴 도달시 최신치 즉시판정(45초 대기 생략).
                     #   비용 ~2TR/등재(하루 ~10건). 실패 무해. _DEEP_PROBE는 건드리지 않음(진입검사 첫 조회 스로틀 안 걸리게).
+                    _bv = None
                     try:
                         import smart_money as _SMB
                         _bv = _SMB.probe(bc, _dc, _cur(bc, _dc) or _dlo)
                         _log(f"🕳 {_dc} 등재시점 수급(기관/외인/프로/개인·백만원): {list(_bv[:4])}")
                     except Exception:
                         pass
+                    _audit_decision(_dc, "REGISTERED", values={
+                        "prev_close": _dpc, "low": _dlo,
+                        "depth_pct": (_dlo / _dpc - 1) * 100,
+                        "open": _dob, "gap_pct": _dgap,
+                        "flow_probe": list(_bv[:5]) if _bv is not None else None,
+                    })
         _rgm = _rng20_map()   # [7/10 변동성 차등] 등재 경합 = 고변동 우선(모든 깊이서 수익·승률 최고) → 동률이면 큰손합
         # [7/11 🤝 진입가점 — 친구님 "진입 관문에도 가점"] 🤝(외인&프로 10일 동반매집)를 경합 맨 앞에.
         #   근거: 매매기 프레임 백테(217종목×100일) — 깊은바닥급(-4%↓) 저점→종가 반등 🤝 +4.45% vs 일반 +3.65%(+0.80%p)·
@@ -1314,6 +1404,8 @@ def _entries(bc, pos, hm, today, mode):
         #   🟢 후보도 2차에 흐르되 역할은 저점반등(눌림)만 가능(모멘텀 전역차단·MA전환은 아래서 1차 한정).
         #   눌림 노른자=13시대(7/5 조사) 커버. 롤백(2차 깊은바닥 전용으로): 이 주석 아래 두 줄을 원복.
         code = str(r.get("code", "")).zfill(6)
+        if hm > ENTRY_END and not r.get("_deep"):
+            continue
         if code in excl:
             continue
         # [2026-07-07 친구님 "바닥 확인하고 잡아야"] 진입 확인 = 상승(모멘텀) OR che 저점반등(바닥확인). 첫매수·재진입 공통.
@@ -1350,6 +1442,7 @@ def _entries(bc, pos, hm, today, mode):
             continue
         _minvol_note(code, _cumvol(bc, code), hm)   # [7/10 분할] 후보 분당 거래량 기록(TR 0)
         _pre_buy = False                             # [7/10 분할] 이번 매수가 선매수(1/3)인지
+        _in_ok = True                                # 비-깊은바닥 레인의 감사기록 기본값
         # [7/8 친구님 정정→7/11 500만 재편] 두 풀(깊은바닥 400만·그 외 100만) 모두 찼을 때만 스캔 중단.
         #   한쪽만 찼으면 계속 순회(역할별 체크는 매수 직전에서). 팔리면 자동 회복 → 재매수.
         if _invested >= DAILY_BUDGET:
@@ -1431,7 +1524,7 @@ def _entries(bc, pos, hm, today, mode):
             # [7/11 친구님 "고 통일해·바닥은 14시까지"] ①가격 턴만 판정을 종일 통일(2차의 체결강도 반등 조건 제거 —
             #   7/9 검증: 바닥권 체결강도 대기=지각·가격만 +50.6%p vs 체결강도 +14.1%p / 오늘 1개월 조사도 가격턴 기준 전 구간 플러스)
             #   ②깊은바닥 진입 마감 14:00(14시 이후 급락 회복률 30%=금지구간·24일 실측). 롤백: setx MF_DEEP_NOCHE_ALL NO / setx MF_DEEP_ENTRY_END 1430
-            if hm > os.environ.get("MF_DEEP_ENTRY_END", "1400").strip():
+            if hm > DEEP_ENTRY_END:
                 continue
             # [7/13 저녁 친구님 "60선 아래 역배열은 매수 금지 · 단 09:00~09:20은 예외 — 추세추종할려고 해"]
             #   역배열 = 일봉 5일선·20일선이 모두 60일선 아래(데드캣 교차까지 커버). 60일 미만 신규주는 맵에 없어 통과.
@@ -1618,6 +1711,8 @@ def _entries(bc, pos, hm, today, mode):
                     _pre_buy = True
                     _in_src = "선매수(턴+거래량팽창)"
                 else:
+                    _gp, _gv = _entry_gate_snapshot(bc, code, "깊은바닥", False)
+                    _audit_decision(code, "BLOCK", "inflow", _gp, _gv)
                     continue                           # 돈 안 몰린 반등(빈반등) → 대기
             # [7/12 친구님 "기록할 방법 없나"] 매수 로그·장부(grade)에 20일선 위치/하락속도/저점→진입 지연 병기 — 실측 축적용(비용 0)
             try:
@@ -1686,6 +1781,8 @@ def _entries(bc, pos, hm, today, mode):
                         _ENTRY_IMB_SEEN.add(code)
                         _log(f"⏸️ {code}({role}) 매수 보류 — 매도벽 우세(호가잔량 "
                              f"{('%.2f' % _eiv) if _eiv is not None else 'N/A'} < {_eimb_thr:g}) · 얇아지면 진입")
+                    _gp, _gv = _entry_gate_snapshot(bc, code, role, bool(_in_ok or _pre_buy))
+                    _audit_decision(code, "BLOCK", "imbalance", _gp, _gv)
                     continue
             # [7/13 친구님 "가격을 넣고 꼬리 양봉을 넣으면 되지" · "0.6으로 하고 봉 없으면 사지 마"]
             #   ★진입 봉 꼬리 관문 — 그 순간 1분봉의 종가위치 = (종가-저가)/(고가-저가).
@@ -1705,6 +1802,8 @@ def _entries(bc, pos, hm, today, mode):
                     if code not in _ENTRY_POS_SEEN:
                         _ENTRY_POS_SEEN.add(code)
                         _log(f"⏸️ {code}({role}) 매수 보류 — 1분봉 없음(판단불가·fail-safe)")
+                    _gp, _gv = _entry_gate_snapshot(bc, code, role, bool(_in_ok or _pre_buy))
+                    _audit_decision(code, "BLOCK", "candle_pos", _gp, _gv)
                     continue
                 # ① 위꼬리 소멸 — 종가위치 ≥ 0.90 = 위꼬리 ≤ 10% (봉 꼭대기 근처에서 마감 = 매수세가 밀리지 않음)
                 _bpos = _bar.get("pos")
@@ -1713,6 +1812,8 @@ def _entries(bc, pos, hm, today, mode):
                         _ENTRY_POS_SEEN.add(code)
                         _log(f"⏸️ {code}({role}) 매수 보류 — 종가위치 {float(_bpos or 0):.2f} < {_epos_thr:g}"
                              f" (위꼬리 남음 = 아직 위에서 밀리고 있다)")
+                    _gp, _gv = _entry_gate_snapshot(bc, code, role, bool(_in_ok or _pre_buy))
+                    _audit_decision(code, "BLOCK", "candle_pos", _gp, _gv)
                     continue
                 # ② ★양봉 N개 연속 — 현재 봉 + 직전 완성봉들이 전부 양봉(종가>시가)이어야 한다.
                 #   기록기가 prev(직전 완성봉 [o,h,l,c] · 오래된 것→최근 순)를 함께 넘겨준다.
@@ -1730,6 +1831,8 @@ def _entries(bc, pos, hm, today, mode):
                             _ENTRY_POS_SEEN.add(code)
                             _log(f"⏸️ {code}({role}) 매수 보류 — 1분봉 양봉 {_bull_n}개 연속 아님"
                                  f" (최근봉 {''.join('양' if x else '음' for x in _seq[:_bull_n]) or '없음'})")
+                        _gp, _gv = _entry_gate_snapshot(bc, code, role, bool(_in_ok or _pre_buy))
+                        _audit_decision(code, "BLOCK", "bull_n", _gp, _gv)
                         continue
         # 던짐 이중차단 (실시간·60s캐시) — [7/10 저녁] 아침 1차 깊은바닥은 면제(친구님 "아침 돈던지기 무시")
         # [7/11 친구님 "투매=개미털기 — 던짐 차단은 스스로를 감옥에 가두는 것·깊은저점 빠지면 들어가야·-2% 컷이 방어"]
@@ -1743,7 +1846,12 @@ def _entries(bc, pos, hm, today, mode):
                 import smart_money as SM
                 blk, smi = SM.dumping(bc, code, cur)
                 if blk:
-                    _log(f"⛔ {code} 던짐차단 [{smi}]"); continue
+                    _log(f"⛔ {code} 던짐차단 [{smi}]")
+                    _gp, _gv = _entry_gate_snapshot(
+                        bc, code, role, bool(_in_ok or _pre_buy), dump_pass=False)
+                    _gv["dumping_signal"] = smi
+                    _audit_decision(code, "BLOCK", "dumping", _gp, _gv)
+                    continue
             except Exception:
                 pass
         # 모든 전략과 같은 공통 목표수량을 쓴다. 선매수는 그 목표 안에서만 분할하고,
@@ -1756,6 +1864,10 @@ def _entries(bc, pos, hm, today, mode):
                 or not position_budget.can_open_krw(qty * cur)):
             continue
         _pm = _pmgap_map().get(code)   # [7/9] 장전 예상갭 참고(없으면 None·매수판단 무영향)
+        _gp, _gv = _entry_gate_snapshot(
+            bc, code, role, bool(_in_ok or _pre_buy), dump_pass=True)
+        _gv.update({"price": cur, "qty": qty, "grade": r.get("grade")})
+        _audit_decision(code, "ORDER_EVAL_PASS", gate_pass=_gp, values=_gv)
         if _order(bc, code, qty, "BUY", f"돈흐름진입 {r.get('grade')}"):
             if LIVE:
                 try:

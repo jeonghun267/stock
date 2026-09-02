@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ sys.path.insert(0, str(RUN_DIR))
 sys.path.insert(0, str(STAGE_DIR))
 
 from strategy_common_foundation_v1 import ContractError, OrderLedger, OrderSide  # noqa: E402
+from hold_sell_audit_v1 import HoldSellAuditRecorder  # noqa: E402
 from strategy_common_hold_sell_v1 import (  # noqa: E402
     STANDARD_STRATEGIES,
     EARLY_STRATEGIES,
@@ -99,6 +101,55 @@ class UnifiedHoldSellEngineTests(unittest.TestCase):
         self.assertEqual(STRATEGY_PROFILES[StrategyId.PULL].ma3_mode, MA3Mode.SELL_OVERRIDE)
         self.assertEqual(STRATEGY_PROFILES[StrategyId.BASE].ma3_mode, MA3Mode.SELL_OVERRIDE)
         self.assertEqual(STRATEGY_PROFILES[StrategyId.REACCEL].ma3_mode, MA3Mode.NONE)
+
+    def test_s01_defense_grace_is_audit_only_and_preserves_actual_sell(self):
+        with tempfile.TemporaryDirectory() as folder:
+            recorder = HoldSellAuditRecorder(
+                Path(folder) / "audit",
+                RUN_DIR / "strategy_common_hold_sell_v1.py",
+                strict=True,
+            )
+            engine = UnifiedHoldSellEngine(audit_recorder=recorder)
+            state = self.state(StrategyId.S01_OPEN_SURGE)
+
+            def peak_flow(second: int, price: str) -> HoldSellObservation:
+                return self.observation(
+                    kst(9, 0, second),
+                    price=price,
+                    buy_money_per_sec_10s=Decimal("100"),
+                    sell_money_per_sec_10s=Decimal("200"),
+                    buy_money_per_sec_30s=Decimal("200"),
+                    sell_money_per_sec_30s=Decimal("100"),
+                    buy_volume_per_sec_5s=Decimal("100"),
+                    sell_volume_per_sec_5s=Decimal("200"),
+                    sell_volume_per_sec_previous_10s=Decimal("100"),
+                    che_str=Decimal("100"),
+                    che_str_change_5s=Decimal("-3"),
+                    common_peak_flow_ready=True,
+                )
+
+            engine.evaluate(state, peak_flow(0, "104"))
+            engine.evaluate(state, peak_flow(1, "102.7"))
+            sold = engine.evaluate(state, peak_flow(3, "102.7"))
+            self.assertEqual(sold.action, HoldSellAction.SELL)
+            self.assertTrue(sold.reason.startswith("COMMON_PEAK_FLOW_EXIT"))
+            self.assertTrue(sold.metadata["grace_would_hold"])
+            self.assertEqual(sold.metadata["actual_action"], "SELL")
+            self.assertEqual(sold.metadata["actual_reason"], sold.reason)
+
+            audit = next((Path(folder) / "audit").rglob("*.jsonl"))
+            last = json.loads(audit.read_text(encoding="utf-8").splitlines()[-1])
+            shadow = last["decision"]["metadata"]
+            self.assertTrue(shadow["grace_would_hold"])
+            self.assertEqual(shadow["actual_action"], "SELL")
+            self.assertEqual(shadow["actual_reason"], sold.reason)
+
+        hard_state = self.state(StrategyId.S01_OPEN_SURGE)
+        hard = self.engine.evaluate(
+            hard_state, self.observation(kst(9, 0, 1), price="96.9")
+        )
+        self.assertEqual(hard.action, HoldSellAction.EMERGENCY_SELL)
+        self.assertFalse(hard.metadata["grace_would_hold"])
 
     def test_regular_valley_profile_preserves_stop_insure_and_time_exit(self):
         stop = self.state(StrategyId.VALLEY)

@@ -231,89 +231,102 @@ def main():
         f"{c} {ep:,.0f}→{(f'{cu:,.0f}({rt:+.1f}%)' if rt is not None else '?')}"
         for c, ep, cu, rt in ms_hold) or "없음"
 
+    # 돈흐름판 핵심 화면: 순위와 유입상태를 한눈에 본다. 표시만 바꾸며 원본 순위/전략은 건드리지 않는다.
+    top_rows = rows[:30]
+    flow_counts = {
+        state: sum(1 for r in rows if r.get("common_flow_state") == state)
+        for state in ("유입지속", "유입전환", "유입없음")
+    }
+
+    def board_row(r):
+        rank = int(num(r.get("rank")))
+        rank_mark = ("🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else str(rank))
+        code = str(r.get("code", "")).zfill(6)
+        live = _snap.get(code) or {}
+        low_range = _hr.get(code) or {}
+        low_state = _che_state.get(code) or {}
+        price = num(r.get("price")) or abs(num(live.get("cur")))
+        low = num(low_range.get("low")) or num(low_state.get("lo")) or abs(num(live.get("lo")))
+        low_time = _low_time(low_range.get("low_time") or low_state.get("lo_ts"))
+        rebound = (price / low - 1) * 100 if price > 0 and low > 0 else None
+        deep = r.get("deep") if isinstance(r.get("deep"), dict) else {}
+        if deep.get("reb") is not None:
+            rebound = num(deep.get("reb"))
+        state = str(r.get("common_flow_state") or "유입없음")
+        state_cls = "flow-on" if state == "유입지속" else ("flow-turn" if state == "유입전환" else "flow-off")
+        grade = str(r.get("grade") or "-")
+        danger = " danger" if "던짐" in grade else ""
+        chg = r.get("chg")
+        che_text = f"{num(r.get('che')):.0f}" if r.get("che") is not None else "-"
+        relative = num(chg) - num(_market_chg) if chg is not None and _market_chg is not None else None
+        return (
+            f"<tr class='{danger.strip()}'><td class='rank'>{rank_mark}</td>"
+            f"<td class='name'>{html.escape(str(r.get('name') or code))}<span>{code}</span></td>"
+            f"<td><b class='pill {state_cls}'>{state}</b></td>"
+            f"<td class='money'>{num(r.get('big'))/100:+,.0f}억</td>"
+            f"<td>{num(r.get('inst'))/100:+,.0f}</td><td>{num(r.get('frgn'))/100:+,.0f}</td>"
+            f"<td>{num(r.get('prog'))/100:+,.0f}</td>"
+            f"<td>{int(num(r.get('buy_cnt')))}/3</td>"
+            f"<td class='{'up' if num(chg) >= 0 else 'down'}'>{(f'{num(chg):+.1f}%' if chg is not None else '-')}"
+            f"<span>{(f'시장대비 {relative:+.1f}%p' if relative is not None else '')}</span></td>"
+            f"<td>{che_text}</td>"
+            f"<td>{num(r.get('common_flow_accel_mkrw_per_min')):+,.1f}<span>백만원/분</span></td>"
+            f"<td>{num(r.get('common_vwap_gap_pct')):+.2f}%</td>"
+            f"<td>{low_time}<span>{(f'반등 {rebound:+.1f}%' if rebound is not None else '반등 -')}</span></td>"
+            f"<td class='grade'>{html.escape(grade)}</td></tr>"
+        )
+
+    top_rows_html = "\n".join(board_row(r) for r in top_rows)
+    dump_names = " · ".join(
+        f"{html.escape(str(r.get('name') or r.get('code')))}({num(r.get('big'))/100:+,.0f}억)"
+        for r in dumps[:15]
+    ) or "없음"
+
     doc = f"""<!DOCTYPE html>
 <html lang="ko"><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="15">
 <title>💰 돈흐름도 (실시간)</title>
 <style>
- body {{ font-family:'Malgun Gothic',sans-serif; font-size:18px; background:#111722; color:#e8ecf3; margin:0; padding:14px 16px; }}
- h1 {{ font-size:28px; margin:4px 0 4px; }}
- .sub {{ color:#9fb0c8; font-size:16px; margin-bottom:10px; }}
- .flow {{ display:flex; align-items:center; gap:4px; flex-wrap:wrap; margin:6px 0 10px; }}
- .fbox {{ background:#1c2636; border:1px solid #33425c; border-radius:6px; padding:7px 10px; text-align:center; font-size:16px; }}
- .fbox b {{ display:inline; margin-left:5px; font-size:1.05em; color:#7cc4ff; }}
- .fbox.star b {{ color:#ffd54f; }}
- .fbox.dump b {{ color:#ff6b6b; }}
- .arrow {{ color:#5b6c85; font-size:1.2em; }}
- .table-wrap {{ overflow-x:auto; border:1px solid #26324a; border-radius:7px; }}
- table {{ border-collapse:collapse; width:100%; min-width:1500px; font-size:17px; table-layout:auto; }}
- th,td {{ border-bottom:1px solid #26324a; padding:8px 10px; text-align:right; vertical-align:middle; }}
- th {{ background:#1c2636; color:#9fb0c8; position:sticky; top:0; }}
- td.nm {{ text-align:left; font-weight:bold; }}
- td.cd {{ color:#7cc4ff; font-weight:800; font-size:18px; letter-spacing:0.8px; white-space:nowrap; }}
- td.td2 {{ text-align:left; font-size:16px; color:#7cc4ff; white-space:nowrap; }}
- td.gr {{ text-align:left; font-size:16px; }}
- td.compact {{ line-height:1.25; white-space:nowrap; }}
- .mini {{ color:#9fb0c8; font-size:15px; }} .warn {{ color:#ffb36b; font-size:15px; }}
- tr.green td.nm {{ color:#69f0ae; }}
- tr.amber td.nm {{ color:#ffd54f; }}
- tr.dump td {{ color:#8a93a5; }}
- tr.dump td.nm {{ color:#ff6b6b; }}
- .pos {{ color:#ff8a80; }} .neg {{ color:#82b1ff; }}
- h2 {{ font-size:20px; margin:16px 0 7px; color:#c8d3e3; }}
- details {{ margin:12px 0; border:1px solid #26324a; border-radius:6px; padding:7px 9px; overflow-x:auto; }}
- summary {{ cursor:pointer; color:#c8d3e3; font-size:18px; font-weight:700; }}
- .note {{ color:#8998ad; font-size:15px; margin-top:14px; }}
+ * {{ box-sizing:border-box; }}
+ body {{ font-family:'Malgun Gothic',sans-serif; background:#080b10; color:#cbd3df; margin:0; padding:18px 20px; font-size:17px; }}
+ h1 {{ color:#dce6f3; font-size:29px; margin:0; letter-spacing:-1px; }}
+ .sub {{ color:#78869a; font-size:15px; margin:5px 0 15px; }}
+ .cards {{ display:grid; grid-template-columns:repeat(4,minmax(150px,1fr)); gap:9px; margin-bottom:14px; }}
+ .card {{ background:#111722; border:1px solid #202b3a; border-radius:9px; padding:10px 13px; color:#8190a5; }}
+ .card b {{ display:block; color:#d5dfec; font-size:23px; margin-top:3px; }}
+ .card.on b {{ color:#63d99a; }} .card.turn b {{ color:#f0c76b; }}
+ .table-wrap {{ overflow:auto; border:1px solid #202b3a; border-radius:9px; max-height:calc(100vh - 205px); }}
+ table {{ border-collapse:collapse; width:100%; min-width:1450px; font-size:16px; }}
+ th {{ position:sticky; top:0; z-index:2; background:#151d29; color:#8796aa; padding:10px 8px; border-bottom:1px solid #2b384b; white-space:nowrap; }}
+ td {{ padding:10px 8px; border-bottom:1px solid #18212e; text-align:right; white-space:nowrap; }}
+ tbody tr:nth-child(even) {{ background:#0c1119; }} tbody tr:hover {{ background:#172131; }}
+ td.rank {{ text-align:center; color:#d7e1ee; font-size:18px; font-weight:800; }}
+ td.name {{ text-align:left; color:#e0e7f0; font-size:18px; font-weight:800; }}
+ td.name span, td span {{ display:block; color:#708096; font-size:13px; font-weight:400; margin-top:2px; }}
+ td.money {{ color:#78b9f2; font-size:17px; font-weight:800; }}
+ .pill {{ display:inline-block; padding:5px 9px; border-radius:999px; font-size:14px; }}
+ .flow-on {{ color:#69e0a2; background:#113323; }} .flow-turn {{ color:#f4cf76; background:#3a2d10; }} .flow-off {{ color:#8490a0; background:#202631; }}
+ .up {{ color:#f08080; }} .down {{ color:#77aef2; }}
+ td.grade {{ text-align:left; color:#aeb9c8; }} tr.danger td.name, tr.danger td.grade {{ color:#ef7d7d; }}
+ details {{ margin-top:10px; color:#8796aa; }} summary {{ cursor:pointer; font-weight:700; }}
+ .foot {{ color:#657286; font-size:14px; margin-top:9px; }}
 </style></head><body>
-<h1>💰 돈흐름도 <span style="font-size:0.7em;color:#9fb0c8">{ts} · 레짐 {html.escape(str(regime))}</span></h1>
-<div class="sub">15초마다 자동 새로고침 · 장중 1분마다 데이터 재생성 (읽기전용)
- · <b style="color:#7cc4ff">🔵보유 {len(hold)}종목</b> (투입 {inv:,.0f}원) · <b style="color:{'#69f0ae' if rpnl>=0 else '#ff6b6b'}">오늘 확정 {rpnl:+,.0f}원</b> · 매도완결 {len(done)}종목</div>
-
-<div class="flow">
- <div class="fbox">코스닥 전체<b>~1,700</b></div><div class="arrow">→</div>
- <div class="fbox">거래대금 상위<b>700</b></div><div class="arrow">→</div>
- <div class="fbox">품질필터(50억·2만·1000억)<b>200</b></div><div class="arrow">→</div>
- <div class="fbox">오늘 유니버스<b>{univ}</b></div><div class="arrow">→</div>
- <div class="fbox">돈 몰림 순위<b>{len(rows)}행</b></div><div class="arrow">→</div>
- <div class="fbox star">⭐ 매수세<b>{len(stars)}</b></div>
- <div class="fbox dump">🔴 던짐(금지)<b>{len(dumps)}</b></div><div class="arrow">→</div>
- <div class="fbox">진입확인(상승·저점반등)<b>최대 3보유</b></div>
+<h1>💰 돈흐름 순위판</h1>
+<div class="sub">{ts} · 레짐 {html.escape(str(regime))} · 15초 자동 새로고침 · 표시전용(SHADOW_ONLY)</div>
+<div class="cards">
+ <div class="card"><span>감시 유니버스</span><b>{univ}종목</b></div>
+ <div class="card on"><span>유입지속</span><b>{flow_counts['유입지속']}종목</b></div>
+ <div class="card turn"><span>유입전환</span><b>{flow_counts['유입전환']}종목</b></div>
+ <div class="card"><span>상위 표시</span><b>{len(top_rows)}종목</b></div>
 </div>
-
-<h2>📈 매수세 순위 (돈 몰린 순 · ⭐=큰손 +10억↑) — {len(buys)}종목</h2>
 <div class="table-wrap">
 <table>
-<tr><th>등수</th><th style="text-align:left">종목</th><th>종목코드</th><th style="text-align:left">매매·결과</th><th>큰손합</th><th>주체(기관·외인·프로)</th><th>등락·저점시각</th><th>체결·호가</th><th>거래대금·속도</th><th style="text-align:left">판정</th></tr>
-{body_rows}
+<thead><tr><th>순위</th><th style="text-align:left">종목</th><th>유입상태</th><th>큰손합</th><th>기관</th><th>외인</th><th>프로</th><th>합의</th><th>등락</th><th>체결</th><th>유입가속</th><th>VWAP</th><th>저점·반등</th><th style="text-align:left">판정</th></tr></thead>
+<tbody>{top_rows_html}</tbody>
 </table>
 </div>
-
-<h2 style="color:#ff8a80">🔴 던짐 · 매수금지 — {len(dumps)}종목</h2>
-<div class="table-wrap">
-<table>
-<tr><th>등수</th><th style="text-align:left">종목</th><th>종목코드</th><th style="text-align:left">매매·결과</th><th>큰손합</th><th>주체</th><th>등락·저점</th><th>체결·호가</th><th>거래대금·속도</th><th style="text-align:left">판정</th></tr>
-{dump_rows}
-</table>
-</div>
-
-<details><summary>👁 일반 관찰 후보 — {len(rows) - len(buys) - len(dumps)}종목</summary>
-<table>
-<tr><th>등수</th><th style="text-align:left">종목</th><th>종목코드</th><th style="text-align:left">매매·결과</th><th>큰손합</th><th>주체</th><th>등락·저점</th><th>체결·호가</th><th>거래대금·속도</th><th style="text-align:left">판정</th></tr>
-{watch_rows}
-</table></details>
-
-<details><summary>🌅⚡ 오전 스캘핑 — 감시 {ms_watch} · 보유 {len(ms_hold)} · 오늘 매도 {len(ms_sells)}</summary>
-<div class="sub">보유중: {html.escape(ms_hold_txt)}</div>
-<table>
-<tr><th style="text-align:left">시각</th><th style="text-align:left">종목</th><th>코드</th><th style="text-align:left">방향</th><th style="text-align:left">사유</th><th>진입가</th><th>수익</th><th style="text-align:left">모드</th></tr>
-{ms_rows}
-</table></details>
-
-<details><summary>표시 기준</summary><div class="note">깔때기: 코스닥 → 거래대금 상위 700 → 품질필터(거래대금 50억·주가 2만·시총 1000억) 상위 200 → 큰손합(기관+외인+프로그램 순매수) 내림차순.<br>
-⭐ = 큰손합 +10억 이상 & 던짐 아님. 🔴 던짐 = 한 주체 대량매도(기관/외인 -80억·프로 -100억) 또는 2주체 이상 매도 또는 개미가 크게 받는 중.<br>
-속도·회전율은 고저폭 실황과 겹치는 종목만 표시됩니다. 합의는 기관·외인·프로그램 중 순매수 주체 수, 시장대비는 종목등락-코스닥등락입니다.<br>
-호가위험은 스프레드 35bp 초과 또는 최우선 매수잔량 비중 35% 미만입니다. 신뢰 가능한 VI 상태값은 없어 임의 표시하지 않습니다.<br>
-매매기: ⭐후보를 순위대로 → 진입확인(오르는 중 or 체결강도 저점반등) → 역할슬롯(통합대장2·바닥2·MA전환1) → 동시보유 최대 3종목 · 1종목 20만원.</div></details>
+<details><summary>🔴 던짐 판정 {len(dumps)}종목</summary><div class="foot">{dump_names}</div></details>
+<div class="foot">순위는 기존 큰손 순매수 기준 그대로입니다. 유입태그는 참고표시만 하며 기존 매수와 전략을 차단하지 않습니다.</div>
 </body></html>"""
     OUT.write_text(doc, encoding="utf-8")
     print(f"돈흐름도 생성: {OUT} ({len(rows)}행·★{len(stars)}·던짐{len(dumps)})")

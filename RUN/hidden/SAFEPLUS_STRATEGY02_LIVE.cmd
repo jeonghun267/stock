@@ -6,7 +6,8 @@ set S02_MAX_SLOTS=6
 set S02_MAX_DAILY_CODES=12
 set S02_MAX_CYCLES_PER_CODE=2
 set S02_MAX_SELL_RETRIES=3
-set S02_SIGNAL_MAX_AGE_SEC=5
+set S02_PEAK_SCORE=2
+set S02_SIGNAL_MAX_AGE_SEC=15
 set S02_SNAPSHOT_MAX_AGE_SEC=4
 set S02_BOARD_MAX_AGE_SEC=8
 set S02_FILL_WAIT_SEC=8
@@ -27,7 +28,7 @@ REM Order-zero trend-lock comparison; preserves observations for 15 minutes.
 set S02_TREND_LOCK_SHADOW=YES
 set S02_POST_EXIT_OBSERVATION_SEC=900
 REM Owner-approved 2026-08-12: market/day gate is not part of Strategy 02 live behavior.
-set S02_DAYGATE=NO
+set S02_DAYGATE=YES
 set ONLY_MF_ALLOW=STRATEGY02
 set SAFEPLUS_MIN_PRICE=10000
 cd /d C:\stock_bot\RUN

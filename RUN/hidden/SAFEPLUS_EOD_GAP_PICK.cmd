@@ -1,4 +1,8 @@
 @echo off
+REM 2026-08-27 owner-approved repair. Keep live disabled until saved-input replay passes.
+set EOD_GAP_LIVE=NO
+set EOD_GAP_MIN_SCORE=60
+set EOD_GAP_MAX_SCORE=70
 REM 2026-07-22 sweep (10 trading days, prices_1m_clean): strategy-A upper-wick cap
 REM   0.25 -> 0.50. Evidence: with jeongbae OFF sample, win 45%->54%, avg -0.39->+0.07;
 REM   with jeongbae ON (current) wick value changes nothing (5 passes at any cap),
@@ -10,13 +14,19 @@ REM 2026-08-18 owner-approved closing-auction upgrade. Capture real FID 23/24/21
 REM first; switch to LIVE with MAX_POS=3 only after a saved-input PROD_REPLAY PASS.
 set EOD_GAP_AUCTION_GATE_MODE=SHADOW
 REM 2026-08-18 owner-approved live configuration for the 2026-08-19 run.
-REM Buy up to three names; limit-up names remain capped at one share each.
-set EOD_GAP_MAX_POS=1
+REM Owner-approved permanent automatic live gate: one share each, up to three names.
+set EOD_GAP_MAX_POS=3
 set EOD_GAP_LOCKED_QTY_ONE=YES
-REM Saved-input replay is not yet available. Owner approved one-share observation
-REM for five trading sessions (2026-08-19 through 2026-08-25).
-set EOD_GAP_LOCKED_D2_PRIORITY=YES
-set EOD_GAP_LOCKED_D2_PRIORITY_UNTIL=20260825
+set EOD_GAP_QTY_ONE_ALL=YES
+set EOD_GAP_LOCKED_FIRST=NO
+set EOD_GAP_LOCKED_PRIORITY=NO
+set EOD_GAP_BOARD_CACHE_FALLBACK=YES
+set EOD_GAP_BOARD_MAX_AGE_SEC=600
+REM 2026-08-27 owner-approved candidate-path cleanup.
+set EOD_GAP_VR_MIN=0
+set EOD_GAP_LIMITUP_ADD=NO
+set EOD_GAP_LOCKED_D2_PRIORITY=NO
+set EOD_GAP_CAPTURE_INPUTS=YES
 REM 2026-07-29 owner order: exempt closing-auction buys from the regime stop.
 REM   Evidence (daily bars, 1 year, 1134 limit-up closes, sell at next open,
 REM   0.38%% round-trip cost removed): crash days (market -3%% or worse)
@@ -25,12 +35,12 @@ REM   The old "wiped out on crash days" note was based on 8 samples only.
 REM   Intraday strategies S01-S05 stay blocked - do NOT add them here.
 REM   Rollback: delete this line.
 set REGIME_STOP_EXEMPT=EODGAP_
-REM 2026-08-20 owner in-session order: lift the 10,000 KRW floor for EOD_GAP only.
-REM   Evidence: 2026-08-19 15:25 both picks (6,760 / 5,380) died at price_floor while
-REM   backtest says low-scored cheap limit-ups earn 3.4x more (Q1 +12.49%% vs Q5 +3.67%%).
-REM   Scoped here so every other strategy keeps the global user-env 10,000 floor.
-REM   1,000 keeps the 2026-06-30 "no sub-1000 KRW penny stocks" rule intact.
-REM   NOTE gateway second net still inherits 10,000 until its own fix deploys.
-REM   Rollback: delete the next line.
-set SAFEPLUS_MIN_PRICE=1000
+REM Match the already-running broker gateway safety floor before candidate selection.
+set SAFEPLUS_MIN_PRICE=10000
+set SAFEPLUS_MIN_MARKETCAP=100000000000
+REM Fail closed: only a previous-trading-day, current-engine PROD_REPLAY PASS enables orders.
+C:\python310\python.exe -X utf8 C:\stock_bot\RUN\eod_gap_live_executor_v1.py entry_replay_auto >> C:\stock_bot\data\LOG\eod_gap_live.log 2>&1
+if errorlevel 1 goto EOD_GAP_PICK_RUN
+set EOD_GAP_LIVE=YES
+:EOD_GAP_PICK_RUN
 C:\python310\python.exe -X utf8 C:\stock_bot\RUN\eod_gap_live_executor_v1.py pick >> C:\stock_bot\data\LOG\eod_gap_live.log 2>&1

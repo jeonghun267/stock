@@ -122,9 +122,14 @@ def decide(
 
 def _task_enabled(task_name: str = TASK_NAME) -> bool:
     try:
+        # ★[ENC-FIX 2026-08-26] schtasks 출력은 cp949 인데 가드가 UTF-8 환경으로
+        #   돌면 text=True 기본 디코딩이 UnicodeDecodeError 로 죽어 S02·S03 생존
+        #   판정이 통째로 빠졌다(8/26 sched_S05_SIGNAL_GUARD.log 실측, byte 0xc1).
+        #   판정에 쓰는 문자열(<Enabled>false</Enabled>)은 ASCII 라 replace 안전.
         xml = subprocess.run(
             ["schtasks", "/query", "/tn", task_name, "/xml"],
             capture_output=True, text=True, timeout=15,
+            encoding="cp949", errors="replace",
         ).stdout
         return "<Enabled>false</Enabled>" not in xml
     except (OSError, subprocess.TimeoutExpired):
@@ -146,6 +151,7 @@ def _guard_one(label: str, sig_path: Path, task_name: str,
     r = subprocess.run(
         ["schtasks", "/run", "/tn", task_name],
         capture_output=True, text=True, timeout=30,
+        encoding="cp949", errors="replace",     # ★[ENC-FIX 2026-08-26] 위와 동일
     )
     out = (r.stdout or r.stderr or "").strip().replace("\n", " ")[:120]
     print(f"[{stamp}] {label} RESTART — {reason} → schtasks /run rc={r.returncode} {out}",

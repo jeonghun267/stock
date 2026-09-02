@@ -275,8 +275,12 @@ RANGE_KEYS = (
     "hr_money_speed_ratio", "hr_turnover_pct", "hr_volatility_quality",
     "hr_quality_risks", "hr_live_status",
 )
-# ★[2026-07-31 친구님 지시 "전략 2하고 3부터 고저폭으로 좁혀줘"]
-#   S02 감시대상을 고저폭 TOP30(hr_rank 가 실린 종목)으로 제한한다.
+MONEY_FLOW_KEYS = (
+    "mf_inst", "mf_frgn", "mf_prog", "mf_che", "mf_chg",
+)
+S02_CANDIDATE_LIMIT = 50
+# ★[2026-08-27 사용자 승인] S02 감시대상은 고저폭·돈흐름 선별판 합집합 최대 50개.
+#   두 판에 모두 든 종목을 먼저 두고, 나머지는 고저폭 순위·돈흐름 순으로 채운다.
 #   근거 — 일봉 1년 코스닥 전수(12만건·왕복비용 0.38% 차감)로 S02 진입을 근사
 #   (당일 저가 +1% 매수 → 당일 종가 매도) 했을 때:
 #       고저폭 조건 밖   +1.251% / 승률 58.8%  (11.4만건)
@@ -287,11 +291,48 @@ RANGE_KEYS = (
 #       2.4배 크고, 다음날에도 10%↑ 로 움직일 확률이 12.5% → 72.0% 라서다.
 #   ⚠️같은 자료에서 "시가 매수 → 당일 종가"(S01 급상승 근사)는 고저폭을 붙이면
 #     오히려 나빠진다(-0.75% → -1.47%). 저점에서 사는 전략에만 유효한 제한이다.
-#   안전장치: 고저폭 목록이 통째로 비면(08:40 생성 실패 등) 제한을 걸지 않는다
-#     — 안 그러면 전 종목이 차단된다(fail-open).
+#   안전장치: 두 후보 소스가 모두 비면 전건 차단한다(fail-closed).
+#   기존 환경변수 이름은 호환을 위해 유지한다.
 #   롤백: setx S02_HIGH_RANGE_ONLY NO + 신호기 재기동
 #         또는 backup\strategy_02_low_buy_signal_v1_20260731_hronly.py 복원
 HIGH_RANGE_ONLY = os.environ.get("S02_HIGH_RANGE_ONLY", "YES").strip().upper() == "YES"
+
+
+def _select_candidate_codes(
+    watch: Mapping[str, Any],
+    candidate_meta: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    """고저폭·돈흐름 선별판 합집합을 최대 50개로 제한한다."""
+    source_tags = watch.get("source_tags") or {}
+    high_range_codes = {
+        code for code, meta in candidate_meta.items()
+        if meta.get("hr_rank") is not None
+    }
+    money_flow_codes = {
+        str(code).zfill(6)
+        for code, tags in source_tags.items()
+        if "moneyflow_selector" in set(tags or [])
+    }
+
+    def money_score(code: str) -> float:
+        meta = candidate_meta.get(code) or {}
+        return sum(max(0.0, _number(meta.get(key))) for key in (
+            "mf_inst", "mf_frgn", "mf_prog",
+        ))
+
+    def high_rank(code: str) -> int:
+        rank = _number((candidate_meta.get(code) or {}).get("hr_rank"), 9999)
+        return int(rank) if rank > 0 else 9999
+
+    overlap = high_range_codes & money_flow_codes
+    high_only = high_range_codes - overlap
+    money_only = money_flow_codes - overlap
+    ordered = (
+        sorted(overlap, key=lambda code: (high_rank(code), -money_score(code), code))
+        + sorted(high_only, key=lambda code: (high_rank(code), code))
+        + sorted(money_only, key=lambda code: (-money_score(code), code))
+    )
+    return ordered[:S02_CANDIDATE_LIMIT]
 
 # ★[ADAPTIVE-BOTTOM 2026-08-20 사용자 상시 승인]
 # FAST: 강세장 + 직접반등 + 시장대비 약세비율<=0.25 + 저점대비<=1.5%.
@@ -313,9 +354,9 @@ ADAPTIVE_WEAK_MIN_OBSERVE_SEC = 300.0
 #   롤백: setx S02_DAY_LOW_MAX_GAP_PCT 999 (사실상 해제) 후 신호기 재시작
 try:
     DAY_LOW_MAX_GAP_PCT = float(
-        os.environ.get("S02_DAY_LOW_MAX_GAP_PCT", "2.0"))
+        os.environ.get("S02_DAY_LOW_MAX_GAP_PCT", "4.0"))
 except (TypeError, ValueError):
-    DAY_LOW_MAX_GAP_PCT = 2.0
+    DAY_LOW_MAX_GAP_PCT = 4.0
 
 
 def _adaptive_regime_group(band: str) -> str:
@@ -661,15 +702,20 @@ def load_live_points(
         if not isinstance(meta, Mapping):
             continue
         picked = {
-            key: meta[key] for key in RANGE_KEYS if meta.get(key) is not None
+            key: meta[key]
+            for key in RANGE_KEYS + MONEY_FLOW_KEYS
+            if meta.get(key) is not None
         }
         if picked:
             prev_close = _number(meta.get("prev_close"))
             if prev_close > 0:
                 picked["hr_prev_close"] = prev_close
             range_meta[str(meta_code).zfill(6)] = picked
-    if HIGH_RANGE_ONLY and not range_meta:
-        return [], "HIGH_RANGE_META_MISSING", len(codes), {}
+    if HIGH_RANGE_ONLY:
+        selected_codes = _select_candidate_codes(watch, range_meta)
+        if not selected_codes:
+            return [], "CANDIDATE_META_MISSING", len(codes), {}
+        codes = set(selected_codes)
     snapshot = _read_json(config.snapshot_path)
     names = _name_map(_read_json(config.names_path))
     output: list[tuple[str, str, MarketPoint]] = []
@@ -677,10 +723,9 @@ def load_live_points(
         code = str(code).zfill(6)
         if code not in codes or not isinstance(raw, Mapping):
             continue
-        # ★[S02-DATA-FAIL-CLOSED 2026-08-23 사용자 승인]
-        # 고저폭 목록이 통째로 없으면 위에서 전건 차단하고, 일부만 있으면
-        # 메타가 확인된 종목만 관찰한다.
-        if HIGH_RANGE_ONLY and code not in range_meta:
+        # ★[S02-DATA-FAIL-CLOSED 2026-08-27 사용자 승인]
+        # 고저폭·돈흐름 선별판 합집합에서 우선순위 상위 50개만 관찰한다.
+        if HIGH_RANGE_ONLY and code not in codes:
             continue
         # S01/S03의 신호만으로 S02 관찰을 중단하지 않는다. 실제 중복 주문은
         # 엔진의 계좌 보유·미체결·공용 슬롯 검사에서 주문 직전에 차단한다.
@@ -2148,7 +2193,9 @@ class LowBuySignalMonitor:
             (point.price / state.session_low - 1) * 100
             if state.session_low > 0 else None
         )
-        if _day_low_gap is None or not (_day_low_gap <= DAY_LOW_MAX_GAP_PCT):
+        if DAY_LOW_MAX_GAP_PCT < 999.0 and (
+            _day_low_gap is None or not (_day_low_gap <= DAY_LOW_MAX_GAP_PCT)
+        ):
             blocked = self._wait_row(
                 code, name, point,
                 "S02_DAY_LOW_MISSING" if _day_low_gap is None
@@ -2469,7 +2516,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
-    lock_path = Path(r"C:\stock_bot\data\strategy_02_signal_v1.lock")
+    lock_path = Path(os.environ.get(
+        "S02_LOCK_PATH", r"C:\stock_bot\data\strategy_02_signal_v1.lock"))
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_handle = lock_path.open("a+")
     try:
@@ -2480,6 +2528,13 @@ def main() -> int:
         msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
         lock_handle.close()
+        # 2026-08-27: 종전에는 잠금을 못 잡으면 아무 말 없이 종료해, 프로세스는 살아 있는데
+        # 산출물만 0 인 '조용사'로 보였다(8/27 09:41 실전 41분 정지의 진단을 어렵게 만든 원인).
+        # 종료코드 0 은 그대로 두고(태스크 판정 불변) 사유만 남긴다.
+        print(
+            f"S02_SIGNAL_SINGLETON_LOCK_BUSY lock={lock_path} "
+            "- another S02 signal process holds it; this one exits without running.",
+            file=sys.stderr, flush=True)
         return 0
     try:
         return run(SignalConfig(), once=args.once)

@@ -4,7 +4,7 @@
   "_근본차단": "태스크 RunLevel 을 Limited 로 낮추는 것. 관리자 셸에서만 된다. 브로커 계열 3개(PIPELINE_0900·WATCHDOG_BROKER·BROKER_NIGHT_STOP)는 브로커를 죽이고 살려야 해서 Highest 가 필요하다.",
   "_다시만들기": "C:\\python310\\python.exe C:\\stock_bot\\RUN\\morning_preflight_rehearsal_v1.py --rebaseline-elevated",
   "_주의": "일부러 고친 뒤에만 다시 만들 것. 먼저 다시 만들고 나중에 확인하면 검사가 무의미해진다.",
-  "생성": "2026-08-25T22:42:29",
+  "생성": "2026-09-02T08:27:14",
   "파일": {
     "RUN\\_run_hidden_wait.vbs": "c0ac14545cc05ce19b58106922dbf0189bf226d8296d43ded14f4bcc8f48266e",
     "RUN\\broker_night_stop.ps1": "415e983374a11e6ec1f17b27f301147675b0ec253b1ca9d9d7f696d05db80a71",
@@ -13,14 +13,14 @@
     "RUN\\hidden\\SAFEPLUS_PREFLIGHT_SELFTEST_HIGH.cmd": "ec1932bd3e85c9287b0c089f0b695b46ba7ee5be63e32690c00b4221aea15b2a",
     "RUN\\hidden\\SAFEPLUS_STRATEGY_ALL_PREFLIGHT.cmd": "82c043da48155fe6b36315f3589bf3af54fabda2a8f2a35494a635a69fe2dff4",
     "RUN\\hidden\\SAFEPLUS_STRATEGY_COMMON_CONTEXT.cmd": "35c1c1926a2ff56c3aaab2eb1fe24883dc2e4793be7bf0918bd979bff8481cc4",
-    "RUN\\hidden\\SAFEPLUS_STRATEGY01_LIVE.cmd": "ac856b14415110c5f9ad590b6a45d0d30b70f65fb667ba92c77892c122ec9852",
-    "RUN\\hidden\\SAFEPLUS_STRATEGY01_SIGNAL.cmd": "7d3aa3b64c7b4c2ae752bacb958e6e33f6946309a9b7b9414f436f79f2acdd90",
-    "RUN\\hidden\\SAFEPLUS_STRATEGY02_LIVE.cmd": "5cd1b383e7003366b564f437b716085205cbad68df367f94f60fbb905607b9c8",
-    "RUN\\hidden\\SAFEPLUS_STRATEGY02_SIGNAL.cmd": "d0dc21f9cf7d9c3cb36e03681f9bf4b041a28d4151277f4e34cfd55a09eb4e84",
-    "RUN\\hidden\\SAFEPLUS_STRATEGY03_LIVE_ASCII.cmd": "31f785a728e1797a226f6d7d21d84f6c98494786eb691bfba9409b839f1f786b",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY01_LIVE.cmd": "ae4d47b5d85125accdfb9da073cd35214023ecd1c9e16b1942e56920080359de",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY01_SIGNAL.cmd": "9a53fe18c3db5e5a221d03a64462700d47fcb245bf03ff52feb4f36288b44b0c",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY02_LIVE.cmd": "b43df7c12644b671fa8a3ce02607ae147a4a029f642d2e5b307b5e12feb886ab",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY02_SIGNAL.cmd": "a49fe4d1b5ada732234ea0da80875c141308cd92b8baa3441a0cd78d6e4bc20f",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY03_LIVE_ASCII.cmd": "43e0d4d9b5b68f146e4d79e59c4799ebbbbfac70257884518563b561ecf8493d",
     "RUN\\hidden\\SAFEPLUS_STRATEGY03_PREFLIGHT.cmd": "f0ac896aeb6ca1572dfe5059dcdadd08f11fba8eefb6bcf43c8aff1d5662ddf5",
-    "RUN\\hidden\\SAFEPLUS_STRATEGY03_SIGNAL_ASCII.cmd": "c27611c64c3b9355a07bab0bc3378828239a5ffe5a3371c7b3076fbc5e12b181",
-    "RUN\\broker_gateway_v1.py": "4c9e8094611879db8045ee66afe4fcd9185ee898264674fee5ffe19c0039866b",
+    "RUN\\hidden\\SAFEPLUS_STRATEGY03_SIGNAL_ASCII.cmd": "25d63593c7cc4ec0ecaf947767ddd94531f648e2eddda8f03cd953bc34c15d28",
+    "RUN\\broker_gateway_v1.py": "3d3c9b59fac3e764594fdbfc9362cc91e5d8bf1df99a0272655eeffbcd318f64",
     "RUN\\ipc_order_auth_v1.py": "1af31e9e12e40e17d4415f6baff4afb17bc098fd00f60514623e4a7592d218eb"
   }
 }

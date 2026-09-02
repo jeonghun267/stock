@@ -106,6 +106,18 @@ If two runs disagree, do not select the preferred result. State that the results
   no daily reapproval. A fixed duration applies only when the owner specified
   it. Existing hard stops, force exit, shadow comparison, and audit recording
   must remain enabled.
+- Bootstrap exception (owner-only) [2026-09-02 owner-added]: for a brand-new
+  strategy whose first live day has no preserved production inputs (so no
+  prior capture can exist and the `[PROD_REPLAY]` gate is structurally
+  impossible to pass), the owner may explicitly authorize, in the current
+  conversation, a one-day substitution of the replay gate — naming the
+  strategy, the exact mechanism, the quantity, and the single date. The
+  substitution must be date-stamped, auto-expiring, loudly logged as
+  `[UNVERIFIED]`, and every other protection (approved-hash verification,
+  hard stops, force exit, capture, audit recording) must remain enabled.
+  From the next trading day the normal `[PROD_REPLAY]` gate applies again.
+  This does not upgrade evidence provenance; it records an owner-accepted
+  risk under honest labeling.
 
 ## 6. Final truth check
 

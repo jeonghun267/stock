@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import timedelta, time as day_time
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 RUN_DIR = Path(__file__).resolve().parents[1] / "RUN"
@@ -80,6 +81,51 @@ def quiet_logger() -> logging.Logger:
 
 
 class Strategy01RotationV2Tests(unittest.TestCase):
+
+    def test_pullback_failure_requires_low_break_and_sell_reacceleration(self) -> None:
+        position = {
+            "entry_stage": "PULLBACK",
+            "entry_stages": ["PULLBACK"],
+            "pullback_reference_low": 100.0,
+        }
+        failed = SimpleNamespace(
+            price=Decimal("99.9"),
+            sell_money_per_sec_10s=Decimal("130"),
+            sell_money_per_sec_30s=Decimal("100"),
+            buy_money_per_sec_10s=Decimal("80"),
+        )
+        self.assertEqual(
+            Strategy01Engine._pullback_failure_reason(position, failed),
+            "PULLBACK_LOW_BREAK_SELL_REACCEL",
+        )
+        recovered = SimpleNamespace(
+            price=Decimal("99.9"),
+            sell_money_per_sec_10s=Decimal("90"),
+            sell_money_per_sec_30s=Decimal("100"),
+            buy_money_per_sec_10s=Decimal("110"),
+        )
+        self.assertEqual(
+            Strategy01Engine._pullback_failure_reason(position, recovered), "",
+        )
+
+    def test_pullback_stale_board_uses_price_only_emergency_exit(self) -> None:
+        position = {
+            "entry_stage": "PULLBACK",
+            "entry_stages": ["PULLBACK"],
+            "pullback_reference_low": 100.0,
+        }
+        self.assertEqual(
+            Strategy01Engine._pullback_stale_board_failure_reason(
+                position, {"price": 99.7},
+            ),
+            "PULLBACK_STALE_BOARD_LOW_BREAK_0P3",
+        )
+        self.assertEqual(
+            Strategy01Engine._pullback_stale_board_failure_reason(
+                position, {"price": 99.8},
+            ),
+            "",
+        )
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -250,6 +296,29 @@ class Strategy01RotationV2Tests(unittest.TestCase):
         self.assertEqual(broker.submissions[0]["quantity"], 1)
         self.assertEqual(engine._active_positions()[code]["qty"], 1)
 
+    def test_rocket_and_pullback_each_use_three_slots_and_one_share(self) -> None:
+        codes = [f"11{index:04d}" for index in range(7)]
+        stages = {
+            code: ["ROCKET" if index < 4 else "PULLBACK"]
+            for index, code in enumerate(codes)
+        }
+        self.write_market(
+            codes, {code: 10_000 for code in codes}, self.now, stages=stages,
+        )
+        engine, broker = self.engine(self.config(quantity=2))
+
+        engine.tick(self.now)
+
+        active = engine._active_positions()
+        self.assertEqual(len(active), 6)
+        self.assertEqual(
+            sum(row["entry_stage"] == "ROCKET" for row in active.values()), 3,
+        )
+        self.assertEqual(
+            sum(row["entry_stage"] == "PULLBACK" for row in active.values()), 3,
+        )
+        self.assertEqual([row["quantity"] for row in broker.submissions], [1] * 6)
+
     def test_staged_signals_buy_one_share_then_add_one_share(self) -> None:
         code = "100097"
         engine, broker = self.engine(self.config(quantity=2))
@@ -394,14 +463,24 @@ class Strategy01RotationV2Tests(unittest.TestCase):
         code = "500001"
         self.write_market([code], {code: 10_000}, self.now)
         self.write_ma3_seed([code], 10_000)
+        regime_path = self.root / "kosdaq_index.json"
+        regime_path.write_text(
+            json.dumps({"ts": self.now.isoformat()}), encoding="utf-8",
+        )
         broker = FakeBroker(real=True, status="TIMEOUT")
         engine, _ = self.engine(self.config(live=True), broker)
 
-        engine.tick(self.now)
+        with patch(
+            "strategy_01_rotation_engine_v2.S01_KOSDAQ_INDEX_PATH", regime_path,
+        ):
+            engine.tick(self.now)
         self.assertTrue(engine.state["recovery_blocked"])
         self.assertEqual(len(broker.submissions), 1)
 
-        engine.tick(self.now + timedelta(seconds=1))
+        with patch(
+            "strategy_01_rotation_engine_v2.S01_KOSDAQ_INDEX_PATH", regime_path,
+        ):
+            engine.tick(self.now + timedelta(seconds=1))
         self.assertFalse(engine.state["recovery_blocked"])
         self.assertEqual(len(broker.submissions), 1)
         self.assertEqual(engine._active_positions(), {})
@@ -410,10 +489,18 @@ class Strategy01RotationV2Tests(unittest.TestCase):
     def test_real_buy_is_blocked_when_ma3_seed_is_missing(self) -> None:
         code = "500002"
         self.write_market([code], {code: 10_000}, self.now)
+        regime_path = self.root / "kosdaq_index.json"
+        regime_path.write_text(
+            json.dumps({"ts": self.now.isoformat()}), encoding="utf-8",
+        )
         broker = FakeBroker(real=True, status="OK")
         engine, _ = self.engine(self.config(live=True), broker)
 
-        with patch("strategy_01_rotation_engine_v2.ma3_request_missing_history") as request:
+        with patch(
+            "strategy_01_rotation_engine_v2.S01_KOSDAQ_INDEX_PATH", regime_path,
+        ), patch(
+            "strategy_01_rotation_engine_v2.ma3_request_missing_history",
+        ) as request:
 
             engine.tick(self.now)
 
@@ -569,6 +656,13 @@ class Strategy01RotationV2Tests(unittest.TestCase):
     def test_order_lifecycle_links_signal_to_order_zero_fill(self) -> None:
         code = "600004"
         self.write_market([code], {code: 10_000}, self.now)
+        signal_payload = json.loads(
+            self.config().signal_path.read_text(encoding="utf-8"),
+        )
+        signal_payload["signals"][0]["price"] = 9_900
+        self.config().signal_path.write_text(
+            json.dumps(signal_payload), encoding="utf-8",
+        )
         engine, _ = self.engine(self.config())
 
         engine.tick(self.now)
@@ -596,6 +690,10 @@ class Strategy01RotationV2Tests(unittest.TestCase):
         self.assertEqual(fill["fill_source"], "ORDER_ZERO")
         self.assertTrue(fill["fill_reconciled_at"])
         self.assertEqual(fill["signal_snapshot"]["code"], code)
+        self.assertEqual(fill["signal_emitted_price"], 9_900)
+        self.assertEqual(fill["arrival_price"], 10_000)
+        self.assertAlmostEqual(fill["arrival_chase_bps"], 101.0101)
+        self.assertEqual(fill["fill_slippage_bps"], 0.0)
         self.assertEqual(
             set(fill["production_files"]),
             {"engine", "signal_contract", "signal_source", "order_adapter"},
@@ -611,6 +709,159 @@ class Strategy01RotationV2Tests(unittest.TestCase):
                 claimed,
                 hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
             )
+
+    def test_lane_daily_distinct_limit_records_fills_and_blocks_fourth(self) -> None:
+        first_three = ["710001", "710002", "710003"]
+        self.write_market(
+            first_three,
+            {code: 10_000 for code in first_three},
+            self.now,
+            stages={code: ["PULLBACK"] for code in first_three},
+        )
+        engine, broker = self.engine(self.config())
+
+        engine.tick(self.now)
+
+        self.assertEqual(
+            engine.state["entered_codes_by_lane"]["PULLBACK"],
+            first_three,
+        )
+        for position in engine._active_positions().values():
+            position["phase"] = "CLOSED"
+        engine._cleanup_terminal()
+
+        fourth = "710004"
+        observed_at = self.now + timedelta(seconds=1)
+        self.write_market(
+            [fourth], {fourth: 10_000}, observed_at,
+            stages={fourth: ["PULLBACK"]},
+        )
+        engine.tick(observed_at)
+
+        self.assertEqual(len(broker.submissions), 3)
+        event_text = "".join(
+            path.read_text(encoding="utf-8-sig")
+            for path in engine.config.event_dir.glob("*.csv")
+        )
+        self.assertIn("PULLBACK_DAILY_CODE_LIMIT_3", event_text)
+
+    def test_lane_daily_limit_allows_same_code_reentry(self) -> None:
+        code = "720001"
+        self.write_market(
+            [code], {code: 10_000}, self.now,
+            stages={code: ["ROCKET"]},
+        )
+        engine, broker = self.engine(self.config())
+        engine.state["entered_codes"] = [code, "720002", "720003"]
+        engine.state["cycles_by_code"] = {code: 1}
+        engine.state["entered_codes_by_lane"]["ROCKET"] = [
+            code, "720002", "720003",
+        ]
+
+        engine.tick(self.now)
+
+        self.assertEqual(len(broker.submissions), 1)
+        self.assertIn(code, engine._active_positions())
+
+    def test_lane_daily_codes_restore_from_legacy_same_day_state(self) -> None:
+        config = self.config()
+        engine, _ = self.engine(config)
+        payload = engine._blank_state(self.now.strftime("%Y%m%d"))
+        payload["history"] = [
+            {
+                "code": "730001", "phase": "CLOSED",
+                "entry_at": self.now.isoformat(),
+                "entry_stage": "PULLBACK",
+            },
+            {
+                "code": "730002", "phase": "CLOSED",
+                "entry_at": self.now.isoformat(),
+                "entry_stage": "ROCKET",
+                "entry_stages": ["ROCKET", "PULLBACK"],
+            },
+        ]
+        payload.pop("entered_codes_by_lane", None)
+        config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        restored, _ = self.engine(config)
+
+        self.assertEqual(
+            restored.state["entered_codes_by_lane"],
+            {
+                "ROCKET": ["730002"],
+                "PULLBACK": ["730001", "730002"],
+            },
+        )
+
+    def test_order_lifecycle_keeps_missing_prices_as_none(self) -> None:
+        engine, _ = self.engine(self.config())
+        position = {
+            "code": "740001",
+            "signal_snapshot": {},
+            "signal_price": 0,
+            "pending": {},
+        }
+
+        engine._order_lifecycle(
+            "BUY_FILL_CONFIRMED", position, fill_price=0,
+            observed_at=self.now,
+        )
+
+        audit_file = next(
+            engine.config.order_lifecycle_root.glob(
+                "*/s01_order_lifecycle.jsonl"
+            )
+        )
+        row = json.loads(
+            audit_file.read_text(encoding="utf-8").splitlines()[-1],
+        )
+        self.assertEqual(row["signal_emitted_price"], 0.0)
+        self.assertEqual(row["arrival_price"], 0.0)
+        self.assertIsNone(row["arrival_chase_bps"])
+        self.assertIsNone(row["fill_slippage_bps"])
+
+    def test_rejected_or_timeout_buy_does_not_consume_lane_daily_code(self) -> None:
+        original_root = self.root
+        try:
+            for status, code in (("REJECTED", "750001"), ("TIMEOUT", "750002")):
+                with self.subTest(status=status):
+                    self.root = original_root / status.lower()
+                    self.root.mkdir(parents=True, exist_ok=True)
+                    self.write_market(
+                        [code], {code: 10_000}, self.now,
+                        stages={code: ["PULLBACK"]},
+                    )
+                    broker = FakeBroker(status=status)
+                    broker.buy_allowed = True
+                    engine, _ = self.engine(self.config(), broker)
+
+                    engine.tick(self.now)
+
+                    self.assertEqual(len(broker.submissions), 1)
+                    self.assertEqual(
+                        engine.state["entered_codes_by_lane"]["PULLBACK"],
+                        [],
+                    )
+        finally:
+            self.root = original_root
+
+    def test_lane_daily_codes_reset_on_next_trading_date(self) -> None:
+        config = self.config()
+        engine, _ = self.engine(config)
+        previous_day = (kst_now() - timedelta(days=1)).strftime("%Y%m%d")
+        payload = engine._blank_state(previous_day)
+        payload["entered_codes_by_lane"] = {
+            "ROCKET": ["760001"],
+            "PULLBACK": ["760002"],
+        }
+        config.state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        restored, _ = self.engine(config)
+
+        self.assertEqual(
+            restored.state["entered_codes_by_lane"],
+            {"ROCKET": [], "PULLBACK": []},
+        )
 
 if __name__ == "__main__":
     unittest.main()

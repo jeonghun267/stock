@@ -548,6 +548,11 @@ class HoldSellConfig:
     s01_ma5_trend_hold_active_date: Optional[str] = (
         os.environ.get("S01_MA5_TREND_HOLD_DATE") or None
     )
+    # S01 defense grace is audit-only.  It never changes the returned action,
+    # sell latch, order key, or rule ordering.
+    s01_defense_grace_sec: int = int(
+        os.environ.get("S01_DEFENSE_GRACE_SEC", "30") or "30"
+    )
     # ★[S02-MA-HOLD 2026-08-14 친구님 지시 "실전에 바로 연결하자 / 그림자는 내가 관리를 못해"]
     #   S02 에도 같은 MA5 추세보류를 준다. 근거(감사기록 5거래일·22건 실측):
     #     S02 는 팔고 나서 평균적으로 더 올랐다 —
@@ -948,6 +953,12 @@ class UnifiedHoldSellEngine:
     ) -> HoldSellDecision:
         state_before = state.to_dict()
         decision = self._evaluate_once(state, observation)
+        decision = self._s01_defense_grace_shadow(
+            state,
+            observation,
+            decision,
+            was_sell_latched=bool(state_before.get("sell_latched")),
+        )
         self.audit_recorder.record(
             state_before=state_before,
             observation=observation,
@@ -955,6 +966,45 @@ class UnifiedHoldSellEngine:
             state_after=state.to_dict(),
         )
         return decision
+
+    def _s01_defense_grace_shadow(
+        self,
+        state: HoldSellState,
+        observation: HoldSellObservation,
+        decision: HoldSellDecision,
+        *,
+        was_sell_latched: bool,
+    ) -> HoldSellDecision:
+        """Record whether a 30-second S01 defense grace would have held."""
+        if state.strategy_id is not StrategyId.S01_OPEN_SURGE:
+            return decision
+        age_sec = max(
+            0.0,
+            (observation.observed_at - state.entry_at).total_seconds(),
+        )
+        defense_exit = bool(
+            decision.should_sell
+            and decision.reason.startswith((
+                "COMMON_PEAK_FLOW_",
+                "COMMON_FLOW_DEFENSE_",
+            ))
+        )
+        grace_would_hold = bool(
+            not was_sell_latched
+            and age_sec < self.config.s01_defense_grace_sec
+            and defense_exit
+        )
+        metadata = dict(decision.metadata)
+        metadata.update({
+            "s01_defense_grace_shadow": True,
+            "s01_defense_grace_sec": self.config.s01_defense_grace_sec,
+            "s01_entry_age_sec": age_sec,
+            "grace_would_hold": grace_would_hold,
+            "actual_action": decision.action.value,
+            "actual_reason": decision.reason,
+            "actual_should_sell": decision.should_sell,
+        })
+        return replace(decision, metadata=metadata)
 
     def _evaluate_once(
         self,

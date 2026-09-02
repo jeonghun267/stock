@@ -251,6 +251,7 @@ def detect_base_breakout(
     base_n: int = 30,
     tight_pct: float = 3.0,
     min_volx: float = 6.0,
+    max_close_drift_pct: float = 1.0,
 ) -> dict[str, float] | None:
     rows = list(bars)
     if len(rows) < base_n + 1:
@@ -263,9 +264,11 @@ def detect_base_breakout(
     if base_low <= 0 or average_volume <= 0:
         return None
     range_pct = (base_high / base_low - 1.0) * 100.0
+    close_drift_pct = abs(base[-1].close / base[0].close - 1.0) * 100.0
     volx = current.volume / average_volume
     if (
         range_pct > tight_pct
+        or close_drift_pct > max_close_drift_pct
         or current.close <= current.open
         or current.close <= base_high
         or volx < min_volx
@@ -275,6 +278,7 @@ def detect_base_breakout(
         "base_high": base_high,
         "base_low": base_low,
         "base_range_pct": range_pct,
+        "base_close_drift_pct": close_drift_pct,
         "breakout_volx": volx,
         "breakout_close": current.close,
     }
@@ -1198,7 +1202,19 @@ def run(config: SignalConfig, *, once: bool = False) -> int:
         now = datetime.now(KST).replace(tzinfo=None)
         day = now.strftime("%Y%m%d")
         leaders = _leaders_current_day(_read_json(config.leaders_path), day)
-        range_meta = _range_meta(_read_json(config.shared_watch_path))
+        shared_payload = _read_json(config.shared_watch_path)
+        range_meta = _range_meta(shared_payload)
+        # ★[BOARD-UNION 2026-08-26 친구님 지시 "5번도 고저폭·돈흐름 2개 다 봐야"]
+        #   종전 유니버스는 live_leaders(돈맥 리더, 당일 09:00 1회 기록·이후 동결)
+        #   뿐이라 고저폭판을 못 봤다. 이미 매 루프 읽는 통합기 공유 감시목록
+        #   (고저폭판+돈흐름판 합본, 당일분)을 합집합으로 더한다. 겹치는 종목은
+        #   dict.fromkeys 로 한 번만. EOD 가격필터(eligible)는 종전대로 전체 적용.
+        #   되돌리기: backup\strategy_05_base_breakout_signal_v1_20260826_before_board_union.py
+        shared_codes = (
+            [str(c).zfill(6) for c in (shared_payload.get("codes") or [])]
+            if str(shared_payload.get("for_date") or "") == day else []
+        )
+        leaders = list(dict.fromkeys(leaders + shared_codes))
 
         minute = _read_json(config.minute_path)
         minute_ts = _parse_dt(minute.get("ts"))

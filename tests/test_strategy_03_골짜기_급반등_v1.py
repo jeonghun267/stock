@@ -6,6 +6,7 @@ import logging
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -16,6 +17,7 @@ if str(RUN) not in sys.path:
 
 
 from strategy_01_rotation_engine_v2 import kst_now
+import strategy_03_rotation_engine_v1 as s03_rotation
 from strategy_03_rotation_engine_v1 import (
     Strategy03Engine,
     Strategy03HoldSellEngine,
@@ -45,6 +47,7 @@ from 골짜기_급반등 import (
     load_live_points,
     load_prior_profile_universe,
     _minute_opens,
+    _strategy03_board_codes,
 )
 
 
@@ -145,28 +148,19 @@ class Strategy03RapidReboundTests(unittest.TestCase):
         )
 
     def rapid_points(self) -> list[MicroPoint]:
-        # ★[SPEED-GATE 2026-08-03] 새 규칙에 맞춰 시나리오 교체.
-        #   옛 시나리오는 매수가 9,855 = 저점(9,700) 대비 +1.598% 로, 좁아진 매수구간
-        #   (+1.0~+1.5%) 밖이라 더는 체결되지 않는다. 60초 관찰도 사라졌다.
-        #   새 흐름: 저점 → 1차반등 +1.03% → 눌림(더 높은 저점) → 2차반등 +0.53%
-        #            → 저점 +1.13% 에서 매수. 그 사이 매수속도가 매도속도를 앞선다.
-        #   앞 3개(10,050/9,900/9,700)는 그대로 둔다 — [:3] 을 쓰는 다른 시험들이 있다.
+        # -4%~-8% 미만에서 신저점을 계속 갱신한 뒤 매도속도 2단 감속,
+        # 연속 2틱 상승, 매도호가 2회 감소를 확인해 +1~2%에서 진입한다.
         return [
             self.point(0, 10_050, 0, 0, ask_px=10_060, bid_px=10_050,
-                       ask_qty=110, bid_qty=80),
-            self.point(20, 9_900, 100, 500, ask_px=9_910, bid_px=9_900,
-                       ask_qty=100, bid_qty=80),
-            self.point(40, 9_700, 200, 1_500, ask_px=9_710, bid_px=9_700,
-                       ask_qty=100, bid_qty=80),
-            # 1차반등 +1.03% → OBSERVE 진입
-            self.point(50, 9_800, 300, 1_520, ask_px=9_810, bid_px=9_800,
-                       ask_qty=80, bid_qty=120),
-            # 눌림 0.43% · 더 높은 저점(원저점 +0.60%)
-            self.point(60, 9_758, 400, 1_540, ask_px=9_768, bid_px=9_758,
-                       ask_qty=80, bid_qty=120),
-            # 2차반등 +0.53% · 저점 후 매수속도가 매도속도를 크게 앞섬 → 매수
-            self.point(70, 9_810, 900, 1_600, ask_px=9_820, bid_px=9_810,
-                       ask_qty=40, bid_qty=200),
+                       ask_qty=500, bid_qty=1_000),
+            self.point(20, 9_950, 100, 500, ask_px=9_960, bid_px=9_950,
+                       ask_qty=400, bid_qty=1_000),
+            self.point(40, 9_900, 200, 1_500, ask_px=9_910, bid_px=9_900,
+                       ask_qty=300, bid_qty=1_000),
+            self.point(50, 9_950, 205, 1_700, ask_px=9_960, bid_px=9_950,
+                       ask_qty=200, bid_qty=1_000),
+            self.point(60, 10_020, 210, 1_800, ask_px=10_030, bid_px=10_020,
+                       ask_qty=100, bid_qty=1_000),
         ]
 
     def make_signal(self) -> dict:
@@ -194,33 +188,19 @@ class Strategy03RapidReboundTests(unittest.TestCase):
             "signals": [row],
         }
 
-    def test_s06_staircase_retest_signals_on_buy_speed_lead(self) -> None:
-        """★[SPEED-GATE 2026-08-03] 시간 관찰(60초) 대신 저점 후 매수속도 우위로 판정.
-
-        계단 재테스트 4단계(1차반등·눌림·더높은저점·2차반등)는 그대로 지킨다 —
-        신저점 찾기가 이 전략의 핵심이라 버리지 않았다.
-        """
+    def test_open_seller_exhaustion_direct_enters_without_buy_dominance(self) -> None:
         row = self.make_signal()
-        self.assertEqual(
-            row["reason"],
-            "S06_STAIRCASE+PULLBACK+HIGHER_LOW+SECOND_REBOUND+BUY_SPEED_LEAD")
+        self.assertEqual(row["reason"], "S03_OPEN_SELLER_EXHAUSTION_DIRECT")
         self.assertEqual(row["dip_low_reset_steps"], 2)
-        # 1차 반등 문턱은 1.5 → 1.0 (좁아진 매수구간에 4단계를 넣기 위한 값)
-        self.assertGreaterEqual(row["first_rebound_pct"], 1.0)
-        # 계단 재테스트 3단계는 종전 그대로 유지된다
-        self.assertGreaterEqual(row["pullback_depth_pct"], 0.4)
-        self.assertGreaterEqual(row["higher_low_pct"], 0.3)
-        self.assertGreaterEqual(row["second_rebound_pct"], 0.5)
-        # 매수구간 저점 +1.0~+1.5%
         self.assertGreaterEqual(row["rebound_pct"], 1.0)
-        self.assertLessEqual(row["rebound_pct"], 1.5)
-        # 판정 근거는 저점 후 매수속도 > 매도속도
-        self.assertGreater(row["post_buy_rate"], row["post_sell_rate"])
+        self.assertLessEqual(row["rebound_pct"], 2.0)
+        self.assertTrue(row["seller_exhaustion_fast"]["ready"])
+        self.assertLess(row["post_buy_rate"], row["post_sell_rate"])
 
     def test_no_time_gate_buys_before_sixty_seconds(self) -> None:
         """60초를 채우지 않아도 산다 — 8/3 실전에서 관찰하다 가격이 달아난 문제."""
         row = self.make_signal()
-        self.assertLess(row["observe_sec"], 60.0)
+        self.assertLess(row["dip_flow_obs_sec"], 60.0)
 
     def test_flow_flip_and_accel_are_recorded_not_gates(self) -> None:
         """흐름 자료가 비어도 매수가 막히지 않는다(8/3 fail-closed 로 하루 0건).
@@ -243,19 +223,19 @@ class Strategy03RapidReboundTests(unittest.TestCase):
         for point in self.rapid_points()[:3]:
             detector.feed(point, self.profile, allow_signal=True)
         small = self.point(
-            43, 9_730, 230, 1_520,
-            ask_px=9_740, bid_px=9_730, ask_qty=80, bid_qty=120)
+            43, 9_940, 230, 1_520,
+            ask_px=9_950, bid_px=9_940, ask_qty=80, bid_qty=120)
         row = detector.feed(small, self.profile, allow_signal=True)
         self.assertEqual(row["action"], "WAIT")
-        self.assertEqual(row["reason"], "STAIRCASE_CHASING_LOW")
+        self.assertEqual(row["reason"], "OPEN_DIRECT_REBOUND_ENTRY_RANGE_WAIT")
 
     def test_above_two_percent_chase_cap_waits_for_new_low(self) -> None:
         detector = RapidReboundDetector()
         for point in self.rapid_points()[:3]:
             detector.feed(point, self.profile, allow_signal=True)
         late = self.point(
-            45, 9_900, 300, 1_550,
-            ask_px=9_910, bid_px=9_900, ask_qty=80, bid_qty=120)
+            45, 10_110, 300, 1_550,
+            ask_px=10_120, bid_px=10_110, ask_qty=80, bid_qty=120)
         row = detector.feed(late, self.profile, allow_signal=True)
         self.assertEqual(row["action"], "WAIT")
         self.assertEqual(row["reason"], "ABOVE_CHASE_CAP")
@@ -266,7 +246,7 @@ class Strategy03RapidReboundTests(unittest.TestCase):
         for point in self.rapid_points()[:3]:
             rows.append(detector.feed(point, self.profile, allow_signal=True))
         self.assertEqual([row["action"] for row in rows], ["ARMED", "RESET", "RESET"])
-        self.assertEqual(rows[-1]["reason"], "NEW_LOW_STAIRCASE_RESET")
+        self.assertEqual(rows[-1]["reason"], "OPEN_NEW_LOW_RESET")
         self.assertEqual(rows[-1]["dip_low_reset_steps"], 2)
 
     def test_open_drop_uses_open_price_and_missing_open_fails_closed(self) -> None:
@@ -297,25 +277,27 @@ class Strategy03RapidReboundTests(unittest.TestCase):
         rows = [detector.feed(point, self.profile, allow_signal=True)
                 for point in self.rapid_points()]
         self.assertEqual([row["action"] for row in rows[:4]],
-                         ["ARMED", "RESET", "RESET", "OBSERVE"])
+                         ["ARMED", "RESET", "RESET", "WAIT"])
         self.assertEqual(rows[-1]["action"], "BUY_READY")
-        self.assertEqual(rows[-1]["anchor_low"], 9_700)
+        self.assertEqual(rows[-1]["anchor_low"], 9_900)
+        self.assertTrue(rows[-1]["s03_first_seen_ts"])
+        self.assertTrue(rows[-1]["stable_pass_ts"])
+        self.assertTrue(rows[-1]["signal_ts"])
+        self.assertLessEqual(
+            datetime.fromisoformat(rows[-1]["stable_pass_ts"]),
+            datetime.fromisoformat(rows[-1]["signal_ts"]),
+        )
         self.assertGreater(rows[-1]["drop_from_open_pct"], -8.0)
         self.assertLessEqual(rows[-1]["drop_from_open_pct"], -4.0)
 
-    def test_below_minus_8_keeps_chasing_and_old_restore_does_not_block(self) -> None:
-        """★[S03-EXPRESS 2026-08-06 친구님 지시 "09:20까지만 급락을 잡고 이후는 6번"]
-        -8% S06 인계 폐지 — 창 안에서는 깊이 제한 없이 신저점을 계속 쫓는다.
-        옛 저장분(인계 사유)을 복원해도 추적이 막히지 않는다.
-        근거: 8/6 씨어스(458870) 인계 구멍 — S06 감시망에 없어 아무도 저점을 못 잡았다."""
+    def test_minus_8_or_deeper_remains_in_s03_open_crash(self) -> None:
         detector = RapidReboundDetector()
-        armed = detector.feed(
+        detector.feed(
             self.point(0, 10_050, 0, 0, ask_px=10_060, bid_px=10_050,
                        ask_qty=100, bid_qty=80),
             self.profile,
             allow_signal=True,
         )
-        self.assertEqual(armed["action"], "ARMED")
         deep = detector.feed(
             self.point(1, 9_660, 0, 100, ask_px=9_670, bid_px=9_660,
                        ask_qty=100, bid_qty=80),
@@ -323,34 +305,51 @@ class Strategy03RapidReboundTests(unittest.TestCase):
             allow_signal=True,
         )
         self.assertEqual(deep["action"], "RESET")
-        self.assertEqual(deep["reason"], "NEW_LOW_STAIRCASE_RESET")
-        deeper = detector.feed(
-            self.point(2, 9_000, 0, 200, ask_px=9_010, bid_px=9_000,
-                       ask_qty=100, bid_qty=80),
-            self.profile,
-            allow_signal=True,
-        )
-        self.assertEqual(deeper["reason"], "NEW_LOW_STAIRCASE_RESET")
+        self.assertEqual(deep["reason"], "OPEN_NEW_LOW_RESET")
+        self.assertLessEqual(deep["anchor_drop_from_open_pct"], -8.0)
 
-        rebound = self.point(
-            3, 9_700, 50, 120,
-            ask_px=9_710, bid_px=9_700, ask_qty=80, bid_qty=100)
+    def test_buy_ready_fails_closed_when_priority_claim_is_not_held(self) -> None:
         monitor = RapidReboundMonitor()
-        monitor.restore({
-            "schema": SIGNAL_SCHEMA,
-            "date": self.now.strftime("%Y%m%d"),
-            "signals": [],
-            "candidates": [{
-                "code": "123456",
-                "entry_lane": "OPEN_CRASH",
-                "reason": "OPEN_DROP_LE_8PCT_HANDOFF_S06",
-            }],
-        }, self.now.strftime("%Y%m%d"))
-        restored, fired = monitor.process_point(
-            "123456", "TEST", rebound, self.profile, allow_signal=True)
+        row = {}
+        fired = False
+        with (
+            unittest.mock.patch(
+                "골짜기_급반등.crash_claim.enabled", return_value=True),
+            unittest.mock.patch(
+                "골짜기_급반등.crash_claim.try_claim_s03",
+                return_value="ERROR",
+            ),
+        ):
+            for point in self.rapid_points():
+                row, fired = monitor.process_point(
+                    "123456", "TEST", point, self.profile, allow_signal=True)
+
         self.assertFalse(fired)
-        self.assertNotEqual(restored["reason"], "OPEN_DROP_LE_8PCT_HANDOFF_S06")
-        self.assertEqual(restored["action"], "ARMED")
+        self.assertEqual(row["action"], "WAIT")
+        self.assertEqual(row["reason"], "S03_CRASH_CLAIM_NOT_HELD")
+
+    def test_two_tick_sell_reacceleration_discards_low(self) -> None:
+        detector = RapidReboundDetector()
+        rows = [
+            self.point(0, 10_050, 0, 0, ask_px=10_060, bid_px=10_050,
+                       ask_qty=500, bid_qty=1_000),
+            self.point(20, 9_950, 100, 500, ask_px=9_960, bid_px=9_950,
+                       ask_qty=400, bid_qty=1_000),
+            self.point(40, 9_900, 200, 1_500, ask_px=9_910, bid_px=9_900,
+                       ask_qty=300, bid_qty=1_000),
+            self.point(50, 10_000, 220, 1_600, ask_px=10_010, bid_px=10_000,
+                       ask_qty=250, bid_qty=1_000),
+            self.point(60, 10_050, 230, 1_800, ask_px=10_060, bid_px=10_050,
+                       ask_qty=200, bid_qty=1_000),
+            self.point(70, 10_080, 235, 2_200, ask_px=10_090, bid_px=10_080,
+                       ask_qty=150, bid_qty=1_000),
+        ]
+        row = {}
+        for point in rows:
+            row = detector.feed(point, self.profile, allow_signal=True)
+        self.assertEqual(row["action"], "WAIT")
+        self.assertEqual(
+            row["reason"], "SELL_REACCEL_BUY_WEAK_2TICKS_WAIT_NEW_LOW")
 
     def test_minute_open_requires_today_and_positive_price(self) -> None:
         today = self.now.strftime("%Y%m%d")
@@ -363,6 +362,34 @@ class Strategy03RapidReboundTests(unittest.TestCase):
         }
         self.assertEqual(_minute_opens(payload, today), {"123456": 10_500.0})
         self.assertEqual(_minute_opens(payload, "19990101"), {})
+
+    def test_board_universe_is_high_range_plus_moneyflow_dump(self) -> None:
+        day = self.now.strftime("%Y%m%d")
+        high_range = {
+            "schema_version": 2,
+            "for_date": day,
+            "source_stale": False,
+            "candidates": [
+                {"rank": 1, "code": "123456"},
+                {"rank": 2, "code": "234567"},
+            ],
+        }
+        moneyflow = {
+            "ts": self.now.isoformat(),
+            "rows": [
+                {"code": "345678", "grade": "🔴던짐"},
+                {"code": "456789", "grade": "🔵매도세"},
+                {"code": "567890", "grade": "🟢매수세"},
+            ],
+        }
+        self.assertEqual(
+            _strategy03_board_codes(high_range, moneyflow, day),
+            {"123456", "234567", "345678", "456789"},
+        )
+        self.assertNotIn(
+            "567890",
+            _strategy03_board_codes(high_range, moneyflow, day),
+        )
 
     def test_open_lane_keeps_tracking_below_absolute_min_price(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -419,8 +446,8 @@ class Strategy03RapidReboundTests(unittest.TestCase):
                 point, best_ask_px=0, best_bid_px=0,
                 best_ask_qty=0, best_bid_qty=0),
                 self.profile, allow_signal=True)
-        self.assertEqual(row["action"], "BUY_READY")
-        self.assertGreater(row["post_buy_rate"], row["post_sell_rate"])
+        self.assertEqual(row["action"], "WAIT")
+        self.assertEqual(row["reason"], "OPEN_SELLER_EXHAUSTION_WAIT")
 
     def test_cumulative_reverse_resets(self) -> None:
         detector = RapidReboundDetector()
@@ -448,7 +475,7 @@ class Strategy03RapidReboundTests(unittest.TestCase):
         not_deep = replace(
             self.rapid_points()[-1],
             ts=self.rapid_points()[-1].ts + timedelta(seconds=1),
-            price=9_650,
+            price=9_850,
             buy_money_cum=1_010,
             sell_money_cum=1_860,
         )
@@ -473,10 +500,41 @@ class Strategy03RapidReboundTests(unittest.TestCase):
                 tzinfo=None).isoformat()
         self.assertEqual(
             select_fresh_signals(stale, now=decision_now, max_age_sec=5), [])
-        handoff = self.signal_payload()
-        handoff["signals"][0]["drop_from_open_pct"] = -8.0
+        # -8% 이상도 이제 OPEN_CRASH 소유이므로 계약이 통과시킨다.
+        deep = self.signal_payload()
+        deep["signals"][0]["anchor_drop_from_open_pct"] = -8.0
+        self.assertEqual(len(select_fresh_signals(
+            deep, now=decision_now, max_age_sec=5)), 1)
+        deeper = self.signal_payload()
+        deeper["signals"][0]["anchor_drop_from_open_pct"] = -12.5
+        self.assertEqual(len(select_fresh_signals(
+            deeper, now=decision_now, max_age_sec=5)), 1)
+
+    def test_only_open_and_intraday_lanes_survive_contract_and_restore(self) -> None:
+        payload = self.signal_payload()
+        early = dict(payload["signals"][0])
+        early.update({
+            "code": "654321",
+            "entry_lane": "EARLY_LOW",
+            "algorithm": "S03_EARLY_60S_REBOUND_V1",
+        })
+        payload["signals"].insert(0, early)
+        decision_now = (
+            datetime.fromisoformat(payload["updated_at"]) + timedelta(seconds=1)
+        )
+
+        selected = select_fresh_signals(
+            payload, now=decision_now, max_age_sec=5
+        )
         self.assertEqual(
-            select_fresh_signals(handoff, now=decision_now, max_age_sec=5), [])
+            {row["entry_lane"] for row in selected}, {"OPEN_CRASH"}
+        )
+
+        monitor = RapidReboundMonitor()
+        monitor.restore(payload, self.now.strftime("%Y%m%d"))
+        self.assertEqual(
+            {row["entry_lane"] for row in monitor.signals}, {"OPEN_CRASH"}
+        )
 
     def test_order_recheck_blocks_chase_and_fresh_sell_dominance(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -547,12 +605,12 @@ class Strategy03RapidReboundTests(unittest.TestCase):
             config.snapshot_path.write_text(json.dumps({"codes": {"123456": {
                 "ts": stamp,
                 "ob_ts": stamp,
-                "cur": 9_810,
+                "cur": 10_020,
                 "cum_vol": 100_000,
-                "buy_money_cum": 1_500,
-                "sell_money_cum": 1_650,
-                "best_ask_px": 9_820,
-                "best_bid_px": 9_810,
+                "buy_money_cum": 220,
+                "sell_money_cum": 1_805,
+                "best_ask_px": 10_030,
+                "best_bid_px": 10_020,
                 "best_ask_qty": 40,
                 "best_bid_qty": 200,
             }}}), encoding="utf-8")
@@ -580,7 +638,15 @@ class Strategy03RapidReboundTests(unittest.TestCase):
                 signal_selector=make_strategy03_signal_selector(
                     config.snapshot_path, config.snapshot_max_age_sec),
             )
-            engine.tick(datetime.fromisoformat(stamp) + timedelta(seconds=1))
+            # ★[PRICE-FLOOR-FIXTURE 2026-08-26] 이 테스트의 목적은 신호→회전
+            #   라우팅이다. 공유 픽스처가 9,700원대라 나중에 생긴 실전 하한
+            #   S03_ORDER_MIN_PRICE(1만원)에 걸려 0건이 되므로, 여기서만 하한을
+            #   픽스처 아래로 내려 라우팅만 검증한다(하한 게이트 동작 자체는
+            #   실전 드롭로그 S03_PRICE_BELOW_10000 으로 별도 확인).
+            with unittest.mock.patch.object(
+                    s03_rotation, "S03_ORDER_MIN_PRICE", 9_000.0):
+                engine.tick(
+                    datetime.fromisoformat(stamp) + timedelta(seconds=1))
             self.assertEqual(len(broker.submissions), 1)
             self.assertEqual(config.slot_owner, "STRATEGY03")
             self.assertEqual(config.max_daily_codes, 6)

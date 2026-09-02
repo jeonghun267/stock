@@ -145,6 +145,15 @@ try:
 except (TypeError, ValueError):
     HR_MICRO_CAP = 50
 
+# [MFLOW-SUPPLY 2026-08-28] Deep-bottom candidates use an independent screen;
+# the shared 200-code lane remains byte-for-byte unchanged in behavior.
+MFLOW_WATCH_FILE = IPC_DIR / "micro_watch_moneyflow_deep.json"
+MFLOW_SCREEN = "9249"
+try:
+    MFLOW_MICRO_CAP = max(0, min(90, int(os.environ.get("MFLOW_MICRO_CAP", "90"))))
+except (TypeError, ValueError):
+    MFLOW_MICRO_CAP = 90
+
 # ★[2026-08-01 친구님 승인 "①② 둘 다 만들어줘"] 실시간 시세 지연 실측 ① — 키움서버→우리 PC 구간.
 #   발단: 매도 실측 25건에서 체결가가 신호가보다 평균 -0.136%(최악 -1.084%)인데 플러스도 10건
 #         섞여 있다 = 호가 스프레드만이 아니라 '시간이 흘렀다'는 뜻.
@@ -923,6 +932,7 @@ class BrokerGateway:
         # 유실시킨다. 한 번의 IPC poll pass가 끝날 때까지 중첩 poll을 막는다.
         self._poll_in_progress = False
         self._urgent_order_poll_in_progress = False
+        self._processing_request_ids: set[str] = set()
         # [Z2 2026-05-14] state replay — SetRealReg 등록 상태 영속화
         # key = screen_no, value = {"code_list": "035720;...", "fid_list": "10;13;...", "real_type": "0", "ts": ...}
         self._realreg_state: dict = {}
@@ -1153,12 +1163,13 @@ class BrokerGateway:
 
             # 디버그 로그 (주요 필드만)
             logger_chejan.info(
-                "event_id=%s order_no=%s state=%s code=%s qty=%s remain=%s otype=%s",
+                "event_id=%s order_no=%s state=%s code=%s qty=%s fill_px=%s remain=%s otype=%s",
                 event_id,
                 fid_data.get("9203", ""),
                 fid_data.get("913", ""),
                 fid_data.get("9001", ""),
                 fid_data.get("911", ""),
+                fid_data.get("910", ""),
                 fid_data.get("902", ""),
                 fid_data.get("905", ""),
             )
@@ -1320,6 +1331,7 @@ class BrokerGateway:
     # and starve the TR/order queue.
     _micro_watch_file_cache: dict = {}
     _hr_watch_codes: list = []      # ★[2026-07-30] 고저폭 전용 통로 등록 상태
+    _mflow_watch_codes: list = []   # [2026-08-28] 돈맥 깊은바닥 전용 통로
     _micro_screens: list = []         # 현재 실시간 등록에 쓰고 있는 화면번호(줄었을 때 해제용)
     _micro_screen_codes: dict = {}    # screen -> 실제 등록 코드; 증감분 갱신/검증용
     _micro_last_upd: dict = {}        # code -> last update epoch ms (per-code throttle)
@@ -1467,6 +1479,29 @@ class BrokerGateway:
                 seen.add(c)
                 out.append(c)
             if len(out) >= HR_MICRO_CAP:
+                break
+        return out
+
+    def _read_moneyflow_watch(self):
+        """Read today's deep-bottom watch list for the isolated MFLOW screen."""
+        if MFLOW_MICRO_CAP <= 0:
+            return []
+        try:
+            data = json.loads(MFLOW_WATCH_FILE.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return []
+        watch_date = str(
+            data.get("for_date")
+            or str(data.get("ts") or "")[:10].replace("-", ""))
+        if watch_date != datetime.now().strftime("%Y%m%d"):
+            return []
+        out, seen = [], set()
+        for raw_code in data.get("codes") or []:
+            code = str(raw_code).zfill(6)
+            if len(code) == 6 and code not in seen:
+                seen.add(code)
+                out.append(code)
+            if len(out) >= MFLOW_MICRO_CAP:
                 break
         return out
 
@@ -1867,6 +1902,25 @@ class BrokerGateway:
                                 len(hr_codes), HR_SCREEN, ret)
             except Exception as e:
                 logger.error("[HR-MICRO] 등록 실패: %s", e)
+            try:
+                mflow_codes = self._read_moneyflow_watch()
+                mflow_changed = (
+                    len(mflow_codes) != len(self._mflow_watch_codes)
+                    or set(mflow_codes) != set(self._mflow_watch_codes)
+                )
+                if mflow_changed:
+                    if mflow_codes:
+                        ret = self.ocx.dynamicCall(
+                            "SetRealReg(QString, QString, QString, QString)",
+                            MFLOW_SCREEN, ";".join(mflow_codes), MICRO_FIDS, "0")
+                    else:
+                        ret = self.ocx.dynamicCall(
+                            "DisconnectRealData(QString)", MFLOW_SCREEN)
+                    self._mflow_watch_codes = list(mflow_codes)
+                    logger.info("[MFLOW-MICRO] 깊은바닥 전용 %d종목 등록 (screen=%s) ret=%s",
+                                len(mflow_codes), MFLOW_SCREEN, ret)
+            except Exception as e:
+                logger.error("[MFLOW-MICRO] 등록 실패: %s", e)
             self._micro_flush()
             # ★[LAT-PROBE 2026-08-01] 지연 계측 버퍼를 1초 1회 CSV 로 흘린다. 자체 try 격리 —
             #   계측이 죽어도 위의 시세 flush 는 이미 끝난 뒤라 영향이 없다.
@@ -2081,12 +2135,49 @@ class BrokerGateway:
         self._tr_screen_seq = seq
         return f"{7000 + seq:04d}"
 
+    @staticmethod
+    def _wait_qt_interval(delay_ms: int) -> None:
+        """Wait without blocking the OCX event thread."""
+        wait_loop = QEventLoop()
+        QTimer.singleShot(delay_ms, wait_loop.quit)
+        wait_loop.exec_()
+
+    def _get_logged_accounts_with_retry(
+            self, attempts: int = 3, interval_ms: int = 200) -> set[str]:
+        """Retry only a transient blank ACCNO response; OCX errors still fail closed."""
+        for attempt in range(attempts):
+            raw_accounts = str(
+                self.ocx.dynamicCall("GetLoginInfo(QString)", "ACCNO")
+            ).strip()
+            logged_accounts = {
+                item.strip().replace("-", "")
+                for item in raw_accounts.split(";") if item.strip()
+            }
+            if logged_accounts:
+                return logged_accounts
+            if attempt + 1 < attempts:
+                self._wait_qt_interval(interval_ms)
+        return set()
+
     def process_request(self, req_path: Path):
         """단일 IPC request 처리 (TTL 검사 → dispatch → 삭제)."""
         request_id = req_path.stem
+        processing_ids = getattr(self, "_processing_request_ids", None)
+        if processing_ids is None:
+            processing_ids = set()
+            self._processing_request_ids = processing_ids
+        guard_acquired = False
         try:
             req = json.loads(req_path.read_text(encoding="utf-8-sig"))
             request_id = req.get("request_id", request_id)
+            if request_id in processing_ids:
+                logger.critical(
+                    "[IPC-REQUEST-REENTRY] duplicate processing blocked request_id=%s path=%s",
+                    request_id, req_path.name,
+                )
+                return
+            processing_ids.add(request_id)
+            guard_acquired = True
             req_type   = req.get("type", "")
             ts_str     = req.get("ts", "")
             ttl        = int(req.get("ttl_sec", self.DEFAULT_TTL_SEC))
@@ -2262,6 +2353,9 @@ class BrokerGateway:
                 req_path.unlink(missing_ok=True)
             except Exception:
                 pass
+        finally:
+            if guard_acquired:
+                processing_ids.discard(request_id)
 
     # [STEP-2F-1 + I1 2026-05-14] read-only 잔고 TR whitelist — SendOrder 금지
     # [I1] 미체결(opt10075) + 주식잔고(opw00009) 추가
@@ -3316,13 +3410,7 @@ class BrokerGateway:
                 return
             qty = adjusted_qty
         try:
-            raw_accounts = str(
-                self.ocx.dynamicCall("GetLoginInfo(QString)", "ACCNO")
-            ).strip()
-            logged_accounts = {
-                item.strip().replace("-", "")
-                for item in raw_accounts.split(";") if item.strip()
-            }
+            logged_accounts = self._get_logged_accounts_with_retry()
         except Exception as exc:
             self._write_response(
                 request_id, status="ERROR",

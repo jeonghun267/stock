@@ -76,7 +76,7 @@ STRATEGIES = (
     {
         "number": "02",
         "id": "S02_LOW_BUY_SELL_EXHAUSTION",
-        "name": "저점매수·매도소진",
+        "name": "저점매수",
         "state": "strategy_02_rotation_state_v1.json",
         "signal": "strategy_02_low_buy_signal_v1.json",
         "events": "strategy_02_rotation_v1",
@@ -271,6 +271,8 @@ def load_strategy(meta: dict[str, str], now: dt.datetime, names: dict[str, str])
         entered_codes = [code for code, count in cycles.items() if integer(count) > 0]
 
     ready_signals = 0
+    watch_count = 0
+    capture_count = 0
     if isinstance(signal, dict) and str(signal.get("date") or "") == day:
         rows = signal.get("signals") or []
         if isinstance(rows, list):
@@ -278,6 +280,24 @@ def load_strategy(meta: dict[str, str], now: dt.datetime, names: dict[str, str])
                 1 for row in rows
                 if isinstance(row, dict) and row.get("action") == "BUY_READY"
             )
+        candidates = signal.get("candidates") or []
+        if not isinstance(candidates, list):
+            candidates = []
+        watch_count = integer(signal.get("watch_count"))
+        if watch_count <= 0:
+            watch_count = len(candidates)
+        capture_count = len(candidates)
+
+    chase = state.get("chase") if current_state else {}
+    if isinstance(chase, dict) and chase:
+        if watch_count <= 0:
+            watch_count = len(chase)
+        active_chase = sum(
+            1 for item in chase.values()
+            if isinstance(item, dict) and str(item.get("phase") or "") in {"CHASE", "OBSERVE"}
+        )
+        if meta["number"] == "06":
+            capture_count = active_chase
 
     last_error = str(state.get("last_error") or "") if current_state else ""
     if last_error.startswith("MA3_SEED_NOT_READY:"):
@@ -296,6 +316,8 @@ def load_strategy(meta: dict[str, str], now: dt.datetime, names: dict[str, str])
         "entered_count": len({str(code).zfill(6) for code in entered_codes}),
         "cycles_total": sum(max(0, integer(value)) for value in cycles.values()),
         "order_attempts": integer(state.get("order_attempts_total")) if current_state else 0,
+        "watch_count": watch_count,
+        "capture_count": capture_count,
         "ready_signals": ready_signals,
         "recovery_blocked": bool(state.get("recovery_blocked")) if current_state else False,
         "last_error": last_error,
@@ -511,6 +533,35 @@ def load_fills(
     return result
 
 
+def load_eod_gap_holdings(now: dt.datetime, fills: dict[str, Any]) -> list[dict[str, Any]]:
+    """Show only EOD_GAP positions that also exist in today's broker fill ledger."""
+    payload = read_json(DATA / "eod_gap_positions.json", {})
+    if not isinstance(payload, dict):
+        return []
+    day = now.strftime("%Y%m%d")
+    eod_positions = {
+        str(code or "").zfill(6): position
+        for code, position in payload.items()
+        if isinstance(position, dict)
+        and str(position.get("date") or "") == day
+        and position.get("live") is True
+        and str(position.get("status") or "") in {"PENDING", "OPEN"}
+    }
+    output: list[dict[str, Any]] = []
+    for position in fills.get("net") or []:
+        code = str(position.get("code") or "").zfill(6)
+        meta = eod_positions.get(code)
+        if not meta:
+            continue
+        output.append({
+            "code": code,
+            "name": str(meta.get("name") or position.get("name") or code),
+            "qty": integer(position.get("qty")),
+            "status": str(meta.get("status") or ""),
+        })
+    return output
+
+
 def load_preflight_selftests(current: dt.datetime) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for profile, strategies, filename in PREFLIGHT_SELFTESTS:
@@ -549,11 +600,13 @@ def build_snapshot(now: dt.datetime | None = None) -> dict[str, Any]:
     strategies = [load_strategy(meta, current, names) for meta in STRATEGIES]
     events, source_by_code = load_strategy_events(current)
     events = filter_current_events(events, strategies)
+    fills = load_fills(current, names, source_by_code)
     return {
         "now": current,
         "strategies": strategies,
         "slots": load_shared_slots(current),
-        "fills": load_fills(current, names, source_by_code),
+        "fills": fills,
+        "eod_gap_holdings": load_eod_gap_holdings(current, fills),
         "events": events,
         "preflight_selftests": load_preflight_selftests(current),
         "manual_block": (CONFIG / "manual_buy_block.flag").exists(),
@@ -575,7 +628,8 @@ def render_text(snapshot: dict[str, Any]) -> str:
         lines.append(
             f"  전략 {strategy['number']} {strategy['name']:<12} "
             f"{strategy['gate']:<5} | {strategy['heartbeat']} | "
-            f"신호 {strategy['ready_signals']} | 당일종목 "
+            f"감시 {strategy['watch_count']} | 포착 {strategy['capture_count']} | "
+            f"매수준비 {strategy['ready_signals']} | 당일종목 "
             f"{strategy['entered_count']}/{strategy['daily_cap']} | "
             f"완료회전 {strategy['cycles_total']} | 보유 {held}{alert}"
         )
@@ -588,6 +642,11 @@ def render_text(snapshot: dict[str, Any]) -> str:
                 f"{position['qty']}주 {fmt_number(position['entry'])}→"
                 f"{fmt_number(position['current'])} {sign}{position['pnl']:.2f}%"
             )
+    for position in snapshot.get("eod_gap_holdings") or []:
+        lines.append(
+            f"  종가매수 {position['name']}({position['code']}) "
+            f"{position['qty']}주 [BROKER_FILL] 보유"
+        )
     lines.extend(["", f"[공용 슬롯] {len(snapshot['slots'])}/6 점유"])
     if snapshot["slots"]:
         for slot in snapshot["slots"]:
@@ -657,10 +716,12 @@ def _status_class(strategy: dict[str, Any]) -> str:
 def render_html(snapshot: dict[str, Any]) -> str:
     now = snapshot["now"]
     parts = [
+        '<div><a href="돈흐름도.html">💰 돈맥 선별판 열기</a></div>',
         f'<div class="clock">스톡봇 통합 중계 <b>{now:%Y-%m-%d %H:%M:%S}</b></div>',
         "<h2>전략 1·2·3·4·5·6 상태</h2>",
         "<table><tr><th>전략</th><th>게이트</th><th>심장박동</th>"
-        "<th>신호</th><th>당일종목</th><th>완료회전</th><th>보유</th></tr>",
+        "<th>감시</th><th>포착</th><th>매수준비</th><th>당일종목</th>"
+        "<th>완료회전</th><th>보유</th></tr>",
     ]
     for strategy in snapshot["strategies"]:
         cls = _status_class(strategy)
@@ -669,6 +730,8 @@ def render_html(snapshot: dict[str, Any]) -> str:
             f"{html.escape(strategy['name'])}</td>"
             f"<td class=\"{cls}\">{strategy['gate']}</td>"
             f"<td class=\"{cls}\">{html.escape(strategy['heartbeat'])}</td>"
+            f"<td>{strategy['watch_count']}</td>"
+            f"<td>{strategy['capture_count']}</td>"
             f"<td>{strategy['ready_signals']}</td>"
             f"<td>{strategy['entered_count']}/{strategy['daily_cap']}</td>"
             f"<td>{strategy['cycles_total']}</td>"
@@ -676,9 +739,31 @@ def render_html(snapshot: dict[str, Any]) -> str:
         )
         if strategy["last_error"]:
             parts.append(
-                f'<tr><td></td><td colspan="6" class="down">'
+                f'<tr><td></td><td colspan="8" class="down">'
                 f'{html.escape(strategy["last_error"])}</td></tr>'
             )
+    board = read_json(DATA / "돈흐름_선별판.json", {})
+    money_rows = board.get("rows") if isinstance(board, dict) else []
+    money_rows = money_rows if isinstance(money_rows, list) else []
+    money_stamp = parse_local(board.get("ts")) if isinstance(board, dict) else None
+    money_age = max(0.0, (now - money_stamp).total_seconds()) if money_stamp else None
+    if money_age is None:
+        money_heartbeat, money_cls = "자료 없음", "down"
+    elif money_age <= 90:
+        money_heartbeat, money_cls = f"정상 {money_age:.0f}초전", "up"
+    else:
+        money_heartbeat, money_cls = f"멈춤 의심 {money_age / 60:.0f}분전", "down"
+    money_buys = sum(
+        "매수세" in str(row.get("grade") or "")
+        for row in money_rows if isinstance(row, dict)
+    )
+    money_univ = integer(board.get("univ")) if isinstance(board, dict) else 0
+    parts.append(
+        f'<tr><td class="nm">돈맥</td><td>선별판</td>'
+        f'<td class="{money_cls}">{money_heartbeat}</td>'
+        f'<td>{money_univ}</td><td>{len(money_rows)}</td>'
+        f'<td>매수세 {money_buys}</td><td>-</td><td>-</td><td>-</td></tr>'
+    )
     parts.append("</table>")
 
     parts.append("<h2>장전 3단계 검증</h2>")
@@ -728,7 +813,8 @@ def render_html(snapshot: dict[str, Any]) -> str:
         for strategy in snapshot["strategies"]
         for position in strategy["held"]
     ]
-    if held_rows:
+    eod_holdings = snapshot.get("eod_gap_holdings") or []
+    if held_rows or eod_holdings:
         parts.append("<table>")
         for strategy, position in held_rows:
             pnl_cls = "up" if position["pnl"] >= 0 else "down"
@@ -741,6 +827,15 @@ def render_html(snapshot: dict[str, Any]) -> str:
                 f"<td>{fmt_number(position['entry'])}→{fmt_number(position['current'])}</td>"
                 f"<td class=\"{pnl_cls} big\">{sign}{position['pnl']:.2f}%</td>"
                 f"<td class=\"dim\">{html.escape(position['phase'])}</td></tr>"
+            )
+        for position in eod_holdings:
+            parts.append(
+                f'<tr><td>종가매수</td>'
+                f'<td class="nm">{html.escape(position["name"])}</td>'
+                f'<td class="dim">{html.escape(position["code"])}</td>'
+                f'<td>{position["qty"]}주</td>'
+                f'<td colspan="2" class="up">[BROKER_FILL] 보유</td>'
+                f'<td class="dim">{html.escape(position["status"])}</td></tr>'
             )
         parts.append("</table>")
     else:

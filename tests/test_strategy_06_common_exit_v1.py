@@ -248,6 +248,17 @@ class Strategy06ExitWiringTest(unittest.TestCase):
         second = HoldSellState.from_dict(self.hold_states()[f"{CODE}:1"])
         self.assertEqual(first.last_observed_at, second.last_observed_at)
 
+    def test_pre_entry_snapshot_is_skipped(self) -> None:
+        position = self.make_position()
+        self.engine._confirm_entry(position, 1, 23000.0, self.now, shadow=True)
+        self.snapshot(22000.0, at=self.now - timedelta(seconds=1))
+
+        self.engine._evaluate_exit(position, self.now)
+
+        state = HoldSellState.from_dict(self.hold_states()[f"{CODE}:1"])
+        self.assertEqual(position["phase"], "HOLD")
+        self.assertIsNone(state.last_observed_at)
+
     def test_incomplete_input_holds_instead_of_selling(self) -> None:
         """진입가가 없는 손상 포지션은 판정 보류 — 주문을 내지 않는다."""
         position = {

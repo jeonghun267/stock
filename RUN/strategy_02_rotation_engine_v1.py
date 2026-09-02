@@ -36,7 +36,11 @@ from strategy_01_rotation_engine_v2 import (
 from strategy_02_signal_contract_v1 import select_fresh_signals
 from strategy_02_six_second_shadow_v1 import Strategy02SixSecondShadow
 from strategy_02_trend_lock_shadow_v1 import Strategy02TrendLockShadow
-from strategy_common_hold_sell_v1 import StrategyId
+from strategy_common_hold_sell_v1 import (
+    HoldSellAction,
+    HoldSellDecision,
+    StrategyId,
+)
 from strategy_common_reentry_gate_v1 import LossReentryGate
 
 
@@ -51,6 +55,7 @@ _DAY_GATE_START = day_time(9, 32)
 _S02_PEAK_CANARY_FLAG = Path(
     r"C:\stock_bot\config\s02_peak_5_drop_1p5_flow_3of4_6s_20260811.flag"
 )
+_S02_FLOW_DEFENSE_LATCH_SEC = 120.0
 
 
 def day_gate_blocked(now) -> bool:
@@ -69,6 +74,10 @@ class Strategy02Engine(Strategy01Engine):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self._s02_only = (
+            self.config.strategy_id
+            == StrategyId.S02_LOW_BUY_SELL_EXHAUSTION
+        )
         # ★[PEAK-SCORE-3 2026-08-19 친구님 "배선해"] 꼭지흐름 매도 문턱 2→3 (S02만).
         #   근거: 8/13 백테심판 — score=2 매도 13건 보류 시 30분 뒤 평균 +2.67%p(상방 10/12).
         #   8/19 재생 실측 — 오늘 S02 이익매도 전부 score=2에서 잘림(019210 +3.14% 등).
@@ -76,13 +85,14 @@ class Strategy02Engine(Strategy01Engine):
         #   하드컷·방어매도·시간청산·S02 전용 약꼭지(1점) 규칙 무변경.
         #   공용 기본값(2)·타 전략 무간섭 — 이 프로세스의 엔진 인스턴스만 바꾼다.
         #   롤백: setx S02_PEAK_SCORE 2  ·  백업 backup\strategy_02_rotation_engine_v1_20260819_before_peak_score3.py
-        try:
-            _peak_score = int(os.environ.get("S02_PEAK_SCORE", "3"))
-        except ValueError:
-            _peak_score = 3
-        if _peak_score != self.exit_engine.config.common_peak_score:
-            self.exit_engine.config = replace(
-                self.exit_engine.config, common_peak_score=_peak_score)
+        if self._s02_only:
+            try:
+                _peak_score = int(os.environ.get("S02_PEAK_SCORE", "3"))
+            except ValueError:
+                _peak_score = 3
+            if _peak_score != self.exit_engine.config.common_peak_score:
+                self.exit_engine.config = replace(
+                    self.exit_engine.config, common_peak_score=_peak_score)
         # Owner-approved permanent S02 loss re-entry gate:
         # 15 minutes after the confirmed sell, a lower low than the prior
         # cycle's trough, then three consecutive buy-side confirmations.
@@ -102,6 +112,10 @@ class Strategy02Engine(Strategy01Engine):
         self._s02_trend_lock_shadow = Strategy02TrendLockShadow(
             self._event, self.exit_engine.config,
         )
+        self._s02_flow_defense_latch: dict[str, dict[str, Any]] = {}
+        self._s02_base_exit_evaluate = self.exit_engine.evaluate
+        if self._s02_only:
+            self.exit_engine.evaluate = self._evaluate_exit_with_flow_defense_latch
 
         production_files = {
             "engine": Path(__file__).resolve(),
@@ -130,6 +144,73 @@ class Strategy02Engine(Strategy01Engine):
         self._s02_base_signal_selector = self.signal_selector
         self._s02_signal_rows_by_code: dict[str, dict[str, Any]] = {}
         self.signal_selector = self._select_with_arrival_collar
+
+    def _evaluate_exit_with_flow_defense_latch(self, state, observation):
+        decision = self._s02_base_exit_evaluate(state, observation)
+        try:
+            return self._apply_flow_defense_latch(state, observation, decision)
+        except Exception as exc:
+            self.log.warning("S02 flow-defense latch skipped: %s", exc)
+            return decision
+
+    def _apply_flow_defense_latch(self, state, observation, decision):
+        """S02-only: sell on the second 4/5 warning within 120 seconds."""
+        reason = str(getattr(decision, "reason", "") or "")
+        if (
+            "COMMON_FLOW_DEFENSE_WATCH" not in reason
+            or "score=4/5" not in reason
+        ):
+            return decision
+        observed_at = as_kst(observation.observed_at)
+        key = str(state.position_id)
+        current = self._s02_flow_defense_latch.get(key)
+        if current is not None:
+            last_at = current.get("last_at")
+            if last_at is not None and observed_at <= last_at:
+                return decision
+        if (
+            current is None
+            or observed_at < current["first_at"]
+            or (observed_at - current["first_at"]).total_seconds()
+            > _S02_FLOW_DEFENSE_LATCH_SEC
+        ):
+            self._s02_flow_defense_latch[key] = {
+                "first_at": observed_at,
+                "last_at": observed_at,
+                "count": 1,
+            }
+            return decision
+
+        current["last_at"] = observed_at
+        current["count"] += 1
+        age_sec = (observed_at - current["first_at"]).total_seconds()
+        live_reason = (
+            "S02_FLOW_DEFENSE_LATCH_EXIT "
+            f"first_at={current['first_at'].isoformat(timespec='seconds')} "
+            f"repeat_at={observed_at.isoformat(timespec='seconds')} "
+            f"age={age_sec:.0f}s count={current['count']}"
+        )
+        state.sell_latched = True
+        state.sell_action = HoldSellAction.SELL
+        state.sell_reason = live_reason
+        state.sell_latched_at = observed_at
+        state.sell_latched_price = observation.price
+        self._event(
+            "S02_FLOW_DEFENSE_LATCH_LIVE",
+            code=state.code,
+            price=float(observation.price),
+            reason=live_reason,
+        )
+        return HoldSellDecision(
+            action=HoldSellAction.SELL,
+            reason=live_reason,
+            strategy_id=state.strategy_id,
+            code=state.code,
+            observed_at=observed_at,
+            price=observation.price,
+            order_key=state.order_key,
+            metadata={"source": "S02_4OF5_120S_LATCH"},
+        )
 
     def _select_with_arrival_collar(self, *args, **kwargs):
         rows = list(self._s02_base_signal_selector(*args, **kwargs))
@@ -220,7 +301,7 @@ class Strategy02Engine(Strategy01Engine):
     def _try_entries(self, now) -> None:
         # ★[DAY-GATE 2026-08-08] 하락일 의심이면 신규 진입만 멈춘다(매도·보유 불변).
         #   알림 이벤트는 날짜당 1회, 이후에는 조용히 건너뛴다.
-        if day_gate_blocked(now):
+        if self._s02_only and day_gate_blocked(now):
             stamp = now.strftime("%Y%m%d")
             if self.state.get("day_gate_announced") != stamp:
                 self.state["day_gate_announced"] = stamp

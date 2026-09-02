@@ -30,10 +30,12 @@ class Strategy03UnifiedIntradayStaircaseTests(unittest.TestCase):
         self.start = datetime(2026, 7, 27, 9, 30, 0)
         self.profile = PriorProfile(previous_close=10_500)
 
-    def point(self, second: int, price: float, buy: float, sell: float) -> MicroPoint:
+    def point(self, second: int, price: float, buy: float, sell: float,
+              minute_low: float = 0.0, ask_qty: float = 100.0) -> MicroPoint:
         return MicroPoint(
             ts=self.start + timedelta(seconds=second),
             price=price,
+            minute_low=minute_low,
             open_price=10_500,
             buy_money_cum=buy,
             sell_money_cum=sell,
@@ -41,26 +43,21 @@ class Strategy03UnifiedIntradayStaircaseTests(unittest.TestCase):
             sell_volume_cum=sell,
             best_ask_px=price + 10,
             best_bid_px=price,
-            best_ask_qty=100,
+            best_ask_qty=ask_qty,
             best_bid_qty=1000,
         )
 
     def points(self) -> list[MicroPoint]:
         # 장중 두 번째 로직: 당일 고점 대비 -5.0% 이상 급락 후
-        # 저점이 안정된 뒤 첫 반등→눌림→높은 저점→재반등과 매수 방법을 확인한다.
-        # ★[S03-LANE2 2026-08-06 친구님 지시 "2초 관찰·1분 안에 상승 없으면 매수 금지"]
-        #   매수 방법이 1레인 급행과 같아져(매도 감속+매수 가속+매수 우위, 10초 두 구간)
-        #   시나리오를 그 흐름이 실리게 다시 짰다: 매도 폭주(120/s) → 감속(86/s 매수 우위).
+        # 저점이 안정된 뒤 +0.5~+1.5% 직접반등에서 매도세 2단 감속과
+        # 2틱 상승을 확인한다. 마지막 구간도 매도 10/s > 매수 5/s라
+        # 매수 우위 역전 없이 먼저 잡는 경로를 검증한다.
         return [
-            self.point(0, 10_000, 100, 100),
-            self.point(10, 9_700, 150, 1_300),    # 매도 폭주로 하락
-            self.point(20, 9_450, 200, 2_500),    # -5.5% 무장
-            self.point(28, 9_440, 250, 3_600),    # 신저점 (매도 여전히 강함)
-            self.point(34, 9_535, 1_500, 3_700),  # 1차 반등 +1.0%
-            self.point(40, 9_490, 1_600, 3_750),  # 0.4% 눌림·높은 두 번째 저점
-            self.point(46, 9_540, 3_000, 3_800),  # 2차 반등 + 매수 가속 → 매수
-            # ★[2026-08-13] 같은 ts 중복 틱은 생산 dedup 이 설계상 거부(WAIT)하므로
-            #   마지막 row 를 덮어 테스트를 깨뜨린다 — 중복 제거.
+            self.point(0, 10_000, 100, 100, ask_qty=500),
+            self.point(10, 9_700, 150, 1_300, ask_qty=400),
+            self.point(20, 9_400, 200, 2_100, ask_qty=300),
+            self.point(21, 9_425, 205, 2_120, ask_qty=200),
+            self.point(22, 9_450, 210, 2_130, ask_qty=100),
         ]
 
     def slow_points(self) -> list[MicroPoint]:
@@ -94,8 +91,10 @@ class Strategy03UnifiedIntradayStaircaseTests(unittest.TestCase):
         monitor = RapidReboundMonitor()
         row = {}
         for point in self.points():
-            row, _ = monitor.process_point(
+            row, fired = monitor.process_point(
                 "043260", "TEST", point, self.profile, allow_signal=True)
+            if fired:
+                return row
         return row
 
     def test_post_0920_uses_intraday_crash_detector(self) -> None:
@@ -104,19 +103,55 @@ class Strategy03UnifiedIntradayStaircaseTests(unittest.TestCase):
         self.assertEqual(row["entry_lane"], INTRADAY_CRASH_LANE)
         self.assertEqual(row["algorithm"], INTRADAY_CRASH_ALGORITHM)
         self.assertLessEqual(row["intraday_drawdown_pct"], -5.0)
-        self.assertGreaterEqual(row["rebound_pct"], 1.0)
+        self.assertGreaterEqual(row["rebound_pct"], 0.5)
         self.assertLessEqual(row["rebound_pct"], 1.5)
-        self.assertIn("EXACT_SHORT_BUY_DOMINANCE", row["reason"])
+        self.assertIn("SELLER_EXHAUSTION_FAST", row["reason"])
+        self.assertTrue(row["seller_exhaustion_fast"]["ready"])
         self.assertFalse(row["long_flow_gates_enabled"])
 
-    def test_first_rebound_alone_does_not_buy(self) -> None:
+    def test_first_rebound_buys_without_pullback(self) -> None:
         monitor = RapidReboundMonitor()
         row = {}
-        for point in self.points()[:5]:
+        for point in self.points():
+            row, _ = monitor.process_point(
+                "043260", "TEST", point, self.profile, allow_signal=True)
+        self.assertEqual(row["action"], "BUY_READY")
+        self.assertIn("SELLER_EXHAUSTION_FAST", row["reason"])
+
+    def test_nonconsecutive_price_ticks_do_not_confirm_bottom(self) -> None:
+        monitor = RapidReboundMonitor()
+        rows = [
+            self.point(0, 10_000, 100, 100, ask_qty=500),
+            self.point(10, 9_700, 150, 1_300, ask_qty=400),
+            self.point(20, 9_400, 200, 2_100, ask_qty=300),
+            self.point(21, 9_450, 205, 2_120, ask_qty=250),
+            self.point(22, 9_448, 210, 2_130, ask_qty=200),
+            self.point(23, 9_452, 215, 2_135, ask_qty=150),
+        ]
+        row = {}
+        for point in rows:
             row, _ = monitor.process_point(
                 "043260", "TEST", point, self.profile, allow_signal=True)
         self.assertEqual(row["action"], "WAIT")
-        self.assertEqual(row["reason"], "FIRST_REBOUND_WAIT_RETEST")
+        self.assertFalse(
+            row["seller_exhaustion_fast"]["checks"]["price_up_two_ticks"])
+
+    def test_single_ask_depletion_does_not_confirm_bottom(self) -> None:
+        monitor = RapidReboundMonitor()
+        rows = [
+            self.point(0, 10_000, 100, 100, ask_qty=500),
+            self.point(10, 9_700, 150, 1_300, ask_qty=400),
+            self.point(20, 9_400, 200, 2_100, ask_qty=300),
+            self.point(21, 9_425, 205, 2_120, ask_qty=300),
+            self.point(22, 9_450, 210, 2_130, ask_qty=200),
+        ]
+        row = {}
+        for point in rows:
+            row, _ = monitor.process_point(
+                "043260", "TEST", point, self.profile, allow_signal=True)
+        self.assertEqual(row["action"], "WAIT")
+        self.assertFalse(
+            row["seller_exhaustion_fast"]["checks"]["ask_depleting"])
 
     # ★[2026-08-06] 회전엔진 선별기가 open_price 로 진입 가격대를 재검산한다.
     #   이 값이 빠지면(strategy_03_rotation_engine_v1.py:141) 신호가 통째로 버려진다 —
@@ -127,20 +162,48 @@ class Strategy03UnifiedIntradayStaircaseTests(unittest.TestCase):
         self.assertIn("open_price", row)
         self.assertGreater(float(row["open_price"] or 0), 0)
 
-    # ★[2026-08-06 친구님 "장중 고점 잘못된 거야 / 당일 고점으로"]
-    #   고점이 10분 창 밖으로 밀려나도 당일 고점으로 낙폭을 재야 한다.
-    #   창 고점 기준이면 -4.64% 라 5% 문턱을 못 넘어 신호가 안 난다.
-    def test_uses_day_high_not_rolling_window(self) -> None:
+    def test_uses_true_rolling_10minute_high(self) -> None:
         monitor = RapidReboundMonitor()
         row = {}
         for point in self.slow_points():
             row, _ = monitor.process_point(
                 "043260", "TEST", point, self.profile, allow_signal=True)
-        self.assertEqual(row["action"], "BUY_READY",
-                         "당일 고점이 아니라 10분 창 고점을 쓰고 있다")
-        self.assertEqual(float(row["intraday_high"]), 10_000.0,
-                         "고점이 당일 고점(10,000)이 아니다")
-        self.assertLessEqual(row["intraday_drawdown_pct"], -7.0)
+        self.assertNotEqual(row["action"], "BUY_READY")
+        self.assertEqual(row["reason"], "INTRADAY_DRAWDOWN_LT_REQUIRED")
+
+    def test_forming_minute_low_is_the_rebound_anchor(self) -> None:
+        monitor = RapidReboundMonitor()
+        rows = [
+            self.point(0, 10_000, 100, 100, ask_qty=500),
+            self.point(10, 9_700, 150, 1_300, ask_qty=400),
+            self.point(20, 9_500, 200, 2_100, minute_low=9_400, ask_qty=300),
+            self.point(21, 9_520, 205, 2_120, minute_low=9_400, ask_qty=200),
+            self.point(22, 9_540, 210, 2_130, minute_low=9_400, ask_qty=100),
+        ]
+        row = {}
+        for point in rows:
+            row, _ = monitor.process_point(
+                "043260", "TEST", point, self.profile, allow_signal=True)
+        self.assertEqual(row["action"], "BUY_READY")
+        self.assertEqual(float(row["anchor_low"]), 9_400.0)
+
+    def test_open_lane_emissions_do_not_exhaust_intraday_lane(self) -> None:
+        monitor = RapidReboundMonitor()
+        monitor.restore({
+            "schema": SIGNAL_SCHEMA,
+            "date": "20260727",
+            "signals": [
+                {"code": "043260", "entry_lane": "OPEN_CRASH",
+                 "signal_sequence": 1, "anchor_low": 9_500},
+                {"code": "043260", "entry_lane": "OPEN_CRASH",
+                 "signal_sequence": 2, "anchor_low": 9_400},
+            ],
+        }, "20260727")
+        row, _ = monitor.process_point(
+            "043260", "TEST", self.point(0, 10_000, 100, 100),
+            self.profile, allow_signal=True,
+        )
+        self.assertNotEqual(row["reason"], "CODE_DAILY_ENTRY_LIMIT_2")
 
     def test_contract_accepts_unified_intraday_lane_only_inside_window(self) -> None:
         row = self.fire()
@@ -162,6 +225,22 @@ class Strategy03UnifiedIntradayStaircaseTests(unittest.TestCase):
         self.assertEqual(select_fresh_signals(
             payload,
             now=datetime.fromisoformat(before_window["ts"]),
+            max_age_sec=5,
+        ), [])
+
+    def test_contract_rejects_missing_seller_exhaustion_evidence(self) -> None:
+        row = dict(self.fire())
+        row.pop("seller_exhaustion_fast")
+        payload = {
+            "schema": SIGNAL_SCHEMA,
+            "date": "20260727",
+            "updated_at": row["ts"],
+            "mode": SIGNAL_MODE,
+            "signals": [row],
+        }
+        self.assertEqual(select_fresh_signals(
+            payload,
+            now=datetime.fromisoformat(row["ts"]) + timedelta(seconds=1),
             max_age_sec=5,
         ), [])
 

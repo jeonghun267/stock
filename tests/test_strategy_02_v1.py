@@ -28,6 +28,7 @@ from strategy_01_rotation_engine_v2 import Strategy01Engine, kst_now
 from strategy_02_low_buy_signal_v1 import (
     LowBuySignalMonitor,
     SignalConfig,
+    _select_candidate_codes,
     _write_json_atomic,
     load_live_points,
 )
@@ -180,8 +181,7 @@ class Strategy02Tests(unittest.TestCase):
             "strategy_02_low_buy_signal_v1.detect_flow_book_exhaustion",
             side_effect=detected,
         ), patch.object(
-            LowBuySignalMonitor,
-    SignalConfig, "_detect_dip_rebound", return_value=None,
+            LowBuySignalMonitor, "_detect_dip_rebound", return_value=None,
         ):
             shadow_rows = []
             for sec in range(3):
@@ -218,8 +218,7 @@ class Strategy02Tests(unittest.TestCase):
             )
 
         with patch.object(          # ★[2026-07-31] 되돌림 판정으로 교체(위 주석 참조)
-            LowBuySignalMonitor,
-    SignalConfig, "_detect_dip_rebound",
+            LowBuySignalMonitor, "_detect_dip_rebound",
             side_effect=detected,
         ):
             first, first_fired = monitor.process_point(
@@ -260,8 +259,7 @@ class Strategy02Tests(unittest.TestCase):
         #   (되돌림)으로 교체됐다. 이 테스트들이 검사하는 건 판정 이후 흐름
         #   (호가 확인·anchor 중복 방지)이므로 가짜로 바꿀 대상만 옮긴다.
         with patch.object(
-            LowBuySignalMonitor,
-    SignalConfig, "_detect_dip_rebound",
+            LowBuySignalMonitor, "_detect_dip_rebound",
             return_value=detected,
         ):
             row, fired = monitor.process_point("123456", "TEST", point)
@@ -291,8 +289,7 @@ class Strategy02Tests(unittest.TestCase):
         #   (되돌림)으로 교체됐다. 이 테스트들이 검사하는 건 판정 이후 흐름
         #   (호가 확인·anchor 중복 방지)이므로 가짜로 바꿀 대상만 옮긴다.
         with patch.object(
-            LowBuySignalMonitor,
-    SignalConfig, "_detect_dip_rebound",
+            LowBuySignalMonitor, "_detect_dip_rebound",
             return_value=detected,
         ):
             row, fired = monitor.process_point("123456", "TEST", point)
@@ -360,6 +357,34 @@ class Strategy02Tests(unittest.TestCase):
         self.assertFalse(recovered_fired)
         self.assertEqual(
             recovered["reason"], "S02_MONEY_SURGE_OR_STAIRCASE_WAIT")
+
+    def test_s02_keeps_exact_8pct_drop_in_original_range(self) -> None:
+        observed_at = self.now.replace(hour=9, minute=10)
+        point = self.point(observed_at, price=9_200)
+        detected = BottomSignal(
+            algorithm="S02_S06_DIRECT_REBOUND_V1",
+            signal_ts=point.ts,
+            signal_price=point.price,
+            anchor_low_ts=point.ts - timedelta(seconds=10),
+            anchor_low_price=point.price,
+            wave_count=2,
+            reason="DIRECT_REBOUND",
+        )
+        monitor = LowBuySignalMonitor(adaptive_bottom_enabled=False)
+        with patch.object(
+            LowBuySignalMonitor, "_detect_dip_rebound", return_value=detected
+        ), patch(
+            "strategy_02_low_buy_signal_v1._s02_book_recovery_ready",
+            return_value=True,
+        ):
+            row, fired = monitor.process_point(
+                "123456", "TEST", point,
+                open_price=10_000,
+                session_high=10_000,
+            )
+        self.assertTrue(fired)
+        self.assertEqual(row["action"], "BUY_READY")
+
     def test_s06_staircase_resets_new_low_during_observe(self) -> None:
         monitor = LowBuySignalMonitor()
         # 09:30 이후에는 확정된 강화값(-5%)이 적용되므로, 이 시험은
@@ -636,7 +661,7 @@ class Strategy02Tests(unittest.TestCase):
             self.assertFalse(written)
             self.assertEqual(replace_mock.call_count, 6)
 
-    def test_missing_high_range_metadata_fails_closed(self) -> None:
+    def test_missing_candidate_metadata_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             config = SignalConfig(
@@ -659,9 +684,30 @@ class Strategy02Tests(unittest.TestCase):
             )
 
             self.assertEqual(points, [])
-            self.assertEqual(status, "HIGH_RANGE_META_MISSING")
+            self.assertEqual(status, "CANDIDATE_META_MISSING")
             self.assertEqual(watch_count, 1)
             self.assertEqual(range_meta, {})
+
+    def test_candidate_union_prefers_overlap_and_caps_fifty(self) -> None:
+        high_codes = [f"{index:06d}" for index in range(1, 31)]
+        money_codes = [f"{index:06d}" for index in range(21, 71)]
+        meta = {
+            code: {"hr_rank": rank}
+            for rank, code in enumerate(high_codes, start=1)
+        }
+        for rank, code in enumerate(money_codes, start=1):
+            meta.setdefault(code, {})["mf_prog"] = 1000 - rank
+        watch = {
+            "source_tags": {
+                code: ["moneyflow_selector"] for code in money_codes
+            }
+        }
+
+        selected = _select_candidate_codes(watch, meta)
+
+        self.assertEqual(len(selected), 50)
+        self.assertEqual(selected[:10], high_codes[20:30])
+        self.assertTrue(set(selected) <= set(high_codes) | set(money_codes))
     def test_s02_arrival_price_collar_blocks_only_upward_chase(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -1158,7 +1204,7 @@ class Strategy02Tests(unittest.TestCase):
         self.assertEqual(config.entry_end.isoformat(), "14:20:00")
         # ★[2026-08-06 친구님 지시 "QTY 2주 원래대로 1주로 돌려줘"] 2 -> 1.
         self.assertEqual(config.quantity, 1)
-        self.assertEqual(config.max_daily_codes, 15)
+        self.assertEqual(config.max_daily_codes, 12)
         self.assertEqual(config.max_cycles_per_code, 2)
         self.assertEqual(config.rotation_capital_krw, 2_000_000)
 

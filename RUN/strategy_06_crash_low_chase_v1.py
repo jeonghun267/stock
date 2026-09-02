@@ -11,8 +11,9 @@
   수급: 저점 전 매도우위→저점 후 매수우위, 최근 10초 매수속도 증가·매수우위,
         매도속도 재강화 없음이 모두 필요하다. 수급자료가 없으면 매수하지 않는다.
   포기: 저점+1.5% 초과 회복이면 그 저점은 버리고 다음 신저점 대기(추격매수 금지)
-  규모: 공용 6슬롯 · 1종목 2주 · 종목당 하루 2회(2발째는 산 저점보다 1% 더 깊은
-        신저점 뒤에만 — 아침 연속 가짜에 연발 낭비 방지) · 종목당 30만원 이내
+  규모: 공용 6슬롯 · 1종목 2주 · 종목당 하루 2회(2발째는 산 저점보다
+        max(손절폭 2%, 확정 일봉 ATRP10×0.75) 더 깊은 신저점 뒤에만 재무장)
+        · 종목당 30만원 이내
 
 ★매도는 당일 +10%와 익일 상승보유·꼭지점 매도를 분리한다:
   ① 당일 매수가 대비 +10% 도달 시 그 자리에서 매도
@@ -48,7 +49,7 @@ from dataclasses import dataclass
 from datetime import datetime, time as day_time
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 RUN_DIR = Path(__file__).resolve().parent
 if str(RUN_DIR) not in sys.path:
@@ -66,6 +67,7 @@ from ma3_common_v1 import (
     rider_permit as ma3_rider_permit,
 )
 import shared_slots
+import s03_s06_crash_claim_v1 as crash_claim
 from strategy_common_order_v1 import StrategyBroker, fills_by_order
 # ★[S06-COMMON-EXIT 2026-08-25 친구님 지시] 매도 판정을 S02 와 같은 공통 엔진으로
 #   옮긴다. 종전 strategy_06_exit_policy_v2 호출은 제거했다(파일은 증거로 남긴다).
@@ -110,6 +112,26 @@ def kst_now() -> datetime:
     return datetime.now(KST)
 
 
+def atrp10_pct(rows: Sequence[Tuple[float, float, float]]) -> float:
+    """확정 일봉 (high, low, close)로 ATRP10을 계산한다."""
+    if len(rows) < 10:
+        return 0.0
+    true_ranges: list[float] = []
+    previous_close: Optional[float] = None
+    for high, low, close in rows:
+        true_range = high - low
+        if previous_close is not None:
+            true_range = max(
+                true_range,
+                abs(high - previous_close),
+                abs(low - previous_close),
+            )
+        true_ranges.append(max(0.0, true_range))
+        previous_close = close
+    atr10 = sum(true_ranges[-10:]) / 10.0
+    return atr10 / rows[-1][2] * 100.0 if rows[-1][2] > 0 else 0.0
+
+
 def as_kst(value: datetime) -> datetime:
     return value.replace(tzinfo=KST) if value.tzinfo is None else value.astimezone(KST)
 
@@ -145,19 +167,32 @@ def read_json(path: Path, default: Any) -> Any:
 
 def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
+    # Overlapping S06/recovery writers must not share one fixed temp file.
+    temporary = path.with_name(
+        f"{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
     )
-    for attempt in range(6):
-        try:
-            os.replace(temporary, path)
-            return True
-        except PermissionError:
-            if attempt == 5:
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        for attempt in range(20):
+            try:
+                os.replace(temporary, path)
+                return True
+            except PermissionError:
+                if attempt == 19:
+                    return False
+                time.sleep(0.25)
+            except OSError:
                 return False
-            time.sleep(0.2)
+    except OSError:
+        return False
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def state_save_failure_marker(state_path: Path) -> Path:
@@ -189,6 +224,15 @@ def mark_state_save_failure(state_path: Path) -> Optional[Path]:
 @dataclass(frozen=True)
 class Config:
     watch_path: Path = Path(r"C:\stock_bot\IPC\micro_watch_high_range.json")
+    # ★[BOARD-UNIVERSE 2026-08-26 친구님 지시 "고저폭하고 돈흐름도를 읽어야지"]
+    #   S06_UNIVERSE_MODE=BOARD 면 고저폭판 ∪ 돈흐름 선별판(던짐/매도세)을
+    #   관찰한다. SNAPSHOT(기본)이면 종전대로 스냅샷 전체.
+    #   [BOARD-UNION 2026-08-26 친구님 지시 "많이 볼 수 있는 걸로"] 최초 배선은
+    #   교집합(∩)이었으나 8/26 실측 고저폭판∩급락 1종목으로 너무 좁아 합집합으로 변경.
+    #   되돌리기: backup\strategy_06_crash_low_chase_v1_20260826_before_board_union.py
+    mflow_board_path: Path = Path(r"C:\stock_bot\data\돈흐름_선별판.json")
+    universe_mode: str = os.environ.get("S06_UNIVERSE_MODE", "SNAPSHOT").strip().upper()
+    mflow_dump_grades: str = os.environ.get("S06_MFLOW_DUMP_GRADES", "🔴던짐,🔵매도세")
     hr_state_path: Path = Path(r"C:\stock_bot\data\common_high_range_live_state.json")
     snapshot_path: Path = Path(r"C:\stock_bot\IPC\live_micro_snapshot.json")
     bars_path: Path = Path(r"C:\stock_bot\data\돈맥_1분봉.json")
@@ -216,7 +260,7 @@ class Config:
     # Live default remains disabled until a preserved-input production replay
     # passes; the scheduled command may opt in with S06_EARLY_ENTRY_CAP_PCT=1.8.
     early_entry_cap_pct: float = float(os.environ.get("S06_EARLY_ENTRY_CAP_PCT", "0.0"))
-    chase_cap_pct: float = float(os.environ.get("S06_CHASE_CAP_PCT", "2.0"))
+    chase_cap_pct: float = float(os.environ.get("S06_CHASE_CAP_PCT", "2.5"))
     entry_floor_pct: float = float(os.environ.get("S06_ENTRY_FLOOR_PCT", "1.0"))
     pullback_min_pct: float = float(os.environ.get("S06_PULLBACK_MIN_PCT", "0.4"))
     higher_low_buffer_pct: float = float(os.environ.get("S06_HIGHER_LOW_BUFFER_PCT", "0.3"))
@@ -225,7 +269,10 @@ class Config:
     observe_sec: float = float(os.environ.get("S06_OBSERVE_SEC", "60"))
     observe_max_sec: float = float(os.environ.get("S06_OBSERVE_MAX_SEC", "720"))
     max_entries_per_code: int = int(os.environ.get("S06_MAX_ENTRIES_PER_CODE", "2"))
-    rearm_deeper_pct: float = float(os.environ.get("S06_REARM_DEEPER_PCT", "1.0"))
+    rearm_stop_floor_pct: float = float(
+        os.environ.get("S06_REARM_STOP_FLOOR_PCT", "2.0"))
+    rearm_atrp_multiplier: float = float(
+        os.environ.get("S06_REARM_ATRP_MULTIPLIER", "0.75"))
     morning_trail_eval_interval_sec: int = int(os.environ.get("S06_MORNING_TRAIL_EVAL_SEC", "180"))
     max_sell_retries: int = int(os.environ.get("S06_MAX_SELL_RETRIES", "3"))
     snapshot_max_age_sec: float = float(os.environ.get("S06_SNAPSHOT_MAX_AGE_SEC", "15"))
@@ -270,8 +317,10 @@ class Config:
             raise ValueError("morning trail interval must be positive")
         if not 1 <= self.max_entries_per_code <= 2:
             raise ValueError("entries per code must be 1 or 2")
-        if not 0 <= self.rearm_deeper_pct <= 5:
-            raise ValueError("rearm depth must be between 0 and 5 percent")
+        if not 0 < self.rearm_stop_floor_pct <= 10:
+            raise ValueError("rearm stop floor must be between 0 and 10 percent")
+        if not 0 < self.rearm_atrp_multiplier <= 2:
+            raise ValueError("rearm ATRP multiplier must be between 0 and 2")
 
 
 def setup_logger(config: Config) -> logging.Logger:
@@ -349,6 +398,8 @@ class ChaseState:
     # ★[DIRECT-REBOUND 2026-08-13 수정3] 저점 당시 체결강도 — che_rising 공통 기준
     #   (S02 six_low_che_str 과 같은 의미). 0 이하 = 자료 없음 → fail-closed.
     che_at_low: float = 0.0
+    rearm_atrp10_pct: float = 0.0
+    rearm_required_drop_pct: float = 0.0
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -461,9 +512,12 @@ class Strategy06Engine:
         self._last_reconcile_epoch: Dict[str, float] = {}
         self._snapshot_cache: Tuple[float, dict] = (0.0, {})
         self._hr_cache: Tuple[float, dict] = (0.0, {})
+        self._mflow_cache: Tuple[float, frozenset] = (0.0, frozenset())
         self._daily_ma_cache: Tuple[str, dict] = ("", {})
+        self._daily_atrp_cache: Tuple[str, dict] = ("", {})
         self._bars_cache: Tuple[float, dict] = (-1.0, {})
         self._entry_wait_epoch: Dict[str, float] = {}
+        self._claim_skip_epoch: Dict[str, float] = {}
         self._observe_log_epoch: Dict[str, float] = {}
         # ★[S06-COMMON-EXIT 2026-08-25] 매도 판정은 S02 와 같은 공통 엔진이 한다.
         #   진입 경로는 이 두 줄과 무관하다(어댑터는 _evaluate_exit 에서만 쓰인다).
@@ -952,7 +1006,45 @@ class Strategy06Engine:
             c for c in snapshot_codes
             if c not in watch_set and c not in crown_set and c not in priority_set
         ]
+        # ★[BOARD-UNION 2026-08-26 친구님 확정 "직접 배선, 너가 말한 대로 합집합"]
+        #   고저폭 계열(고저폭판·왕관·우선)과 던짐/매도세를 합집합(∪)으로 본다.
+        #   집합이라 양쪽에 겹치는 종목은 자동으로 한 번만 들어간다.
+        #   매수는 기존 S06 조건(급락·반등창·가격하한·수급)이 그대로 거른다.
+        #   최초 배선(∩)은 8/26 실측 고저폭판∩급락 1종목으로 너무 좁아 폐기.
+        if self.config.universe_mode == "BOARD":
+            dump_set = self._mflow_dump_codes()
+            board_set = watch_set | crown_set | priority_set | set(dump_set)
+            if not board_set:
+                return [], "BOARD_UNIVERSE_EMPTY"
+            board_codes = [
+                c for c in snapshot_codes
+                if c in board_set
+            ]
+            return board_codes, ""
         return priority_codes + crown_rest + high_range_rest + snapshot_rest, ""
+
+    def _mflow_dump_codes(self) -> frozenset:
+        """돈흐름 선별판에서 던짐/매도세 등급 종목코드. 1초 캐시, 실패 시 빈 집합."""
+        epoch = time.time()
+        if epoch - self._mflow_cache[0] < 1.0:
+            return self._mflow_cache[1]
+        payload = read_json(self.config.mflow_board_path, {})
+        wanted = {
+            g.strip() for g in str(self.config.mflow_dump_grades).split(",")
+            if g.strip()
+        }
+        codes = set()
+        for row in (payload.get("rows") or []):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("grade") or "").strip() not in wanted:
+                continue
+            code = str(row.get("code") or "").strip().zfill(6)
+            if len(code) == 6 and code.isascii() and code.isdigit():
+                codes.add(code)
+        result = frozenset(codes)
+        self._mflow_cache = (epoch, result)
+        return result
 
     def _hr_row(self, code: str) -> Mapping[str, Any]:
         epoch = time.time()
@@ -1193,8 +1285,7 @@ class Strategy06Engine:
             chase.low = seen_low
             chase.low_at = now.strftime("%H:%M:%S")
             # ★[2026-08-01] 죽인 저점은 "문턱보다 깊은" 신저점만 되살린다.
-            #   매수 재무장은 산 저점보다 rearm_deeper_pct 만큼 깊어야 함(아침 연속
-            #   가짜 역전에 2발을 다 쓰는 것 방지 — 7/29 재생 -2.18%→+0.98%).
+            #   매수 재무장은 산 저점보다 확정 일봉 변동성 문턱만큼 깊어야 함.
             #   포기(dead=저점 그대로)는 어떤 신저점이든 그보다 낮으므로 종전과 동일.
             if chase.dead_low <= 0 or seen_low < chase.dead_low:
                 chase.dead_low = 0.0
@@ -1480,10 +1571,15 @@ class Strategy06Engine:
             if entries >= self.config.max_entries_per_code:
                 chase.phase = "DONE"
             else:
-                # ★재무장 — 산 저점보다 rearm_deeper_pct 더 깊은 신저점이 나와야 2발째
+                # ★재무장 — 고정 1% 대신 손절폭과 확정 일봉 ATRP10을 함께 쓴다.
+                # 2차 진입도 아래의 저점유지·재반등·매도감속·매수증가 조건을
+                # 처음부터 다시 통과해야 한다.
                 chase.phase = "CHASE"
-                chase.dead_low = chase.low * (
-                    1.0 - self.config.rearm_deeper_pct / 100.0)
+                required_pct, atrp_pct = self._rearm_required_pct(
+                    code, str(self.state.get("date") or ""))
+                chase.rearm_atrp10_pct = atrp_pct
+                chase.rearm_required_drop_pct = required_pct
+                chase.dead_low = chase.low * (1.0 - required_pct / 100.0)
                 self._clear_retest(chase)
             self._save_chase(code, chase)
 
@@ -1500,6 +1596,13 @@ class Strategy06Engine:
     ) -> str:
         """'BOUGHT'=주문 제출 / 'STOP'=오늘 이 종목 끝 / 'RETRY'=잠시 후 재시도.
         ★[2026-08-01] 재무장 2회 — 같은 종목 2번째 진입은 별도 포지션 칸(code:2)."""
+        claim_state = crash_claim.s03_claim_status(code, now)
+        if claim_state != "FREE":
+            self._event(
+                "BUY_WAIT", code=code, name=name,
+                reason=f"S03_OPEN_CRASH_CLAIM_{claim_state}_PREORDER",
+            )
+            return "RETRY"
         if self.state.get("recovery_blocked"):
             return "RETRY"
         if len(self._active_positions()) >= self.config.max_slots:
@@ -1919,6 +2022,46 @@ class Strategy06Engine:
         self._daily_ma_cache = (today, rows)
         return rows
 
+    def _daily_atrp10_rows(self, today: str) -> Mapping[str, float]:
+        """오늘 이전 확정 일봉만 사용한 종목별 ATRP10."""
+        if self._daily_atrp_cache[0] == today:
+            return self._daily_atrp_cache[1]
+        by_code: Dict[str, list[Tuple[str, float, float, float]]] = {}
+        try:
+            with self.config.eod_bars_path.open(encoding="utf-8-sig", newline="") as fh:
+                for raw in csv.DictReader(fh):
+                    code = str(raw.get("code") or "").zfill(6)
+                    day = str(raw.get("date") or "").replace("-", "")
+                    high = number(raw.get("high"))
+                    low = number(raw.get("low"))
+                    close = number(raw.get("close"))
+                    if (
+                        len(code) == 6 and day < today
+                        and high > 0 and low > 0 and close > 0
+                    ):
+                        by_code.setdefault(code, []).append(
+                            (day, high, low, close))
+        except OSError:
+            self._daily_atrp_cache = (today, {})
+            return {}
+        rows = {
+            code: atrp10_pct([
+                (high, low, close)
+                for _day, high, low, close in sorted(series)
+            ])
+            for code, series in by_code.items()
+        }
+        self._daily_atrp_cache = (today, rows)
+        return rows
+
+    def _rearm_required_pct(self, code: str, today: str) -> Tuple[float, float]:
+        atrp_pct = float(self._daily_atrp10_rows(today).get(code, 0.0))
+        required = max(
+            self.config.rearm_stop_floor_pct,
+            atrp_pct * self.config.rearm_atrp_multiplier,
+        )
+        return required, atrp_pct
+
     def _recent_3min_high(self, code: str) -> float:
         """완성 1분봉 3개의 고가. 자료가 없으면 0으로 상승보유만 보류한다."""
         try:
@@ -2109,6 +2252,25 @@ class Strategy06Engine:
         hold_state = self.exit_adapter.ensure(position)
         if hold_state is None:
             return                                   # 입력 불완전 = 판정 보류(무주문)
+        exact_exit = None
+        if hold_state.last_observed_at is None:
+            exact_exit = _exact_capture_before(self, position["code"], now)
+            if exact_exit is not None:
+                exact_exit["entry_point"] = "Strategy06Engine._evaluate_exit"
+                exact_exit["position_before"] = dict(position)
+                exact_exit["hold_state_before"] = hold_state.to_dict()
+                _exit_ts = point["ts"]
+                exact_exit["exit_point"] = {
+                    **dict(point),
+                    "ts": _exit_ts.isoformat()
+                    if hasattr(_exit_ts, "isoformat") else str(_exit_ts),
+                }
+        if point["ts"] < hold_state.entry_at:
+            if exact_exit is not None:
+                exact_exit["exit_result"] = "SKIP_PRE_ENTRY_SNAPSHOT"
+                exact_exit["hold_state_after"] = hold_state.to_dict()
+                _exact_capture_after(self, position["code"], exact_exit)
+            return                                   # 체결 직후 남은 진입 전 캐시 틱은 건너뛴다
         if (
             hold_state.last_observed_at is not None
             and point["ts"] <= hold_state.last_observed_at
@@ -2116,9 +2278,29 @@ class Strategy06Engine:
             return                                   # 같은 틱 재판정 금지(S02 와 동일)
         observation = self.exit_adapter.build_observation(position, point)
         if observation is None:
+            if exact_exit is not None:
+                exact_exit["exit_result"] = "OBSERVATION_UNAVAILABLE"
+                exact_exit["hold_state_after"] = hold_state.to_dict()
+                _exact_capture_after(self, position["code"], exact_exit)
             return
-        decision = self.exit_engine.evaluate(hold_state, observation)
+        try:
+            decision = self.exit_engine.evaluate(hold_state, observation)
+        except Exception as exc:
+            _exact_capture_after(
+                self, position["code"], exact_exit,
+                f"{type(exc).__name__}: {exc}",
+            )
+            raise
         self.exit_adapter.save(position, hold_state)
+        if exact_exit is not None:
+            exact_exit["exit_result"] = "EVALUATED"
+            exact_exit["hold_state_after"] = hold_state.to_dict()
+            exact_exit["decision"] = {
+                "should_sell": bool(decision.should_sell),
+                "action": str(decision.action),
+                "reason": str(decision.reason or ""),
+            }
+            _exact_capture_after(self, position["code"], exact_exit)
         if decision.should_sell:
             partial = decision.action is HoldSellAction.PARTIAL_SELL
             self._start_sell(
@@ -2611,6 +2793,14 @@ class Strategy06Engine:
             else:
                 self.state["last_universe_block"] = ""
                 for code in codes:
+                    claim_state = crash_claim.s03_claim_status(code, now)
+                    if claim_state != "FREE":
+                        if time.time() - self._claim_skip_epoch.get(code, 0.0) >= 30.0:
+                            self._claim_skip_epoch[code] = time.time()
+                            self._event(
+                                "BUY_WAIT", code=code,
+                                reason=f"S03_OPEN_CRASH_CLAIM_{claim_state}")
+                        continue
                     _exact = _exact_capture_before(self, code, now)
                     _exact_error = ""
                     try:

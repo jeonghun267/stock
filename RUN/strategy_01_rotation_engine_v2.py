@@ -68,6 +68,18 @@ ACTIVE_PHASES = {"BUY_PENDING", "HOLD", "SELL_PENDING", "RECOVERY_BLOCKED"}
 BUY_FEE = Decimal("0.00015")
 SELL_FEE = Decimal("0.00015")
 SELL_TAX = Decimal("0.0018")
+# [S01-REGIME-DATA-READY-V1] S01 live entry only; shared broker gates unchanged.
+S01_KOSDAQ_INDEX_PATH = Path(os.environ.get(
+    "S01_KOSDAQ_INDEX_PATH", r"C:\stock_bot\data\kosdaq_index.json"
+))
+# The producer runs every 5 minutes. Allow one interval plus 60 seconds.
+S01_REGIME_MAX_AGE_SEC = float(os.environ.get(
+    "S01_REGIME_MAX_AGE_SEC", "360"
+))
+# Reject the exchange's opening-zero snapshot; the next scheduled sample is ~09:05.
+S01_REGIME_MIN_SOURCE_MINUTE = int(os.environ.get(
+    "S01_REGIME_MIN_SOURCE_MINUTE", "1"
+))
 FORCE_EXIT_EXTRA_RETRIES = int(
     os.environ.get("S01_FORCE_EXIT_EXTRA_RETRIES", "5")
 )
@@ -209,6 +221,8 @@ class Config:
     )
     quantity: int = capital_config.get_order_quantity()
     max_slots: int = int(os.environ.get("S01_MAX_SLOTS", "6"))
+    rocket_max_slots: int = int(os.environ.get("S01_ROCKET_MAX_SLOTS", "3"))
+    pullback_max_slots: int = int(os.environ.get("S01_PULLBACK_MAX_SLOTS", "3"))
     max_daily_codes: int = int(os.environ.get("S01_MAX_DAILY_CODES", "6"))
     max_cycles_per_code: int = int(os.environ.get("S01_MAX_CYCLES_PER_CODE", "2"))
     rotation_capital_krw: int = capital_config.get_limit("daily_total_max")
@@ -253,6 +267,11 @@ class Config:
             raise ValueError(f"{self.strategy_label} quantity must be positive")
         if self.max_slots != 6:
             raise ValueError(f"{self.strategy_label} requires exactly six concurrent slots")
+        if self.strategy_id == StrategyId.S01_OPEN_SURGE:
+            if self.rocket_max_slots != 3 or self.pullback_max_slots != 3:
+                raise ValueError(
+                    f"{self.strategy_label} requires ROCKET 3 and PULLBACK 3 slots"
+                )
         required_daily_codes = (
             12
             if self.strategy_id == StrategyId.S02_LOW_BUY_SELL_EXHAUSTION
@@ -475,6 +494,8 @@ class Strategy01Engine:
         self._last_reconcile_epoch: Dict[str, float] = {}
         self._last_data_warning = ""
         self._last_s01_buy_gate_allowed: Optional[bool] = None
+        self._last_s01_regime_data_ready: Optional[bool] = None
+        self._last_s01_regime_data_reason = ""
         production_files = {
             "engine": Path(__file__).resolve(),
             "signal_contract": RUN_DIR / "strategy_01_signal_contract_v2.py",
@@ -497,6 +518,7 @@ class Strategy01Engine:
             "positions": {},
             "cycles_by_code": {},
             "entered_codes": [],
+            "entered_codes_by_lane": {"ROCKET": [], "PULLBACK": []},
             "history": [],
             "recovery_blocked": False,
             "last_error": "",
@@ -565,6 +587,35 @@ class Strategy01Engine:
             )
         payload["entered_codes"] = entered_codes
         payload.setdefault("history", [])
+        lane_codes = {"ROCKET": set(), "PULLBACK": set()}
+        raw_lane_codes = payload.get("entered_codes_by_lane") or {}
+        if isinstance(raw_lane_codes, dict):
+            for lane in lane_codes:
+                lane_codes[lane].update(
+                    str(code).zfill(6)
+                    for code in (raw_lane_codes.get(lane) or [])
+                    if str(code).strip()
+                )
+        restored_positions = (
+            list(payload["positions"].values())
+            + list(payload.get("history") or [])
+        )
+        for position in restored_positions:
+            if not isinstance(position, dict) or not position.get("entry_at"):
+                continue
+            normalized = str(position.get("code") or "").zfill(6)
+            if not normalized.strip("0"):
+                continue
+            stages = position.get("entry_stages") or []
+            if not isinstance(stages, list):
+                stages = []
+            stages = [position.get("entry_stage"), *stages]
+            for lane in lane_codes:
+                if lane in {str(stage or "") for stage in stages}:
+                    lane_codes[lane].add(normalized)
+        payload["entered_codes_by_lane"] = {
+            lane: sorted(codes) for lane, codes in lane_codes.items()
+        }
         return payload
     def _load_names(self) -> Dict[str, str]:
         payload = read_json(self.config.names_path, {})
@@ -755,6 +806,20 @@ class Strategy01Engine:
     ) -> None:
         pending = position.get("pending") or {}
         captured_at = as_kst(observed_at or kst_now())
+        signal_snapshot = position.get("signal_snapshot") or {}
+        emitted_price = number(
+            signal_snapshot.get("signal_emitted_price")
+            or signal_snapshot.get("price")
+        )
+        arrival_price = number(position.get("signal_price"))
+        arrival_chase_bps = (
+            (arrival_price / emitted_price - 1.0) * 10000.0
+            if emitted_price > 0 and arrival_price > 0 else None
+        )
+        fill_slippage_bps = (
+            (number(fill_price) / arrival_price - 1.0) * 10000.0
+            if number(fill_price) > 0 and arrival_price > 0 else None
+        )
         record: Dict[str, Any] = {
             "schema": "s01_order_lifecycle_v1",
             "captured_at": captured_at.isoformat(timespec="seconds"),
@@ -767,7 +832,17 @@ class Strategy01Engine:
             "signal_price": number(position.get("signal_price")),
             "signal_reason": str(position.get("signal_reason") or ""),
             "entry_stage": str(pending.get("entry_stage") or position.get("entry_stage") or ""),
-            "signal_snapshot": position.get("signal_snapshot") or {},
+            "signal_snapshot": signal_snapshot,
+            "signal_emitted_price": emitted_price,
+            "arrival_price": arrival_price,
+            "arrival_chase_bps": (
+                round(arrival_chase_bps, 4)
+                if arrival_chase_bps is not None else None
+            ),
+            "fill_slippage_bps": (
+                round(fill_slippage_bps, 4)
+                if fill_slippage_bps is not None else None
+            ),
             "idempotency_key": str(pending.get("idempotency_key") or ""),
             "order_no": str(pending.get("order_no") or ""),
             "requested_quantity": int(pending.get("requested_qty") or 0),
@@ -1264,6 +1339,37 @@ class Strategy01Engine:
         self._save()
         return True
 
+    def _s01_regime_data_ready(self, now: datetime) -> Tuple[bool, str]:
+        """Require a fresh post-open KOSDAQ sample before S01 live entries."""
+        if (
+            self.config.strategy_id != StrategyId.S01_OPEN_SURGE
+            or not bool(self.config.live_requested)
+        ):
+            return True, "NOT_APPLICABLE"
+        try:
+            payload = json.loads(
+                S01_KOSDAQ_INDEX_PATH.read_text(encoding="utf-8-sig")
+            )
+            raw_ts = str(payload.get("ts") or "").strip()
+            sample_ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+        except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+            return False, "SOURCE_UNAVAILABLE"
+        if sample_ts.tzinfo is None:
+            sample_ts = sample_ts.replace(tzinfo=KST)
+        else:
+            sample_ts = sample_ts.astimezone(KST)
+        current = now if now.tzinfo is not None else now.replace(tzinfo=KST)
+        current = current.astimezone(KST)
+        if sample_ts.date() != current.date():
+            return False, f"SOURCE_DATE_MISMATCH ts={raw_ts or '?'}"
+        minimum = day_time(9, S01_REGIME_MIN_SOURCE_MINUTE)
+        if sample_ts.time() < minimum:
+            return False, f"SOURCE_BEFORE_OPEN_READY ts={raw_ts or '?'}"
+        age_sec = (current - sample_ts).total_seconds()
+        if age_sec < -5.0 or age_sec > S01_REGIME_MAX_AGE_SEC:
+            return False, f"SOURCE_STALE ts={raw_ts or '?'}"
+        return True, f"SOURCE_READY ts={raw_ts}"
+
     def _try_entries(self, now: datetime) -> None:
         if self.state.get("recovery_blocked"):
             return
@@ -1302,6 +1408,26 @@ class Strategy01Engine:
                 )
                 self._event("BUY_GATE_OPEN", reason="PREFLIGHT_APPROVED")
             self._last_s01_buy_gate_allowed = True
+        if self.config.strategy_id == StrategyId.S01_OPEN_SURGE:
+            regime_ready, regime_reason = self._s01_regime_data_ready(now)
+            if not regime_ready:
+                if (
+                    self._last_s01_regime_data_ready is not False
+                    or regime_reason != self._last_s01_regime_data_reason
+                ):
+                    self.log.warning("S01_REGIME_DATA_NOT_READY %s", regime_reason)
+                    self._event(
+                        "BUY_WAIT",
+                        reason=f"S01_REGIME_DATA_NOT_READY {regime_reason}",
+                    )
+                self._last_s01_regime_data_ready = False
+                self._last_s01_regime_data_reason = regime_reason
+                return
+            if self._last_s01_regime_data_ready is False:
+                self.log.info("S01_REGIME_DATA_READY %s", regime_reason)
+                self._event("REGIME_DATA_READY", reason=regime_reason)
+            self._last_s01_regime_data_ready = True
+            self._last_s01_regime_data_reason = regime_reason
         payload = read_json(self.config.signal_path, {})
         rows = self.signal_selector(
             payload,
@@ -1344,11 +1470,46 @@ class Strategy01Engine:
                     reason="CODE_ALREADY_ACTIVE",
                 )
                 continue
-            if len(self._active_positions()) >= self.config.max_slots:
-                return
             entry_stage = str(signal.get("entry_stage") or "")
+            active_positions = self._active_positions()
+            if len(active_positions) >= self.config.max_slots:
+                return
+            lane_limits = {
+                "ROCKET": self.config.rocket_max_slots,
+                "PULLBACK": self.config.pullback_max_slots,
+            }
+            if entry_stage in lane_limits:
+                lane_active = sum(
+                    1 for position in active_positions.values()
+                    if str(position.get("entry_stage") or "") == entry_stage
+                )
+                if lane_active >= lane_limits[entry_stage]:
+                    self._event(
+                        "BUY_BLOCKED", code=code, name=name,
+                        reason=f"{entry_stage}_SLOT_LIMIT_3",
+                    )
+                    continue
+                lane_daily_codes = {
+                    str(item).zfill(6)
+                    for item in (
+                        (self.state.get("entered_codes_by_lane") or {})
+                        .get(entry_stage, [])
+                    )
+                    if str(item).strip()
+                }
+                if (
+                    code not in lane_daily_codes
+                    and len(lane_daily_codes) >= lane_limits[entry_stage]
+                ):
+                    self._event(
+                        "BUY_BLOCKED", code=code, name=name,
+                        reason=f"{entry_stage}_DAILY_CODE_LIMIT_3",
+                    )
+                    continue
             order_qty = (
-                1 if entry_stage in {"EARLY_FLOW", "STRONG_FLOW", "ROCKET"}
+                1 if entry_stage in {
+                    "EARLY_FLOW", "STRONG_FLOW", "ROCKET", "PULLBACK"
+                }
                 else int(self.config.quantity)
             )
             entered_codes = {
@@ -1458,7 +1619,14 @@ class Strategy01Engine:
                 continue
 
             if getattr(self.broker, "real_session", False):
-                if ma3_rows(code, bars_payload) is None:
+                s01_entry_ma_not_required = (
+                    self.config.strategy_id == StrategyId.S01_OPEN_SURGE
+                    and entry_stage in {"ROCKET", "PULLBACK"}
+                )
+                if (
+                    not s01_entry_ma_not_required
+                    and ma3_rows(code, bars_payload) is None
+                ):
                     ma3_request_missing_history(
                         code, f"{self.config.strategy_id.value}:ENTRY",
                     )
@@ -1597,6 +1765,10 @@ class Strategy01Engine:
                 "signal_sequence": int(signal.get("signal_sequence") or 0),
                 "entry_stage": entry_stage,
                 "entry_stages": [],
+                "pullback_reference_low": (
+                    number(signal.get("reference_low"))
+                    if entry_stage == "PULLBACK" else 0.0
+                ),
                 "candidate_rank_at_entry": candidate_rank,
                 "candidate_count_at_entry": candidate_count,
                 "cycle_target": cycles + 1,
@@ -1665,6 +1837,20 @@ class Strategy01Engine:
         pre_hold_qty = int(pending.get("pre_hold_qty") or 0)
         entry_stage = str(
             pending.get("entry_stage") or position.get("entry_stage") or "")
+        if entry_stage in {"ROCKET", "PULLBACK"}:
+            lane_entries = self.state.setdefault(
+                "entered_codes_by_lane", {"ROCKET": [], "PULLBACK": []},
+            )
+            if not isinstance(lane_entries, dict):
+                lane_entries = {"ROCKET": [], "PULLBACK": []}
+                self.state["entered_codes_by_lane"] = lane_entries
+            codes = {
+                str(item).zfill(6)
+                for item in (lane_entries.get(entry_stage) or [])
+                if str(item).strip()
+            }
+            codes.add(code)
+            lane_entries[entry_stage] = sorted(codes)
         fill_source = (
             "ORDER_ZERO" if shadow
             else (
@@ -2110,6 +2296,51 @@ class Strategy01Engine:
     ) -> bool:
         return True
 
+    @staticmethod
+    def _pullback_failure_reason(
+        position: Mapping[str, Any], observation: HoldSellObservation,
+    ) -> str:
+        stages = set(position.get("entry_stages") or [])
+        if str(position.get("entry_stage") or "") == "PULLBACK":
+            stages.add("PULLBACK")
+        if "PULLBACK" not in stages:
+            return ""
+        reference_low = Decimal(str(number(
+            position.get("pullback_reference_low")
+        )))
+        if reference_low <= 0 or observation.price >= reference_low:
+            return ""
+        sell10 = observation.sell_money_per_sec_10s
+        sell30 = observation.sell_money_per_sec_30s
+        buy10 = observation.buy_money_per_sec_10s
+        sell_reaccelerating = (
+            sell10 > 0
+            and sell10 > buy10
+            and sell10 > sell30 * Decimal("1.2")
+        )
+        return (
+            "PULLBACK_LOW_BREAK_SELL_REACCEL"
+            if sell_reaccelerating else ""
+        )
+
+    @staticmethod
+    def _pullback_stale_board_failure_reason(
+        position: Mapping[str, Any], point: Mapping[str, Any],
+    ) -> str:
+        stages = set(position.get("entry_stages") or [])
+        if str(position.get("entry_stage") or "") == "PULLBACK":
+            stages.add("PULLBACK")
+        if "PULLBACK" not in stages:
+            return ""
+        reference_low = number(position.get("pullback_reference_low"))
+        price = number(point.get("price"))
+        if reference_low <= 0 or price <= 0:
+            return ""
+        return (
+            "PULLBACK_STALE_BOARD_LOW_BREAK_0P3"
+            if price <= reference_low * 0.997 else ""
+        )
+
     def _position_force_exit_at(
         self,
         _position: Dict[str, Any],
@@ -2146,6 +2377,11 @@ class Strategy01Engine:
             )
             return
         if not point["board_fresh"]:
+            stale_failure = self._pullback_stale_board_failure_reason(
+                position, point,
+            )
+            if stale_failure:
+                self._start_sell(position, now, stale_failure, point)
             return
         hold_state = HoldSellState.from_dict(position["hold_state"])
         if (
@@ -2154,6 +2390,10 @@ class Strategy01Engine:
         ):
             return
         observation = self._build_observation(position, point)
+        pullback_failure = self._pullback_failure_reason(position, observation)
+        if pullback_failure:
+            self._start_sell(position, now, pullback_failure, point)
+            return
         decision = self.exit_engine.evaluate(hold_state, observation)
         position["hold_state"] = hold_state.to_dict()
         if decision.should_sell:

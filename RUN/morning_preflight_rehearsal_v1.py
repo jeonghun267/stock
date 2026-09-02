@@ -275,7 +275,9 @@ def check_lowfind_contract() -> None:
         "S06": {"1차반등문턱": c6.rebound_pct, "추격상한": c6.chase_cap_pct,
                 "진입하한": c6.entry_floor_pct, "눌림최소": c6.pullback_min_pct,
                 "직전저점버퍼": c6.higher_low_buffer_pct,
-                "2차반등": c6.second_rebound_pct, "재무장깊이": c6.rearm_deeper_pct,
+                "2차반등": c6.second_rebound_pct,
+                "재무장최소깊이": c6.rearm_stop_floor_pct,
+                "재무장ATRP배수": c6.rearm_atrp_multiplier,
                 "흐름가속창초": c6.flow_accel_window_sec,
                 "관찰최대초": c6.observe_max_sec, "관찰시간초": c6.observe_sec},
     }
@@ -284,9 +286,18 @@ def check_lowfind_contract() -> None:
     common = {k: v for k, v in c.get("공통값", {}).items() if not k.startswith("_")}
     for key, want in common.items():
         for sid in ("S02", "S03", "S06"):
+            if sid == "S06" and key == "재무장깊이":
+                continue
             got = live[sid].get(key)
             if got is None or abs(float(got) - float(want)) > 1e-9:
                 bad.append(f"{sid}.{key} 계약 {want} != 실제 {got}")
+
+    s06_rearm = c.get("전략정체성", {}).get("S06재무장", {})
+    for key in ("재무장최소깊이", "재무장ATRP배수"):
+        want = s06_rearm.get(key)
+        got = live["S06"].get(key)
+        if want is None or got is None or abs(float(got) - float(want)) > 1e-9:
+            bad.append(f"S06.{key} 계약 {want} != 실제 {got}")
 
     base = {k: v for k, v in c.get("기본값", {}).items() if not k.startswith("_")}
     exc_map = c.get("인정된예외", {})
@@ -310,7 +321,7 @@ def check_lowfind_contract() -> None:
         add("FAIL", "저점찾기 계약",
             f"{len(bad)}건 어긋남 - " + " | ".join(bad[:5]))
     else:
-        n = len(common) + len(base) + len(obs)
+        n = len(common) + len(base) + len(obs) + len(s06_rearm)
         add("PASS", "저점찾기 계약",
             f"S02·S03·S06 {n}개 항목 계약대로 (S06 예외 2건 포함)")
 

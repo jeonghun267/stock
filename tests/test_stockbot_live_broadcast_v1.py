@@ -137,6 +137,34 @@ class StockbotLiveBroadcastTests(unittest.TestCase):
         self.assertEqual(len(strategy["held"]), 1)
         self.assertEqual(len(snapshot["slots"]), 1)
 
+    def test_eod_gap_broker_fill_is_visible_in_holdings(self) -> None:
+        now = datetime(2026, 9, 1, 15, 36)
+        (self.root / "data" / "eod_gap_positions.json").write_text(
+            json.dumps({
+                "950260": {
+                    "code": "950260",
+                    "name": "종가테스트",
+                    "qty": 1,
+                    "date": "20260901",
+                    "status": "OPEN",
+                    "live": True,
+                }
+            }, ensure_ascii=False), encoding="utf-8"
+        )
+        (self.root / "LOG" / "fills_20260901.csv").write_text(
+            "ts,code,order_no,state,otype,fill_qty,fill_px,remain\n"
+            "2026-09-01 15:18:15,950260,0588727,체결,+매수,1,19150,0\n",
+            encoding="utf-8",
+        )
+
+        snapshot = broadcast.build_snapshot(now)
+        page = broadcast.render_html(snapshot)
+
+        self.assertEqual(snapshot["eod_gap_holdings"][0]["code"], "950260")
+        self.assertIn("종가매수", page)
+        self.assertIn("종가테스트", page)
+        self.assertIn("[BROKER_FILL] 보유", page)
+
     def test_broken_approval_flag_is_not_shown_as_live(self) -> None:
         """★[APPROVAL-DISPLAY 2026-08-04] 깃발이 있어도 주문이 안 나가면 LIVE 가 아니다.
 

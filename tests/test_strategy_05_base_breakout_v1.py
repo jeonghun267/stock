@@ -105,6 +105,22 @@ class Strategy05Tests(unittest.TestCase):
         self.assertGreaterEqual(found["breakout_volx"], 6)
         self.assertIsNone(detect_base_breakout(bars, min_volx=10))
 
+    def test_rising_channel_is_not_a_sideways_base(self) -> None:
+        start = datetime(2026, 8, 28, 9, 9)
+        bars = [
+            Bar(
+                start + timedelta(minutes=i),
+                19000 + 15 * i,
+                19010 + 15 * i,
+                18990 + 15 * i,
+                19000 + 15 * i,
+                100,
+            )
+            for i in range(30)
+        ]
+        bars.append(Bar(start + timedelta(minutes=30), 19450, 19600, 19450, 19600, 700))
+        self.assertIsNone(detect_base_breakout(bars))
+
     def test_minute_gap_clears_stale_base(self) -> None:
         monitor = BaseBreakoutSignalMonitor(SignalConfig())
         state = monitor.states.setdefault("445090", CodeState())
@@ -394,6 +410,9 @@ class Strategy05Tests(unittest.TestCase):
                         "ts": stamp,
                         "code": "123456",
                         "name": "TEST",
+                        # ★[2026-08-26 현행화] 엔진이 신호 도착가(price)를 요구
+                        #   (없으면 ARRIVAL_SIGNAL_PRICE_MISSING 으로 무한 대기).
+                        "price": 10_100.0,
                         "action": "BUY_READY",
                         "reason": "BASE_RETEST+REAL_LOW+EXACT_BUY_DOMINANCE+BOOK_CONFIRM",
                         "mode": "SIGNAL_ONLY_ORDER_ZERO",

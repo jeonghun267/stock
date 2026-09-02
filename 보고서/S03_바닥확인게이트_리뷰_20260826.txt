@@ -1,0 +1,86 @@
+================================================================
+리뷰: strategy_03_flow_turn_fast_v1.py + test_strategy_03_bottom_confirm_v1.py
+2026-08-26 마감 후. 검사만(수정 없음). 근거: 코드 정독 + 오늘 그림자 실측
+  (data/audit/s03_engine_drop/s03_engine_drop_20260826.jsonl, 판정 1,450건)
+================================================================
+
+■ 배선 현황 [실측]
+- flow_turn_fast_decision  : 실전 관문 (launcher S03_FLOW_TURN_FAST_LIVE=YES,
+  오늘 FLOW_TURN_FAST_BLOCK 1,103건 — 실제로 일하고 있음)
+- bottom_confirm_decision  : 그림자만 (주문 무변경, 판정 기록만)
+- seller_exhaustion_fast   : 이번 변경분. 어디에도 미배선 (order-zero 실험)
+- 테스트 6/6 통과
+
+■ 오늘 그림자 실측 — bottom_confirm이 실전이었다면
+- 판정 1,450건 중 READY 단 2건 (0.14%). 나머지 1,448건 BLOCK.
+- 밴드 분포: UNKNOWN 940 / FLAT 510. 오늘 밴드는 BULL이 아니었음.
+- 유일하게 통과시킨 트레이드 = 코오롱티슈진 09:15 재진입 (실현 +0.05%, 본전).
+- 오늘 실제 매수 6종목 재판정:
+    제닉/비에이치아이/코오롱1/에코프로비엠/에이비엘 (09:00:30~09:01:00)
+      -> 전부 BLOCK. 이유 = 밴드 UNKNOWN (장세 피드가 아직 오늘 밴드를 못 냄)
+    NHN KCP (09:02:51, 오늘 유일한 수익 +0.46%)
+      -> BLOCK. flow 3/3 만점인데 FLAT 밴드라 direct 레인 자체가 차단
+  즉 이 게이트는 오늘 손실 5건을 다 막지만, 수익 1건도 같이 막고,
+  본전 1건만 통과시킨다. "손실 차단기"로는 완벽했지만 "수익 통과기"로는 0점.
+
+■ 약점 목록 (우선순위)
+
+P1. 개장 밴드 공백 = 전면 차단 [실측]
+  09:00~09:01대는 오늘 밴드가 아직 없어 UNKNOWN -> route=BLOCK.
+  regime 파일 첫 레코드는 전일(20260825 BULL)이고 당일분은 ~09:02부터.
+  EARLY_LOW 창(09:00~09:10)의 알짜 첫 1분(오늘 6건 중 5건)이 정확히 이 공백.
+  UNKNOWN 폴백 정책(전일 밴드 상속? NORMAL 취급?)이 미정의인 채 fail-closed.
+  이대로 live 전환하면 아침 레인이 구조적으로 꺼진다.
+
+P2. 레짐 라우팅이 배타적 [실측+코드]
+  STRONG=direct만 / NORMAL·WEAK=retest만.
+  (a) BULL 아닌 날 direct 신호 전멸 — 오늘 NHN(만점 flow)이 실례.
+  (b) 역설: BULL날에는 staircase retest(더 강한 확인)가 direct=False라 차단.
+  더 강한 확인이 더 좋은 장에서 거부되는 구조는 설계 의도인지 의심.
+
+P3. flow 2/3 점수제가 "매도 미소진"을 통과시킨다 [실측]
+  min_flow_score=2 라 sell_decelerating 실패여도 buy 2개로 통과.
+  오늘 최악 트레이드 제닉(-2.15% 하드스톱)이 정확히 이 조합
+  (flow=2, sell_decelerating=False)으로 라이브 flow 관문을 통과했다.
+  매도 소진이 급반등 논리의 핵심인데 그 항목이 선택사항.
+
+P4. 제로 베이스라인 공백 (OPEN_CRASH 레인) [코드]
+  flow_turn_fast는 baseline>0 가드가 없다:
+    baseline_buy=0  -> buy_accelerating = (0 >= 0*1.2) = True
+    baseline_sell=0 & recent_sell=0 -> sell_decelerating = True
+  = 흐름 데이터가 아예 없어도 2점. EARLY_LOW 레인은 flow_turn_ready
+  가드가 막아주지만, OPEN_CRASH 레인은 previous_10s를 그대로 써서 무방비.
+  (신규 seller_exhaustion은 old>0 가드가 있음 — 같은 파일 안 비대칭)
+
+P5. 틱 깜빡임, 지속성 조건 없음 [실측]
+  코오롱 09:15:43 READY -> 09:15:44 BLOCK(microprice/bid_share) 반복.
+  한 틱만 스치면 진입. 매도쪽 age 3~4초 노이즈 문제의 진입판.
+  N틱/N초 연속 유지 요구가 없다.
+
+P6. 잔약점
+  a) 반등 상한(1.5/2.0%)이 신호가 기준 — 체결 슬리피지 미통제.
+     게이트가 최대매수가를 출력하지 않아 호출부가 상한을 강제할 수 없음.
+     (오늘 진단의 "프리미엄 +1.5%가 1번 사인" 문제와 직결)
+  b) retest가 reason 문자열 "STAIRCASE" 부분일치에 결합 — 문구 바뀌면
+     조용히 전멸. 문자열 계약 취약.
+  c) NO_INDEX(지수 피드 결측) -> UNKNOWN -> 전면 차단. 의도라면 명시 필요.
+  d) 반등 하한 불일치: bottom_confirm은 0.0 허용, seller_exhaustion은 >0 요구.
+  e) 신규 seller_exhaustion의 min_rapid_drop_pct=0.60%는 "급락"치고 얕음.
+     S03 EXPRESS(-8%대)와 축이 다름 — 의도 확인 필요. (미배선이라 당장 무해)
+
+■ 테스트 약점 (6/6 통과하지만 구멍 위를 안 지나감)
+  - UNKNOWN/NO_INDEX 밴드 케이스 없음 (P1 미검증)
+  - STRONG에서 retest 차단이 의도인지 미고정 (P2 미검증)
+  - zero-baseline 케이스 없음 (P4 미검증)
+  - flow_score=2 경계(sell_decel 실패 통과) 없음 (P3 미검증)
+  - BottomConfirmConfig 봉인 부분적: min_pullback/higher_low/second_rebound/
+    weak_min_reset_steps 4개 미봉인
+  - seller_exhaustion mid=0 체인, spread=0 경계 없음
+
+■ 판단 (요청은 진단까지 — 수정은 지시 대기)
+  모듈 형태(순수 함수, 봉인 테스트, order-zero 실험 분리)는 이 저장소
+  기준으로 모범적. 그러나 오늘 표본 기준 이 게이트의 실전 가치는
+  "P1+P2를 풀기 전에는 없음"이다 — 지금은 손실도 수익도 다 막는 문이다.
+  튜닝 순서 제안: P1(UNKNOWN 폴백) -> P3(sell_decel 필수화 여부를
+  그림자로 A/B) -> P2(레짐 라우팅 합집합화 검토). 전부 그림자 검증 먼저.
+================================================================
